@@ -162,8 +162,7 @@ impl GithubClient for GitHubRestClient {
         mention: &CommentMention,
         bot_login: &str,
     ) -> Result<bool> {
-        self.mention_has_reaction(mention, bot_login, "rocket")
-            .await
+        self.mention_has_reaction(mention, bot_login, "+1").await
     }
 
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()> {
@@ -171,7 +170,7 @@ impl GithubClient for GitHubRestClient {
     }
 
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()> {
-        self.add_reaction(mention, "rocket").await
+        self.add_reaction(mention, "+1").await
     }
 
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
