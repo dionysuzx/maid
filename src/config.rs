@@ -1,8 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
 use std::{
     env,
-    io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     process::Command,
@@ -67,66 +65,9 @@ fn resolve_github_token(bot_login: &str) -> Result<String> {
         return Ok(token);
     }
 
-    let active_login = active_gh_login()?;
-    if !io::stdin().is_terminal() {
-        bail!(
-            "GITHUB_TOKEN is not set and stdin is not interactive; set GITHUB_TOKEN or run Maid from a terminal to approve using gh account {active_login}"
-        );
-    }
-
-    eprintln!("GITHUB_TOKEN is not set.");
-    eprintln!("GitHub CLI active account: {active_login}");
-    if !active_login.eq_ignore_ascii_case(bot_login) {
-        eprintln!(
-            "Note: MAID_BOT_LOGIN is {bot_login}, so Maid will still listen for @{bot_login}."
-        );
-    }
-    eprint!("Use the active gh account token for Maid? [y/N] ");
-    io::stderr().flush()?;
-
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
-        bail!("GITHUB_TOKEN is required unless you approve using the active gh account");
-    }
-
-    gh_token_for(&active_login)
-}
-
-fn active_gh_login() -> Result<String> {
-    let output = Command::new("gh")
-        .args([
-            "auth",
-            "status",
-            "--active",
-            "--hostname",
-            "github.com",
-            "--json",
-            "hosts",
-        ])
-        .output()
-        .context("failed to run `gh auth status`; set GITHUB_TOKEN or install/authenticate gh")?;
-
-    if !output.status.success() {
-        bail!(
-            "`gh auth status` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    active_gh_login_from_status_json(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn active_gh_login_from_status_json(json: &str) -> Result<String> {
-    let status: GhAuthStatus = serde_json::from_str(json).context("invalid gh auth status JSON")?;
-    let login = status
-        .hosts
-        .github_com
-        .into_iter()
-        .find(|account| account.active && account.state == "success")
-        .map(|account| account.login)
-        .ok_or_else(|| anyhow!("gh has no active authenticated github.com account"))?;
-    Ok(login)
+    gh_token_for(bot_login).with_context(|| {
+        format!("GITHUB_TOKEN is not set and gh has no usable token for {bot_login}")
+    })
 }
 
 fn gh_token_for(login: &str) -> Result<String> {
@@ -151,60 +92,4 @@ fn gh_token_for(login: &str) -> Result<String> {
     }
 
     Ok(token)
-}
-
-#[derive(Debug, Deserialize)]
-struct GhAuthStatus {
-    hosts: GhAuthHosts,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhAuthHosts {
-    #[serde(rename = "github.com")]
-    github_com: Vec<GhAccount>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhAccount {
-    active: bool,
-    login: String,
-    state: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_active_gh_login_from_status_json() {
-        let login = active_gh_login_from_status_json(
-            r#"{
-                "hosts": {
-                    "github.com": [
-                        {"state": "success", "active": false, "login": "dionysuzx"},
-                        {"state": "success", "active": true, "login": "mayushii-nyan"}
-                    ]
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(login, "mayushii-nyan");
-    }
-
-    #[test]
-    fn rejects_status_json_without_active_successful_account() {
-        let err = active_gh_login_from_status_json(
-            r#"{
-                "hosts": {
-                    "github.com": [
-                        {"state": "failed", "active": true, "login": "mayushii-nyan"}
-                    ]
-                }
-            }"#,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("no active authenticated"));
-    }
 }
