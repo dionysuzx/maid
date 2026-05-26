@@ -12,14 +12,20 @@ pub trait GithubClient: Send + Sync {
     async fn notifications(&self) -> Result<Vec<Notification>>;
     async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
-    async fn mention_has_handled_marker(
+    async fn mention_state(
         &self,
         mention: &CommentMention,
         bot_login: &str,
-    ) -> Result<bool>;
+    ) -> Result<MentionState>;
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MentionState {
+    Pending,
+    Handled,
 }
 
 #[async_trait]
@@ -118,18 +124,17 @@ where
             return Ok(HandleOutcome::Skipped);
         };
 
-        if self
-            .github
-            .mention_has_handled_marker(&mention, &self.bot_login)
-            .await?
-        {
-            info!(
-                notification_id = notification.id,
-                mention = %mention.html_url,
-                "skipping already handled mention"
-            );
-            self.github.mark_notification_handled(notification).await?;
-            return Ok(HandleOutcome::Skipped);
+        match self.github.mention_state(&mention, &self.bot_login).await? {
+            MentionState::Pending => {}
+            MentionState::Handled => {
+                info!(
+                    notification_id = notification.id,
+                    mention = %mention.html_url,
+                    "skipping already handled mention"
+                );
+                self.github.mark_notification_handled(notification).await?;
+                return Ok(HandleOutcome::Skipped);
+            }
         }
 
         self.github.mark_mention_started(&mention).await?;
@@ -245,16 +250,21 @@ mod tests {
             Ok(())
         }
 
-        async fn mention_has_handled_marker(
+        async fn mention_state(
             &self,
             mention: &CommentMention,
             _bot_login: &str,
-        ) -> Result<bool> {
-            Ok(self
+        ) -> Result<MentionState> {
+            if self
                 .handled_mentions
                 .lock()
                 .unwrap()
-                .contains(&mention.api_url))
+                .contains(&mention.api_url)
+            {
+                Ok(MentionState::Handled)
+            } else {
+                Ok(MentionState::Pending)
+            }
         }
 
         async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()> {

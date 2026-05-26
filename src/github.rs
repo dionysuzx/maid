@@ -1,6 +1,6 @@
 use crate::{
     domain::{CommentMention, Notification, PullRequest},
-    maid::GithubClient,
+    maid::{GithubClient, MentionState},
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -160,13 +160,19 @@ impl GithubClient for GitHubRestClient {
         self.post_json(&url, &PostComment { body }).await
     }
 
-    async fn mention_has_handled_marker(
+    async fn mention_state(
         &self,
         mention: &CommentMention,
         bot_login: &str,
-    ) -> Result<bool> {
-        self.mention_has_reaction(mention, bot_login, HANDLED_REACTION)
-            .await
+    ) -> Result<MentionState> {
+        if self
+            .mention_has_reaction(mention, bot_login, HANDLED_REACTION)
+            .await?
+        {
+            Ok(MentionState::Handled)
+        } else {
+            Ok(MentionState::Pending)
+        }
     }
 
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()> {
