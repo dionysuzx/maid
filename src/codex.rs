@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::{path::Path, process::Stdio};
 use tempfile::NamedTempFile;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tracing::info;
 
 #[derive(Clone, Debug)]
 pub struct CodexCli {
@@ -58,19 +59,34 @@ impl CodexRunner for CodexCli {
             .context("failed to write Codex prompt")?;
         drop(stdin);
 
-        let output = child
-            .wait_with_output()
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("failed to open Codex stdout"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("failed to open Codex stderr"))?;
+        let stderr_task = tokio::spawn(async move {
+            let mut stderr_bytes = Vec::new();
+            stderr.read_to_end(&mut stderr_bytes).await?;
+            Ok::<_, std::io::Error>(stderr_bytes)
+        });
+
+        let json = CodexJsonEvents::read(stdout, checkout, task).await?;
+        let status = child.wait().await.context("Codex failed to run")?;
+        let stderr = stderr_task
             .await
-            .context("Codex failed to run")?;
-        if !output.status.success() {
+            .context("failed to join Codex stderr reader")?
+            .context("failed to read Codex stderr")?;
+        if !status.success() {
             return Err(anyhow!(
                 "Codex exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                status,
+                String::from_utf8_lossy(&stderr).trim()
             ));
         }
 
-        let json = CodexJsonEvents::parse(&output.stdout);
         let response = match tokio::fs::read_to_string(&output_path).await {
             Ok(response) if !response.trim().is_empty() => response,
             Err(_) => json.last_message.unwrap_or_default(),
@@ -95,25 +111,65 @@ struct CodexJsonEvents {
 }
 
 impl CodexJsonEvents {
+    #[cfg(test)]
     fn parse(stdout: &[u8]) -> Self {
         let mut events = Self::default();
         for line in String::from_utf8_lossy(stdout).lines() {
-            let Ok(event) = serde_json::from_str::<CodexJsonEvent>(line) else {
-                continue;
-            };
-            match event {
-                CodexJsonEvent::ThreadStarted { thread_id } => {
-                    events.session_id = Some(thread_id);
-                }
-                CodexJsonEvent::ItemCompleted { item } => {
-                    if let CodexJsonItem::AgentMessage { text } = item {
-                        events.last_message = Some(text);
-                    }
-                }
-                CodexJsonEvent::Other => {}
-            }
+            events.observe_line(line);
         }
         events
+    }
+
+    async fn read(
+        stdout: impl AsyncRead + Unpin,
+        checkout: &Path,
+        task: &CodexTask,
+    ) -> Result<Self> {
+        let mut events = Self::default();
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .context("failed to read Codex stdout")?
+        {
+            if let Some(session_id) = events.observe_line(&line) {
+                let resume_command =
+                    format!("codex resume --include-non-interactive --all {session_id}");
+                info!(
+                    pr = %task.pr_url,
+                    mention = %task.mention_url,
+                    checkout = %checkout.display(),
+                    codex_session_id = %session_id,
+                    codex_resume = %resume_command,
+                    "codex session started"
+                );
+            }
+        }
+        Ok(events)
+    }
+
+    fn observe_line(&mut self, line: &str) -> Option<String> {
+        let Ok(event) = serde_json::from_str::<CodexJsonEvent>(line) else {
+            return None;
+        };
+        match event {
+            CodexJsonEvent::ThreadStarted { thread_id } => {
+                let is_first_session = self.session_id.is_none();
+                self.session_id = Some(thread_id.clone());
+                if is_first_session {
+                    Some(thread_id)
+                } else {
+                    None
+                }
+            }
+            CodexJsonEvent::ItemCompleted { item } => {
+                if let CodexJsonItem::AgentMessage { text } = item {
+                    self.last_message = Some(text);
+                }
+                None
+            }
+            CodexJsonEvent::Other => None,
+        }
     }
 }
 

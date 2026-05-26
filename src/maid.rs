@@ -138,6 +138,12 @@ where
         }
 
         self.github.mark_mention_started(&mention).await?;
+        info!(
+            notification_id = notification.id,
+            pr = %mention.pr.html_url,
+            mention = %mention.html_url,
+            "started handling mention"
+        );
 
         let checkout = self.repos.prepare(&mention.pr).await?;
         let task = CodexTask {
