@@ -14,7 +14,7 @@ test:
 
 check: fmt clippy test
 
-run:
+start:
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -50,6 +50,11 @@ run:
 
 dev:
     RUST_LOG="${RUST_LOG:-maid=info}" cargo run
+
+update:
+    just stop
+    git pull --ff-only origin main
+    just start
 
 logs:
     #!/usr/bin/env bash

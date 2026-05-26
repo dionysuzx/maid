@@ -15,7 +15,7 @@ Maid uses polling, not webhooks. It expects `git`, `gh`, and `codex` to be on
 ```sh
 git clone https://github.com/dionysuzx/maid.git
 cd maid
-just run      # start Maid in the background
+just start    # start Maid in the background
 just logs     # follow ~/.maid/maid.log
 ```
 
@@ -24,12 +24,13 @@ one explicitly:
 
 ```sh
 export GITHUB_TOKEN="$(gh auth token -u mayushii-nyan)"
-just run
+just start
 ```
 
-`just run` starts Maid in the background. Runtime state lives in `~/.maid`,
+`just start` runs Maid in the background. Runtime state lives in `~/.maid`,
 including `~/.maid/maid.log`, `~/.maid/maid.pid`, and the default repo cache.
-Use `just status` to check it and `just stop` to stop it.
+Use `just status` to check it, `just stop` to stop it, and `just update` to
+pull the latest `main` and restart.
 
 Useful options:
 
