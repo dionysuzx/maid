@@ -28,9 +28,7 @@ impl Config {
             .context("MAID_BIND must be a socket address like 127.0.0.1:3000")?;
         let cache_dir = match env::var("MAID_CACHE_DIR") {
             Ok(value) => PathBuf::from(value),
-            Err(_) => dirs::cache_dir()
-                .ok_or_else(|| anyhow!("could not determine a cache directory"))?
-                .join("maid"),
+            Err(_) => maid_home()?.join("cache"),
         };
         let poll_seconds = env::var("MAID_POLL_SECONDS")
             .ok()
@@ -56,6 +54,18 @@ impl Config {
             github_api_ip,
         })
     }
+}
+
+fn maid_home() -> Result<PathBuf> {
+    if let Ok(value) = env::var("MAID_HOME")
+        && !value.trim().is_empty()
+    {
+        return Ok(PathBuf::from(value));
+    }
+
+    Ok(dirs::home_dir()
+        .ok_or_else(|| anyhow!("could not determine the home directory"))?
+        .join(".maid"))
 }
 
 fn resolve_github_token(bot_login: &str) -> Result<String> {
