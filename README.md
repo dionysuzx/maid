@@ -21,11 +21,11 @@ just logs     # follow ~/.maid/maid.log
 ```
 
 Fill in `bot_login` in `~/.maid/config.toml` before starting. Maid asks `gh` for
-the bot account's token. You can also provide one explicitly:
+that account's token, so the bot account must be logged in locally:
 
 ```sh
-export GITHUB_TOKEN=...
-just start
+gh auth login
+gh auth status --hostname github.com
 ```
 
 `just start` runs Maid in the background. Runtime state lives in `~/.maid`,

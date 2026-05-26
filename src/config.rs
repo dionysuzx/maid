@@ -30,7 +30,7 @@ impl Config {
                 config_path.display()
             )
         })?;
-        let github_token = resolve_github_token(&bot_login)?;
+        let github_token = gh_token_for(&bot_login)?;
         let bind_addr = non_empty(file.bind)
             .unwrap_or_else(|| "127.0.0.1:3000".to_string())
             .parse()
@@ -111,27 +111,17 @@ fn expand_home(path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn resolve_github_token(bot_login: &str) -> Result<String> {
-    if let Ok(token) = env::var("GITHUB_TOKEN")
-        && !token.trim().is_empty()
-    {
-        return Ok(token);
-    }
-
-    gh_token_for(bot_login).with_context(|| {
-        format!("GITHUB_TOKEN is not set and gh has no usable token for {bot_login}")
-    })
-}
-
 fn gh_token_for(login: &str) -> Result<String> {
     let output = Command::new("gh")
         .args(["auth", "token", "--hostname", "github.com", "--user", login])
         .output()
-        .with_context(|| format!("failed to run `gh auth token --user {login}`"))?;
+        .with_context(|| {
+            format!("failed to run `gh auth token --user {login}`; install and authenticate gh")
+        })?;
 
     if !output.status.success() {
         bail!(
-            "`gh auth token --user {login}` failed: {}",
+            "`gh auth token --user {login}` failed: {}; run `gh auth login` for {login} or check `gh auth status --hostname github.com`",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
