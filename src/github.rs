@@ -136,6 +136,7 @@ impl GithubClient for GitHubRestClient {
         Ok(Some(CommentMention {
             author: comment.user.login,
             body: comment.body,
+            api_url: comment_url.to_string(),
             html_url: comment.html_url,
             pr: PullRequest {
                 owner: owner.login,
@@ -156,6 +157,23 @@ impl GithubClient for GitHubRestClient {
         self.post_json(&url, &PostComment { body }).await
     }
 
+    async fn mention_has_handled_marker(
+        &self,
+        mention: &CommentMention,
+        bot_login: &str,
+    ) -> Result<bool> {
+        self.mention_has_reaction(mention, bot_login, "rocket")
+            .await
+    }
+
+    async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()> {
+        self.add_reaction(mention, "eyes").await
+    }
+
+    async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()> {
+        self.add_reaction(mention, "rocket").await
+    }
+
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
         let url = format!(
             "https://api.github.com/notifications/threads/{}",
@@ -165,6 +183,28 @@ impl GithubClient for GitHubRestClient {
             .request(Method::PATCH, &url, Option::<&()>::None)
             .await?;
         Ok(())
+    }
+}
+
+impl GitHubRestClient {
+    async fn mention_has_reaction(
+        &self,
+        mention: &CommentMention,
+        bot_login: &str,
+        content: &str,
+    ) -> Result<bool> {
+        let reactions = self
+            .get::<Vec<ApiReaction>>(&format!("{}/reactions?per_page=100", mention.api_url))
+            .await?;
+
+        Ok(reactions.into_iter().any(|reaction| {
+            reaction.content == content && reaction.user.login.eq_ignore_ascii_case(bot_login)
+        }))
+    }
+
+    async fn add_reaction(&self, mention: &CommentMention, content: &'static str) -> Result<()> {
+        let url = format!("{}/reactions", mention.api_url);
+        self.post_json(&url, &PostReaction { content }).await
     }
 }
 
@@ -195,6 +235,12 @@ struct ApiComment {
 #[derive(Debug, Deserialize)]
 struct ApiUser {
     login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiReaction {
+    content: String,
+    user: ApiUser,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,4 +276,9 @@ struct ApiRepo {
 #[derive(Debug, Serialize)]
 struct PostComment<'a> {
     body: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct PostReaction {
+    content: &'static str,
 }

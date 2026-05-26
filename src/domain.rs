@@ -39,6 +39,7 @@ impl PullRequest {
 pub struct CommentMention {
     pub author: String,
     pub body: String,
+    pub api_url: String,
     pub html_url: String,
     pub pr: PullRequest,
 }

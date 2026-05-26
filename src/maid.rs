@@ -4,9 +4,7 @@ use async_trait::async_trait;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::Arc,
 };
-use tokio::sync::Mutex;
 use tracing::{error, info};
 
 #[async_trait]
@@ -14,6 +12,13 @@ pub trait GithubClient: Send + Sync {
     async fn notifications(&self) -> Result<Vec<Notification>>;
     async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
+    async fn mention_has_handled_marker(
+        &self,
+        mention: &CommentMention,
+        bot_login: &str,
+    ) -> Result<bool>;
+    async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
+    async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
 }
 
@@ -39,7 +44,6 @@ pub struct Maid<G, R, C> {
     repos: R,
     codex: C,
     bot_login: String,
-    suppressed: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -62,7 +66,6 @@ where
             repos,
             codex,
             bot_login: bot_login.into(),
-            suppressed: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -76,9 +79,7 @@ where
 
         for notification in notifications {
             let suppression_key = suppression_key(&notification);
-            if !seen_this_poll.insert(suppression_key.clone())
-                || self.is_suppressed(&suppression_key).await
-            {
+            if !seen_this_poll.insert(suppression_key) {
                 report.skipped += 1;
                 continue;
             }
@@ -117,9 +118,20 @@ where
             return Ok(HandleOutcome::Skipped);
         };
 
+        if self
+            .github
+            .mention_has_handled_marker(&mention, &self.bot_login)
+            .await?
+        {
+            self.github.mark_notification_handled(notification).await?;
+            return Ok(HandleOutcome::Skipped);
+        }
+
+        self.github.mark_mention_started(&mention).await?;
+
         let checkout = self.repos.prepare(&mention.pr).await?;
         let task = CodexTask {
-            mention_url: mention.html_url,
+            mention_url: mention.html_url.clone(),
             pr_url: mention.pr.html_url.clone(),
             raw_body: request.raw_body,
             cleaned_text: request.cleaned_text,
@@ -129,7 +141,7 @@ where
         self.github
             .post_pr_comment(&mention.pr, &codex_run.response)
             .await?;
-        self.suppress(suppression_key(notification)).await;
+        self.github.mark_mention_handled(&mention).await?;
         self.github.mark_notification_handled(notification).await?;
 
         if let Some(session_id) = &codex_run.session_id {
@@ -151,14 +163,6 @@ where
         }
         Ok(HandleOutcome::Responded)
     }
-
-    async fn is_suppressed(&self, id: &str) -> bool {
-        self.suppressed.lock().await.contains(id)
-    }
-
-    async fn suppress(&self, id: String) {
-        self.suppressed.lock().await.insert(id);
-    }
 }
 
 fn suppression_key(notification: &Notification) -> String {
@@ -178,7 +182,7 @@ enum HandleOutcome {
 mod tests {
     use super::*;
     use anyhow::{Result, anyhow};
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     type FakeMentionResult = Option<Result<Option<CommentMention>, String>>;
 
@@ -190,6 +194,8 @@ mod tests {
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
         post_error: Arc<StdMutex<Option<String>>>,
+        started_mentions: Arc<StdMutex<Vec<String>>>,
+        handled_mentions: Arc<StdMutex<HashSet<String>>>,
     }
 
     #[async_trait]
@@ -220,6 +226,36 @@ mod tests {
                 return Err(anyhow!(message));
             }
             self.posts.lock().unwrap().push(body.to_string());
+            Ok(())
+        }
+
+        async fn mention_has_handled_marker(
+            &self,
+            mention: &CommentMention,
+            _bot_login: &str,
+        ) -> Result<bool> {
+            Ok(self
+                .handled_mentions
+                .lock()
+                .unwrap()
+                .contains(&mention.api_url))
+        }
+
+        async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()> {
+            self.events.lock().unwrap().push("start".to_string());
+            self.started_mentions
+                .lock()
+                .unwrap()
+                .push(mention.api_url.clone());
+            Ok(())
+        }
+
+        async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()> {
+            self.events.lock().unwrap().push("handled".to_string());
+            self.handled_mentions
+                .lock()
+                .unwrap()
+                .insert(mention.api_url.clone());
             Ok(())
         }
 
@@ -299,10 +335,15 @@ mod tests {
     }
 
     fn mention(author: &str, body: &str) -> CommentMention {
+        mention_with_comment(author, body, "2")
+    }
+
+    fn mention_with_comment(author: &str, body: &str, comment_id: &str) -> CommentMention {
         CommentMention {
             author: author.to_string(),
             body: body.to_string(),
-            html_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+            api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
+            html_url: format!("https://github.com/o/r/pull/1#issuecomment-{comment_id}"),
             pr: pr(),
         }
     }
@@ -339,7 +380,21 @@ mod tests {
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
         assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
-        assert_eq!(*github.events.lock().unwrap(), vec!["post", "mark"]);
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["start", "post", "handled", "mark"]
+        );
+        assert_eq!(
+            *github.started_mentions.lock().unwrap(),
+            vec!["https://api.github.com/repos/o/r/issues/comments/2"]
+        );
+        assert!(
+            github
+                .handled_mentions
+                .lock()
+                .unwrap()
+                .contains("https://api.github.com/repos/o/r/issues/comments/2")
+        );
         assert_eq!(*repos.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, checkout);
@@ -406,8 +461,11 @@ mod tests {
     async fn responds_to_new_latest_comment_on_same_notification_thread() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "2")];
-        *github.mention.lock().unwrap() =
-            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan first"))));
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
+            "dionysuzx",
+            "@mayushii-nyan first",
+            "2",
+        ))));
         let repos = FakeRepos {
             checkout: PathBuf::from("/tmp/checkout"),
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -419,8 +477,11 @@ mod tests {
         let first_report = maid.run_once().await.unwrap();
 
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "3")];
-        *github.mention.lock().unwrap() =
-            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan second"))));
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
+            "dionysuzx",
+            "@mayushii-nyan second",
+            "3",
+        ))));
 
         let second_report = maid.run_once().await.unwrap();
 
@@ -428,6 +489,36 @@ mod tests {
         assert_eq!(second_report.responded, 1);
         assert_eq!(github.posts.lock().unwrap().len(), 2);
         assert_eq!(*github.marks.lock().unwrap(), vec!["n1", "n1"]);
+    }
+
+    #[tokio::test]
+    async fn skips_mentions_with_durable_handled_marker_after_restart() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() =
+            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan review"))));
+        github
+            .handled_mentions
+            .lock()
+            .unwrap()
+            .insert("https://api.github.com/repos/o/r/issues/comments/2".to_string());
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/checkout"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -493,6 +584,6 @@ mod tests {
 
         assert_eq!(report.failed, 1);
         assert!(github.marks.lock().unwrap().is_empty());
-        assert_eq!(*github.events.lock().unwrap(), vec!["post"]);
+        assert_eq!(*github.events.lock().unwrap(), vec!["start", "post"]);
     }
 }
