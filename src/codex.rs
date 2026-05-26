@@ -133,14 +133,11 @@ impl CodexJsonEvents {
             .context("failed to read Codex stdout")?
         {
             if let Some(session_id) = events.observe_line(&line) {
-                let resume_command =
-                    format!("codex resume --include-non-interactive --all {session_id}");
                 info!(
                     pr = %task.pr_url,
                     mention = %task.mention_url,
                     checkout = %checkout.display(),
                     codex_session_id = %session_id,
-                    codex_resume = %resume_command,
                     "codex session started"
                 );
             }
