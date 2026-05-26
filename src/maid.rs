@@ -75,8 +75,9 @@ where
         let mut seen_this_poll = HashSet::new();
 
         for notification in notifications {
-            if !seen_this_poll.insert(notification.id.clone())
-                || self.is_suppressed(&notification.id).await
+            let suppression_key = suppression_key(&notification);
+            if !seen_this_poll.insert(suppression_key.clone())
+                || self.is_suppressed(&suppression_key).await
             {
                 report.skipped += 1;
                 continue;
@@ -128,7 +129,7 @@ where
         self.github
             .post_pr_comment(&mention.pr, &codex_run.response)
             .await?;
-        self.suppress(notification.id.clone()).await;
+        self.suppress(suppression_key(notification)).await;
         self.github.mark_notification_handled(notification).await?;
 
         if let Some(session_id) = &codex_run.session_id {
@@ -158,6 +159,13 @@ where
     async fn suppress(&self, id: String) {
         self.suppressed.lock().await.insert(id);
     }
+}
+
+fn suppression_key(notification: &Notification) -> String {
+    notification
+        .latest_comment_url
+        .clone()
+        .unwrap_or_else(|| notification.id.clone())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,14 +272,18 @@ mod tests {
     }
 
     fn notification(id: &str) -> Notification {
+        notification_with_comment(id, "2")
+    }
+
+    fn notification_with_comment(id: &str, comment_id: &str) -> Notification {
         Notification {
             id: id.to_string(),
             reason: "mention".to_string(),
             subject_kind: "PullRequest".to_string(),
             subject_url: Some("https://api.github.com/repos/o/r/pulls/1".to_string()),
-            latest_comment_url: Some(
-                "https://api.github.com/repos/o/r/issues/comments/2".to_string(),
-            ),
+            latest_comment_url: Some(format!(
+                "https://api.github.com/repos/o/r/issues/comments/{comment_id}"
+            )),
         }
     }
 
@@ -388,6 +400,34 @@ mod tests {
         assert_eq!(second_report.skipped, 2);
         assert_eq!(github.posts.lock().unwrap().len(), 1);
         assert_eq!(github.marks.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn responds_to_new_latest_comment_on_same_notification_thread() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "2")];
+        *github.mention.lock().unwrap() =
+            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan first"))));
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/checkout"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), repos, codex);
+
+        let first_report = maid.run_once().await.unwrap();
+
+        *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "3")];
+        *github.mention.lock().unwrap() =
+            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan second"))));
+
+        let second_report = maid.run_once().await.unwrap();
+
+        assert_eq!(first_report.responded, 1);
+        assert_eq!(second_report.responded, 1);
+        assert_eq!(github.posts.lock().unwrap().len(), 2);
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1", "n1"]);
     }
 
     #[tokio::test]
