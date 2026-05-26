@@ -24,34 +24,24 @@ impl Config {
         let maid_home = maid_home()?;
         let config_path = maid_home.join("config.toml");
         let file = ConfigFile::read(&config_path)?;
-        let bot_login = env_string("MAID_BOT_LOGIN")
-            .or_else(|| non_empty(file.bot_login))
-            .with_context(|| {
-                format!(
-                    "bot_login is required; run `just init` and fill out {} or set MAID_BOT_LOGIN",
-                    config_path.display()
-                )
-            })?;
+        let bot_login = non_empty(file.bot_login).with_context(|| {
+            format!(
+                "bot_login is required; run `just init` and fill out {}",
+                config_path.display()
+            )
+        })?;
         let github_token = resolve_github_token(&bot_login)?;
-        let bind_addr = env_string("MAID_BIND")
-            .or_else(|| non_empty(file.bind))
+        let bind_addr = non_empty(file.bind)
             .unwrap_or_else(|| "127.0.0.1:3000".to_string())
             .parse()
             .context("bind must be a socket address like 127.0.0.1:3000")?;
-        let cache_dir = env_string("MAID_CACHE_DIR")
-            .or_else(|| non_empty(file.cache_dir))
+        let cache_dir = non_empty(file.cache_dir)
             .map(|path| expand_home(&path))
             .transpose()?
             .unwrap_or_else(|| maid_home.join("cache"));
-        let poll_seconds = env_u64("MAID_POLL_SECONDS")?
-            .or(file.poll_seconds)
-            .unwrap_or(20)
-            .max(10);
-        let codex_bin = env_string("MAID_CODEX_BIN")
-            .or_else(|| non_empty(file.codex_bin))
-            .unwrap_or_else(|| "codex".to_string());
-        let github_api_ip = env_string("MAID_GITHUB_API_IP")
-            .or_else(|| non_empty(file.github_api_ip))
+        let poll_seconds = file.poll_seconds.unwrap_or(20).max(10);
+        let codex_bin = non_empty(file.codex_bin).unwrap_or_else(|| "codex".to_string());
+        let github_api_ip = non_empty(file.github_api_ip)
             .map(|value| value.parse::<IpAddr>())
             .transpose()
             .context("github_api_ip must be an IPv4 or IPv6 address")?;
@@ -99,17 +89,6 @@ fn maid_home() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .ok_or_else(|| anyhow!("could not determine the home directory"))?
         .join(".maid"))
-}
-
-fn env_string(name: &str) -> Option<String> {
-    env::var(name).ok().and_then(|value| non_empty(Some(value)))
-}
-
-fn env_u64(name: &str) -> Result<Option<u64>> {
-    env_string(name)
-        .map(|value| value.parse::<u64>())
-        .transpose()
-        .with_context(|| format!("{name} must be a positive integer"))
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {

@@ -33,6 +33,17 @@ including `~/.maid/maid.log`, `~/.maid/maid.pid`, and the default repo cache.
 Use `just status` to check it, `just stop` to stop it, and `just update` to
 pull the latest `main` and restart.
 
+Config options:
+
+```toml
+bot_login = ""              # required
+bind = "127.0.0.1:3000"
+poll_seconds = 20
+cache_dir = "~/.maid/cache"
+codex_bin = "codex"
+github_api_ip = ""          # optional
+```
+
 Development:
 
 ```sh
