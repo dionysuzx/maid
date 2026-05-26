@@ -153,21 +153,20 @@ mod tests {
 
     #[test]
     fn parses_mentions_and_cleans_request_text() {
-        let request =
-            MentionRequest::parse("@mayushii-nyan please review this PR", "mayushii-nyan")
-                .unwrap()
-                .unwrap();
+        let request = MentionRequest::parse("@maid-bot please review this PR", "maid-bot")
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(request.raw_body, "@mayushii-nyan please review this PR");
+        assert_eq!(request.raw_body, "@maid-bot please review this PR");
         assert_eq!(request.cleaned_text, "please review this PR");
 
         assert!(
-            MentionRequest::parse("@mayushii-nyanx not you", "mayushii-nyan")
+            MentionRequest::parse("@maid-botx not you", "maid-bot")
                 .unwrap()
                 .is_none()
         );
         assert!(
-            MentionRequest::parse("@MAYUSHII-NYAN check this", "mayushii-nyan")
+            MentionRequest::parse("@MAID-BOT check this", "maid-bot")
                 .unwrap()
                 .is_some()
         );
@@ -178,14 +177,14 @@ mod tests {
         let task = CodexTask {
             mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
             pr_url: "https://github.com/o/r/pull/1".to_string(),
-            raw_body: "@mayushii-nyan review".to_string(),
+            raw_body: "@maid-bot review".to_string(),
             cleaned_text: "review".to_string(),
         };
 
         let prompt = task.prompt();
         assert!(prompt.contains("Mention URL:\nhttps://github.com/o/r/pull/1#issuecomment-2"));
         assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
-        assert!(prompt.contains("Raw mention body:\n@mayushii-nyan review"));
+        assert!(prompt.contains("Raw mention body:\n@maid-bot review"));
         assert!(prompt.contains("Cleaned request text:\nreview"));
     }
 }

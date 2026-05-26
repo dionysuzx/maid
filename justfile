@@ -14,6 +14,27 @@ test:
 
 check: fmt clippy test
 
+init:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    maid_home="${MAID_HOME:-$HOME/.maid}"
+    config_file="$maid_home/config.toml"
+    mkdir -p "$maid_home"
+
+    if [[ -e "$config_file" ]]; then
+        echo "$config_file already exists"
+        exit 0
+    fi
+
+    {
+        printf '%s\n' '# Fill in your GitHub bot account login before starting Maid.'
+        printf '%s\n' 'bot_login = ""'
+    } >"$config_file"
+
+    echo "created $config_file"
+    echo "edit bot_login, then run: just start"
+
 start:
     #!/usr/bin/env bash
     set -euo pipefail

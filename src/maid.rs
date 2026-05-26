@@ -382,7 +382,7 @@ mod tests {
         repos: FakeRepos,
         codex: FakeCodex,
     ) -> Maid<FakeGithub, FakeRepos, FakeCodex> {
-        Maid::new(github, repos, codex, "mayushii-nyan")
+        Maid::new(github, repos, codex, "maid-bot")
     }
 
     #[tokio::test]
@@ -392,7 +392,7 @@ mod tests {
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention(
             "dionysuzx",
-            "@mayushii-nyan please review this PR",
+            "@maid-bot please review this PR",
         ))));
         let repos = FakeRepos {
             checkout: checkout.clone(),
@@ -432,7 +432,7 @@ mod tests {
             "https://github.com/o/r/pull/1#issuecomment-2"
         );
         assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/pull/1");
-        assert_eq!(calls[0].1.raw_body, "@mayushii-nyan please review this PR");
+        assert_eq!(calls[0].1.raw_body, "@maid-bot please review this PR");
         assert_eq!(calls[0].1.cleaned_text, "please review this PR");
     }
 
@@ -440,8 +440,7 @@ mod tests {
     async fn ignores_self_authored_mentions() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() =
-            Some(Ok(Some(mention("mayushii-nyan", "@mayushii-nyan review"))));
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("maid-bot", "@maid-bot review"))));
         let repos = FakeRepos {
             checkout: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -465,8 +464,7 @@ mod tests {
     async fn skips_duplicate_latest_comment_after_success() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1"), notification("n1")];
-        *github.mention.lock().unwrap() =
-            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan review"))));
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
         let repos = FakeRepos {
             checkout: PathBuf::from("/tmp/checkout"),
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -492,7 +490,7 @@ mod tests {
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "2")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
             "dionysuzx",
-            "@mayushii-nyan first",
+            "@maid-bot first",
             "2",
         ))));
         let repos = FakeRepos {
@@ -508,7 +506,7 @@ mod tests {
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "3")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
             "dionysuzx",
-            "@mayushii-nyan second",
+            "@maid-bot second",
             "3",
         ))));
 
@@ -524,8 +522,7 @@ mod tests {
     async fn skips_mentions_with_durable_handled_marker_after_restart() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() =
-            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan review"))));
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
         github
             .handled_mentions
             .lock()
@@ -554,8 +551,7 @@ mod tests {
     async fn repo_prep_failure_does_not_post_or_mark() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() =
-            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan review"))));
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
         let repos = FakeRepos {
             checkout: PathBuf::from("/tmp/checkout"),
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -578,8 +574,7 @@ mod tests {
     async fn codex_failure_does_not_post_or_mark() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() =
-            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan review"))));
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
         let repos = FakeRepos {
             checkout: PathBuf::from("/tmp/checkout"),
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -599,8 +594,7 @@ mod tests {
     async fn post_failure_does_not_mark_notification_handled() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() =
-            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan review"))));
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
         *github.post_error.lock().unwrap() = Some("post failed".to_string());
         let repos = FakeRepos {
             checkout: PathBuf::from("/tmp/checkout"),
@@ -620,8 +614,7 @@ mod tests {
     async fn handled_marker_failure_after_post_still_marks_notification_handled() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() =
-            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan review"))));
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
         *github.handled_error.lock().unwrap() = Some("reaction failed".to_string());
         let repos = FakeRepos {
             checkout: PathBuf::from("/tmp/checkout"),

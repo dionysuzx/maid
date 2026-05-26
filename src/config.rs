@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
 use std::{
     env,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
@@ -20,29 +21,40 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let bot_login = env::var("MAID_BOT_LOGIN").unwrap_or_else(|_| "mayushii-nyan".to_string());
+        let maid_home = maid_home()?;
+        let config_path = maid_home.join("config.toml");
+        let file = ConfigFile::read(&config_path)?;
+        let bot_login = env_string("MAID_BOT_LOGIN")
+            .or_else(|| non_empty(file.bot_login))
+            .with_context(|| {
+                format!(
+                    "bot_login is required; run `just init` and fill out {} or set MAID_BOT_LOGIN",
+                    config_path.display()
+                )
+            })?;
         let github_token = resolve_github_token(&bot_login)?;
-        let bind_addr = env::var("MAID_BIND")
-            .unwrap_or_else(|_| "127.0.0.1:3000".to_string())
+        let bind_addr = env_string("MAID_BIND")
+            .or_else(|| non_empty(file.bind))
+            .unwrap_or_else(|| "127.0.0.1:3000".to_string())
             .parse()
-            .context("MAID_BIND must be a socket address like 127.0.0.1:3000")?;
-        let cache_dir = match env::var("MAID_CACHE_DIR") {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => maid_home()?.join("cache"),
-        };
-        let poll_seconds = env::var("MAID_POLL_SECONDS")
-            .ok()
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .context("MAID_POLL_SECONDS must be a positive integer")?
+            .context("bind must be a socket address like 127.0.0.1:3000")?;
+        let cache_dir = env_string("MAID_CACHE_DIR")
+            .or_else(|| non_empty(file.cache_dir))
+            .map(|path| expand_home(&path))
+            .transpose()?
+            .unwrap_or_else(|| maid_home.join("cache"));
+        let poll_seconds = env_u64("MAID_POLL_SECONDS")?
+            .or(file.poll_seconds)
             .unwrap_or(20)
             .max(10);
-        let codex_bin = env::var("MAID_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
-        let github_api_ip = env::var("MAID_GITHUB_API_IP")
-            .ok()
+        let codex_bin = env_string("MAID_CODEX_BIN")
+            .or_else(|| non_empty(file.codex_bin))
+            .unwrap_or_else(|| "codex".to_string());
+        let github_api_ip = env_string("MAID_GITHUB_API_IP")
+            .or_else(|| non_empty(file.github_api_ip))
             .map(|value| value.parse::<IpAddr>())
             .transpose()
-            .context("MAID_GITHUB_API_IP must be an IPv4 or IPv6 address")?;
+            .context("github_api_ip must be an IPv4 or IPv6 address")?;
 
         Ok(Self {
             bind_addr,
@@ -56,6 +68,27 @@ impl Config {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ConfigFile {
+    bot_login: Option<String>,
+    bind: Option<String>,
+    cache_dir: Option<String>,
+    poll_seconds: Option<u64>,
+    codex_bin: Option<String>,
+    github_api_ip: Option<String>,
+}
+
+impl ConfigFile {
+    fn read(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(config) => toml::from_str(&config)
+                .with_context(|| format!("failed to parse {}", path.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+        }
+    }
+}
+
 fn maid_home() -> Result<PathBuf> {
     if let Ok(value) = env::var("MAID_HOME")
         && !value.trim().is_empty()
@@ -66,6 +99,37 @@ fn maid_home() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .ok_or_else(|| anyhow!("could not determine the home directory"))?
         .join(".maid"))
+}
+
+fn env_string(name: &str) -> Option<String> {
+    env::var(name).ok().and_then(|value| non_empty(Some(value)))
+}
+
+fn env_u64(name: &str) -> Result<Option<u64>> {
+    env_string(name)
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .with_context(|| format!("{name} must be a positive integer"))
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn expand_home(path: &str) -> Result<PathBuf> {
+    if path == "~" {
+        return dirs::home_dir().ok_or_else(|| anyhow!("could not determine the home directory"));
+    }
+
+    if let Some(rest) = path.strip_prefix("~/") {
+        return Ok(dirs::home_dir()
+            .ok_or_else(|| anyhow!("could not determine the home directory"))?
+            .join(rest));
+    }
+
+    Ok(PathBuf::from(path))
 }
 
 fn resolve_github_token(bot_login: &str) -> Result<String> {
@@ -102,4 +166,65 @@ fn gh_token_for(login: &str) -> Result<String> {
     }
 
     Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn reads_config_file_values() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+bot_login = "maid-bot"
+bind = "127.0.0.1:4000"
+cache_dir = "~/.maid/cache"
+poll_seconds = 30
+codex_bin = "codex-test"
+github_api_ip = "127.0.0.1"
+"#
+        )
+        .unwrap();
+
+        let config = ConfigFile::read(file.path()).unwrap();
+
+        assert_eq!(config.bot_login.as_deref(), Some("maid-bot"));
+        assert_eq!(config.bind.as_deref(), Some("127.0.0.1:4000"));
+        assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
+        assert_eq!(config.poll_seconds, Some(30));
+        assert_eq!(config.codex_bin.as_deref(), Some("codex-test"));
+        assert_eq!(config.github_api_ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn missing_config_file_is_empty_config() {
+        let config = ConfigFile::read(Path::new("/tmp/maid-missing-config-for-test.toml")).unwrap();
+
+        assert_eq!(config.bot_login, None);
+        assert_eq!(config.poll_seconds, None);
+    }
+
+    #[test]
+    fn trims_empty_strings_to_none() {
+        assert_eq!(
+            non_empty(Some("  maid-bot  ".to_string())).as_deref(),
+            Some("maid-bot")
+        );
+        assert_eq!(non_empty(Some("  ".to_string())), None);
+    }
+
+    #[test]
+    fn expands_home_paths() {
+        let home = dirs::home_dir().unwrap();
+
+        assert_eq!(expand_home("~").unwrap(), home);
+        assert_eq!(expand_home("~/cache").unwrap(), home.join("cache"));
+        assert_eq!(
+            expand_home("/tmp/maid").unwrap(),
+            PathBuf::from("/tmp/maid")
+        );
+    }
 }
