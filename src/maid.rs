@@ -24,7 +24,13 @@ pub trait RepoPreparer: Send + Sync {
 
 #[async_trait]
 pub trait CodexRunner: Send + Sync {
-    async fn run(&self, checkout: &Path, task: &CodexTask) -> Result<String>;
+    async fn run(&self, checkout: &Path, task: &CodexTask) -> Result<CodexRun>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexRun {
+    pub response: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -117,17 +123,31 @@ where
             raw_body: request.raw_body,
             cleaned_text: request.cleaned_text,
         };
-        let response = self.codex.run(&checkout, &task).await?;
+        let codex_run = self.codex.run(&checkout, &task).await?;
 
-        self.github.post_pr_comment(&mention.pr, &response).await?;
+        self.github
+            .post_pr_comment(&mention.pr, &codex_run.response)
+            .await?;
         self.suppress(notification.id.clone()).await;
         self.github.mark_notification_handled(notification).await?;
 
-        info!(
-            notification_id = notification.id,
-            pr = %mention.pr.html_url,
-            "responded to mention"
-        );
+        if let Some(session_id) = &codex_run.session_id {
+            let resume_command =
+                format!("codex resume --include-non-interactive --all {session_id}");
+            info!(
+                notification_id = notification.id,
+                pr = %mention.pr.html_url,
+                codex_session_id = %session_id,
+                codex_resume = %resume_command,
+                "responded to mention"
+            );
+        } else {
+            info!(
+                notification_id = notification.id,
+                pr = %mention.pr.html_url,
+                "responded to mention"
+            );
+        }
         Ok(HandleOutcome::Responded)
     }
 
@@ -228,7 +248,7 @@ mod tests {
 
     #[async_trait]
     impl CodexRunner for FakeCodex {
-        async fn run(&self, checkout: &Path, task: &CodexTask) -> Result<String> {
+        async fn run(&self, checkout: &Path, task: &CodexTask) -> Result<CodexRun> {
             self.calls
                 .lock()
                 .unwrap()
@@ -236,7 +256,10 @@ mod tests {
             if let Some(message) = self.error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
-            Ok("codex response".to_string())
+            Ok(CodexRun {
+                response: "codex response".to_string(),
+                session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
+            })
         }
     }
 
