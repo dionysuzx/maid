@@ -8,6 +8,9 @@ use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{net::IpAddr, time::Duration};
 
+const STARTED_REACTION: &str = "eyes";
+const HANDLED_REACTION: &str = "+1";
+
 #[derive(Clone)]
 pub struct GitHubRestClient {
     client: Client,
@@ -162,15 +165,16 @@ impl GithubClient for GitHubRestClient {
         mention: &CommentMention,
         bot_login: &str,
     ) -> Result<bool> {
-        self.mention_has_reaction(mention, bot_login, "+1").await
+        self.mention_has_reaction(mention, bot_login, HANDLED_REACTION)
+            .await
     }
 
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()> {
-        self.add_reaction(mention, "eyes").await
+        self.add_reaction(mention, STARTED_REACTION).await
     }
 
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()> {
-        self.add_reaction(mention, "+1").await
+        self.add_reaction(mention, HANDLED_REACTION).await
     }
 
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
@@ -201,7 +205,7 @@ impl GitHubRestClient {
         }))
     }
 
-    async fn add_reaction(&self, mention: &CommentMention, content: &'static str) -> Result<()> {
+    async fn add_reaction(&self, mention: &CommentMention, content: &str) -> Result<()> {
         let url = format!("{}/reactions", mention.api_url);
         self.post_json(&url, &PostReaction { content }).await
     }
@@ -278,6 +282,6 @@ struct PostComment<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct PostReaction {
-    content: &'static str,
+struct PostReaction<'a> {
+    content: &'a str,
 }

@@ -78,8 +78,8 @@ where
         let mut seen_this_poll = HashSet::new();
 
         for notification in notifications {
-            let suppression_key = suppression_key(&notification);
-            if !seen_this_poll.insert(suppression_key) {
+            let work_key = work_key(&notification);
+            if !seen_this_poll.insert(work_key) {
                 report.skipped += 1;
                 continue;
             }
@@ -123,6 +123,11 @@ where
             .mention_has_handled_marker(&mention, &self.bot_login)
             .await?
         {
+            info!(
+                notification_id = notification.id,
+                mention = %mention.html_url,
+                "skipping already handled mention"
+            );
             self.github.mark_notification_handled(notification).await?;
             return Ok(HandleOutcome::Skipped);
         }
@@ -141,7 +146,15 @@ where
         self.github
             .post_pr_comment(&mention.pr, &codex_run.response)
             .await?;
-        self.github.mark_mention_handled(&mention).await?;
+        if let Err(err) = self.github.mark_mention_handled(&mention).await {
+            error!(
+                notification_id = notification.id,
+                pr = %mention.pr.html_url,
+                mention = %mention.html_url,
+                error = ?err,
+                "failed to mark mention handled after posting response"
+            );
+        }
         self.github.mark_notification_handled(notification).await?;
 
         if let Some(session_id) = &codex_run.session_id {
@@ -150,6 +163,7 @@ where
             info!(
                 notification_id = notification.id,
                 pr = %mention.pr.html_url,
+                mention = %mention.html_url,
                 codex_session_id = %session_id,
                 codex_resume = %resume_command,
                 "responded to mention"
@@ -158,6 +172,7 @@ where
             info!(
                 notification_id = notification.id,
                 pr = %mention.pr.html_url,
+                mention = %mention.html_url,
                 "responded to mention"
             );
         }
@@ -165,7 +180,7 @@ where
     }
 }
 
-fn suppression_key(notification: &Notification) -> String {
+fn work_key(notification: &Notification) -> String {
     notification
         .latest_comment_url
         .clone()
@@ -194,6 +209,7 @@ mod tests {
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
         post_error: Arc<StdMutex<Option<String>>>,
+        handled_error: Arc<StdMutex<Option<String>>>,
         started_mentions: Arc<StdMutex<Vec<String>>>,
         handled_mentions: Arc<StdMutex<HashSet<String>>>,
     }
@@ -252,6 +268,9 @@ mod tests {
 
         async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()> {
             self.events.lock().unwrap().push("handled".to_string());
+            if let Some(message) = self.handled_error.lock().unwrap().take() {
+                return Err(anyhow!(message));
+            }
             self.handled_mentions
                 .lock()
                 .unwrap()
@@ -433,7 +452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suppresses_duplicate_notifications_after_success() {
+    async fn skips_duplicate_latest_comment_after_success() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1"), notification("n1")];
         *github.mention.lock().unwrap() =
@@ -585,5 +604,31 @@ mod tests {
         assert_eq!(report.failed, 1);
         assert!(github.marks.lock().unwrap().is_empty());
         assert_eq!(*github.events.lock().unwrap(), vec!["start", "post"]);
+    }
+
+    #[tokio::test]
+    async fn handled_marker_failure_after_post_still_marks_notification_handled() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() =
+            Some(Ok(Some(mention("dionysuzx", "@mayushii-nyan review"))));
+        *github.handled_error.lock().unwrap() = Some("reaction failed".to_string());
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/checkout"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos, codex).run_once().await.unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(github.handled_mentions.lock().unwrap().is_empty());
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["start", "post", "handled", "mark"]
+        );
     }
 }
