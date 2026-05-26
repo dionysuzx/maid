@@ -83,16 +83,15 @@ impl RepoPreparer for GitRepoCache {
             &["remote", "set-url", "origin", &pr.clone_url],
         )
         .await?;
-        let pr_head = format!(
-            "pull/{}/head:refs/remotes/origin/pr/{}",
-            pr.number, pr.number
-        );
+        let pr_head = format!("pull/{}/head", pr.number);
         self.run_git(Some(&checkout), &["fetch", "--prune", "origin", &pr_head])
             .await
             .with_context(|| format!("failed to fetch PR {}", pr.html_url))?;
-        let pr_ref = format!("refs/remotes/origin/pr/{}", pr.number);
-        self.run_git(Some(&checkout), &["switch", "--detach", "--force", &pr_ref])
-            .await?;
+        self.run_git(
+            Some(&checkout),
+            &["switch", "--detach", "--force", "FETCH_HEAD"],
+        )
+        .await?;
         self.run_git(Some(&checkout), &["clean", "-fdx"]).await?;
 
         Ok(checkout)
