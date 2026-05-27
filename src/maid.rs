@@ -50,6 +50,7 @@ pub struct Maid<G, R, C> {
     repos: R,
     codex: C,
     bot_login: String,
+    master_accounts: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -66,12 +67,23 @@ where
     R: RepoPreparer,
     C: CodexRunner,
 {
-    pub fn new(github: G, repos: R, codex: C, bot_login: impl Into<String>) -> Self {
+    pub fn new(
+        github: G,
+        repos: R,
+        codex: C,
+        bot_login: impl Into<String>,
+        master_accounts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
             github,
             repos,
             codex,
             bot_login: bot_login.into(),
+            master_accounts: master_accounts
+                .into_iter()
+                .map(|login| login.into().trim().to_ascii_lowercase())
+                .filter(|login| !login.is_empty())
+                .collect(),
         }
     }
 
@@ -117,6 +129,20 @@ where
         };
 
         if mention.author.eq_ignore_ascii_case(&self.bot_login) {
+            return Ok(HandleOutcome::Skipped);
+        }
+
+        if !self
+            .master_accounts
+            .contains(&mention.author.to_ascii_lowercase())
+        {
+            info!(
+                notification_id = notification.id,
+                mention = %mention.html_url,
+                author = %mention.author,
+                "skipping mention from non-master account"
+            );
+            self.github.mark_notification_handled(notification).await?;
             return Ok(HandleOutcome::Skipped);
         }
 
@@ -388,7 +414,7 @@ mod tests {
         repos: FakeRepos,
         codex: FakeCodex,
     ) -> Maid<FakeGithub, FakeRepos, FakeCodex> {
-        Maid::new(github, repos, codex, "maid-bot")
+        Maid::new(github, repos, codex, "maid-bot", ["dionysuzx"])
     }
 
     #[tokio::test]
@@ -464,6 +490,49 @@ mod tests {
         assert!(github.marks.lock().unwrap().is_empty());
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignores_mentions_from_non_master_accounts() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() =
+            Some(Ok(Some(mention("not-trusted", "@maid-bot review"))));
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn master_account_matching_is_case_insensitive() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("Dionysuzx", "@maid-bot review"))));
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/checkout"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos, codex).run_once().await.unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
     }
 
     #[tokio::test]

@@ -20,8 +20,10 @@ just start    # start Maid in the background
 just logs     # follow ~/.maid/maid.log
 ```
 
-Fill in `bot_login` in `~/.maid/config.toml` before starting. Maid asks `gh` for
-that account's token, so the bot account must be logged in locally:
+Fill in `bot_login` and `master_accounts` in `~/.maid/config.toml` before
+starting. Maid only responds to mentions authored by one of the configured
+master accounts. Maid asks `gh` for the bot account's token, so the bot account
+must be logged in locally:
 
 ```sh
 gh auth login
@@ -36,7 +38,8 @@ pull the latest `main` and restart.
 Config options:
 
 ```toml
-bot_login = ""              # required
+bot_login = ""                    # required
+master_accounts = ["dionysuzx"]   # required
 bind = "127.0.0.1:3000"
 poll_seconds = 20
 cache_dir = "~/.maid/cache"
