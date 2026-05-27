@@ -14,6 +14,7 @@ pub struct Config {
     pub github_token: String,
     pub bot_login: String,
     pub master_accounts: Vec<String>,
+    pub auto_review_accounts: Vec<String>,
     pub cache_dir: PathBuf,
     pub poll_interval: Duration,
     pub codex_bin: String,
@@ -33,6 +34,14 @@ impl Config {
         })?;
         let master_accounts = required_logins(file.master_accounts, "master_accounts")
             .with_context(|| format!("master_accounts is required in {}", config_path.display()))?;
+        let auto_review_accounts =
+            optional_logins(file.auto_review_accounts, "auto_review_accounts")?
+                .unwrap_or_else(|| master_accounts.clone());
+        for login in &auto_review_accounts {
+            if !master_accounts.contains(login) {
+                bail!("auto_review_accounts must be a subset of master_accounts: {login}");
+            }
+        }
         let github_token = gh_token_for(&bot_login)?;
         let bind_addr = non_empty(file.bind)
             .unwrap_or_else(|| "127.0.0.1:3000".to_string())
@@ -54,6 +63,7 @@ impl Config {
             github_token,
             bot_login,
             master_accounts,
+            auto_review_accounts,
             cache_dir,
             poll_interval: Duration::from_secs(poll_seconds),
             codex_bin,
@@ -66,6 +76,7 @@ impl Config {
 struct ConfigFile {
     bot_login: Option<String>,
     master_accounts: Option<Vec<String>>,
+    auto_review_accounts: Option<Vec<String>>,
     bind: Option<String>,
     cache_dir: Option<String>,
     poll_seconds: Option<u64>,
@@ -107,6 +118,21 @@ fn required_logins(value: Option<Vec<String>>, key: &str) -> Result<Vec<String>>
         bail!("{key} must list at least one GitHub login");
     };
 
+    let logins = normalize_logins(raw_logins, key)?;
+    if logins.is_empty() {
+        bail!("{key} must list at least one GitHub login");
+    }
+
+    Ok(logins)
+}
+
+fn optional_logins(value: Option<Vec<String>>, key: &str) -> Result<Option<Vec<String>>> {
+    value
+        .map(|raw_logins| normalize_logins(raw_logins, key))
+        .transpose()
+}
+
+fn normalize_logins(raw_logins: Vec<String>, key: &str) -> Result<Vec<String>> {
     let mut logins = Vec::new();
     for login in raw_logins {
         let login = login.trim();
@@ -118,10 +144,6 @@ fn required_logins(value: Option<Vec<String>>, key: &str) -> Result<Vec<String>>
         if !logins.contains(&normalized) {
             logins.push(normalized);
         }
-    }
-
-    if logins.is_empty() {
-        bail!("{key} must list at least one GitHub login");
     }
 
     Ok(logins)
@@ -180,6 +202,7 @@ mod tests {
             r#"
 bot_login = "maid-bot"
 master_accounts = ["dionysuzx"]
+auto_review_accounts = ["dionysuzx"]
 bind = "127.0.0.1:4000"
 cache_dir = "~/.maid/cache"
 poll_seconds = 30
@@ -193,6 +216,10 @@ github_api_ip = "127.0.0.1"
 
         assert_eq!(config.bot_login.as_deref(), Some("maid-bot"));
         assert_eq!(config.master_accounts, Some(vec!["dionysuzx".to_string()]));
+        assert_eq!(
+            config.auto_review_accounts,
+            Some(vec!["dionysuzx".to_string()])
+        );
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:4000"));
         assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
         assert_eq!(config.poll_seconds, Some(30));
@@ -206,6 +233,7 @@ github_api_ip = "127.0.0.1"
 
         assert_eq!(config.bot_login, None);
         assert_eq!(config.master_accounts, None);
+        assert_eq!(config.auto_review_accounts, None);
         assert_eq!(config.poll_seconds, None);
     }
 
@@ -236,6 +264,24 @@ github_api_ip = "127.0.0.1"
         assert!(required_logins(None, "master_accounts").is_err());
         assert!(required_logins(Some(Vec::new()), "master_accounts").is_err());
         assert!(required_logins(Some(vec![" ".to_string()]), "master_accounts").is_err());
+    }
+
+    #[test]
+    fn optional_login_lists_allow_empty_lists() {
+        assert_eq!(
+            optional_logins(
+                Some(vec!["  Dionysuzx  ".to_string(), "dionysuzx".to_string()]),
+                "auto_review_accounts"
+            )
+            .unwrap(),
+            Some(vec!["dionysuzx".to_string()])
+        );
+        assert_eq!(
+            optional_logins(Some(Vec::new()), "auto_review_accounts").unwrap(),
+            Some(Vec::new())
+        );
+        assert!(optional_logins(Some(vec![" ".to_string()]), "auto_review_accounts").is_err());
+        assert_eq!(optional_logins(None, "auto_review_accounts").unwrap(), None);
     }
 
     #[test]

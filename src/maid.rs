@@ -1,4 +1,6 @@
-use crate::domain::{CodexTask, CommentMention, MentionRequest, Notification, PullRequest};
+use crate::domain::{
+    CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, Notification, PullRequest,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::{
@@ -11,19 +13,20 @@ use tracing::{error, info};
 pub trait GithubClient: Send + Sync {
     async fn notifications(&self) -> Result<Vec<Notification>>;
     async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>>;
+    async fn pull_request_for(&self, notification: &Notification) -> Result<Option<PullRequest>>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
-    async fn mention_state(
-        &self,
-        mention: &CommentMention,
-        bot_login: &str,
-    ) -> Result<MentionState>;
+    async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
+    -> Result<ReviewState>;
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()>;
+    async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState>;
+    async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()>;
+    async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MentionState {
+pub enum ReviewState {
     Pending,
     Handled,
 }
@@ -51,6 +54,7 @@ pub struct Maid<G, R, C> {
     codex: C,
     bot_login: String,
     master_accounts: HashSet<String>,
+    auto_review_accounts: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -73,17 +77,15 @@ where
         codex: C,
         bot_login: impl Into<String>,
         master_accounts: impl IntoIterator<Item = impl Into<String>>,
+        auto_review_accounts: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         Self {
             github,
             repos,
             codex,
             bot_login: bot_login.into(),
-            master_accounts: master_accounts
-                .into_iter()
-                .map(|login| login.into().trim().to_ascii_lowercase())
-                .filter(|login| !login.is_empty())
-                .collect(),
+            master_accounts: normalized_logins(master_accounts),
+            auto_review_accounts: normalized_logins(auto_review_accounts),
         }
     }
 
@@ -120,10 +122,19 @@ where
     }
 
     async fn handle_notification(&self, notification: &Notification) -> Result<HandleOutcome> {
-        if !notification.is_pr_mention_candidate() {
-            return Ok(HandleOutcome::Skipped);
+        if notification.is_pr_mention_candidate() {
+            return self.handle_mention(notification).await;
         }
 
+        if notification.is_pr_open_candidate() {
+            return self.handle_pr_open(notification).await;
+        }
+
+        self.github.mark_notification_handled(notification).await?;
+        Ok(HandleOutcome::Skipped)
+    }
+
+    async fn handle_mention(&self, notification: &Notification) -> Result<HandleOutcome> {
         let Some(mention) = self.github.mention_for(notification).await? else {
             return Ok(HandleOutcome::Skipped);
         };
@@ -151,8 +162,8 @@ where
         };
 
         match self.github.mention_state(&mention, &self.bot_login).await? {
-            MentionState::Pending => {}
-            MentionState::Handled => {
+            ReviewState::Pending => {}
+            ReviewState::Handled => {
                 info!(
                     notification_id = notification.id,
                     mention = %mention.html_url,
@@ -173,10 +184,12 @@ where
 
         let checkout = self.repos.prepare(&mention.pr).await?;
         let task = CodexTask {
-            mention_url: mention.html_url.clone(),
             pr_url: mention.pr.html_url.clone(),
-            raw_body: request.raw_body,
-            cleaned_text: request.cleaned_text,
+            origin: CodexTaskOrigin::Mention {
+                mention_url: mention.html_url.clone(),
+                raw_body: request.raw_body,
+                cleaned_text: request.cleaned_text,
+            },
         };
         let codex_run = self.codex.run(&checkout, &task).await?;
 
@@ -215,6 +228,95 @@ where
         }
         Ok(HandleOutcome::Responded)
     }
+
+    async fn handle_pr_open(&self, notification: &Notification) -> Result<HandleOutcome> {
+        let Some(pr) = self.github.pull_request_for(notification).await? else {
+            return Ok(HandleOutcome::Skipped);
+        };
+
+        if pr.author.eq_ignore_ascii_case(&self.bot_login) {
+            self.github.mark_notification_handled(notification).await?;
+            return Ok(HandleOutcome::Skipped);
+        }
+
+        if !self
+            .auto_review_accounts
+            .contains(&pr.author.to_ascii_lowercase())
+        {
+            info!(
+                notification_id = notification.id,
+                pr = %pr.html_url,
+                author = %pr.author,
+                "skipping opened PR from account without auto review"
+            );
+            self.github.mark_notification_handled(notification).await?;
+            return Ok(HandleOutcome::Skipped);
+        }
+
+        match self.github.pr_state(&pr, &self.bot_login).await? {
+            ReviewState::Pending => {}
+            ReviewState::Handled => {
+                info!(
+                    notification_id = notification.id,
+                    pr = %pr.html_url,
+                    "skipping already handled opened PR"
+                );
+                self.github.mark_notification_handled(notification).await?;
+                return Ok(HandleOutcome::Skipped);
+            }
+        }
+
+        self.github.mark_pr_started(&pr).await?;
+        info!(
+            notification_id = notification.id,
+            pr = %pr.html_url,
+            author = %pr.author,
+            "started handling opened PR"
+        );
+
+        let checkout = self.repos.prepare(&pr).await?;
+        let task = CodexTask {
+            pr_url: pr.html_url.clone(),
+            origin: CodexTaskOrigin::PullRequestOpened {
+                author: pr.author.clone(),
+            },
+        };
+        let codex_run = self.codex.run(&checkout, &task).await?;
+
+        self.github
+            .post_pr_comment(&pr, &codex_run.response)
+            .await?;
+        if let Err(err) = self.github.mark_pr_handled(&pr).await {
+            error!(
+                notification_id = notification.id,
+                pr = %pr.html_url,
+                error = ?err,
+                "failed to mark opened PR handled after posting response"
+            );
+        }
+        self.github.mark_notification_handled(notification).await?;
+
+        if let Some(session_id) = &codex_run.session_id {
+            let resume_command =
+                format!("codex resume --include-non-interactive --all {session_id}");
+            info!(
+                notification_id = notification.id,
+                pr = %pr.html_url,
+                author = %pr.author,
+                codex_session_id = %session_id,
+                codex_resume = %resume_command,
+                "responded to opened PR"
+            );
+        } else {
+            info!(
+                notification_id = notification.id,
+                pr = %pr.html_url,
+                author = %pr.author,
+                "responded to opened PR"
+            );
+        }
+        Ok(HandleOutcome::Responded)
+    }
 }
 
 fn work_key(notification: &Notification) -> String {
@@ -222,6 +324,14 @@ fn work_key(notification: &Notification) -> String {
         .latest_comment_url
         .clone()
         .unwrap_or_else(|| notification.id.clone())
+}
+
+fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> HashSet<String> {
+    logins
+        .into_iter()
+        .map(|login| login.into().trim().to_ascii_lowercase())
+        .filter(|login| !login.is_empty())
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,11 +347,13 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
 
     type FakeMentionResult = Option<Result<Option<CommentMention>, String>>;
+    type FakePullRequestResult = Option<Result<Option<PullRequest>, String>>;
 
     #[derive(Clone, Default)]
     struct FakeGithub {
         notifications: Arc<StdMutex<Vec<Notification>>>,
         mention: Arc<StdMutex<FakeMentionResult>>,
+        pull_request: Arc<StdMutex<FakePullRequestResult>>,
         posts: Arc<StdMutex<Vec<String>>>,
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
@@ -249,6 +361,8 @@ mod tests {
         handled_error: Arc<StdMutex<Option<String>>>,
         started_mentions: Arc<StdMutex<Vec<String>>>,
         handled_mentions: Arc<StdMutex<HashSet<String>>>,
+        started_prs: Arc<StdMutex<Vec<String>>>,
+        handled_prs: Arc<StdMutex<HashSet<String>>>,
     }
 
     #[async_trait]
@@ -273,6 +387,22 @@ mod tests {
             }
         }
 
+        async fn pull_request_for(
+            &self,
+            _notification: &Notification,
+        ) -> Result<Option<PullRequest>> {
+            match self
+                .pull_request
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Ok(None))
+            {
+                Ok(value) => Ok(value),
+                Err(message) => Err(anyhow!(message)),
+            }
+        }
+
         async fn post_pr_comment(&self, _pr: &PullRequest, body: &str) -> Result<()> {
             self.events.lock().unwrap().push("post".to_string());
             if let Some(message) = self.post_error.lock().unwrap().take() {
@@ -286,16 +416,16 @@ mod tests {
             &self,
             mention: &CommentMention,
             _bot_login: &str,
-        ) -> Result<MentionState> {
+        ) -> Result<ReviewState> {
             if self
                 .handled_mentions
                 .lock()
                 .unwrap()
                 .contains(&mention.api_url)
             {
-                Ok(MentionState::Handled)
+                Ok(ReviewState::Handled)
             } else {
-                Ok(MentionState::Pending)
+                Ok(ReviewState::Pending)
             }
         }
 
@@ -317,6 +447,29 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(mention.api_url.clone());
+            Ok(())
+        }
+
+        async fn pr_state(&self, pr: &PullRequest, _bot_login: &str) -> Result<ReviewState> {
+            if self.handled_prs.lock().unwrap().contains(&pr.html_url) {
+                Ok(ReviewState::Handled)
+            } else {
+                Ok(ReviewState::Pending)
+            }
+        }
+
+        async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()> {
+            self.events.lock().unwrap().push("start_pr".to_string());
+            self.started_prs.lock().unwrap().push(pr.html_url.clone());
+            Ok(())
+        }
+
+        async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()> {
+            self.events.lock().unwrap().push("handled_pr".to_string());
+            if let Some(message) = self.handled_error.lock().unwrap().take() {
+                return Err(anyhow!(message));
+            }
+            self.handled_prs.lock().unwrap().insert(pr.html_url.clone());
             Ok(())
         }
 
@@ -384,11 +537,36 @@ mod tests {
         }
     }
 
+    fn opened_pr_notification(id: &str) -> Notification {
+        Notification {
+            id: id.to_string(),
+            reason: "subscribed".to_string(),
+            subject_kind: "PullRequest".to_string(),
+            subject_url: Some("https://api.github.com/repos/o/r/pulls/1".to_string()),
+            latest_comment_url: None,
+        }
+    }
+
+    fn irrelevant_notification(id: &str) -> Notification {
+        Notification {
+            id: id.to_string(),
+            reason: "subscribed".to_string(),
+            subject_kind: "Issue".to_string(),
+            subject_url: Some("https://api.github.com/repos/o/r/issues/1".to_string()),
+            latest_comment_url: None,
+        }
+    }
+
     fn pr() -> PullRequest {
+        pr_with_author("dionysuzx")
+    }
+
+    fn pr_with_author(author: &str) -> PullRequest {
         PullRequest {
             owner: "o".to_string(),
             repo: "r".to_string(),
             number: 1,
+            author: author.to_string(),
             api_url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
             html_url: "https://github.com/o/r/pull/1".to_string(),
             clone_url: "https://github.com/o/r.git".to_string(),
@@ -414,7 +592,14 @@ mod tests {
         repos: FakeRepos,
         codex: FakeCodex,
     ) -> Maid<FakeGithub, FakeRepos, FakeCodex> {
-        Maid::new(github, repos, codex, "maid-bot", ["dionysuzx"])
+        Maid::new(
+            github,
+            repos,
+            codex,
+            "maid-bot",
+            ["dionysuzx"],
+            ["dionysuzx"],
+        )
     }
 
     #[tokio::test]
@@ -459,13 +644,141 @@ mod tests {
         assert_eq!(*repos.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, checkout);
-        assert_eq!(
-            calls[0].1.mention_url,
-            "https://github.com/o/r/pull/1#issuecomment-2"
-        );
         assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/pull/1");
-        assert_eq!(calls[0].1.raw_body, "@maid-bot please review this PR");
-        assert_eq!(calls[0].1.cleaned_text, "please review this PR");
+        assert_eq!(
+            calls[0].1.origin,
+            CodexTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot please review this PR".to_string(),
+                cleaned_text: "please review this PR".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn responds_to_opened_pr_from_auto_review_account() {
+        let checkout = PathBuf::from("/tmp/maid-test-checkout");
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![opened_pr_notification("n1")];
+        *github.pull_request.lock().unwrap() = Some(Ok(Some(pr())));
+        let repos = FakeRepos {
+            checkout: checkout.clone(),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["start_pr", "post", "handled_pr", "mark"]
+        );
+        assert_eq!(
+            *github.started_prs.lock().unwrap(),
+            vec!["https://github.com/o/r/pull/1"]
+        );
+        assert!(
+            github
+                .handled_prs
+                .lock()
+                .unwrap()
+                .contains("https://github.com/o/r/pull/1")
+        );
+        assert_eq!(*repos.calls.lock().unwrap(), vec!["o/r"]);
+        let calls = codex.calls.lock().unwrap();
+        assert_eq!(calls[0].0, checkout);
+        assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/pull/1");
+        assert_eq!(
+            calls[0].1.origin,
+            CodexTaskOrigin::PullRequestOpened {
+                author: "dionysuzx".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_opened_pr_from_account_without_auto_review() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![opened_pr_notification("n1")];
+        *github.pull_request.lock().unwrap() = Some(Ok(Some(pr_with_author("mayushii"))));
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn skips_opened_pr_with_durable_handled_marker_after_restart() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![opened_pr_notification("n1")];
+        *github.pull_request.lock().unwrap() = Some(Ok(Some(pr())));
+        github
+            .handled_prs
+            .lock()
+            .unwrap()
+            .insert("https://github.com/o/r/pull/1".to_string());
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert_eq!(*github.events.lock().unwrap(), vec!["mark"]);
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignores_self_authored_opened_prs() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![opened_pr_notification("n1")];
+        *github.pull_request.lock().unwrap() = Some(Ok(Some(pr_with_author("maid-bot"))));
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -488,6 +801,29 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn marks_irrelevant_unread_notifications_handled() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![irrelevant_notification("n1")];
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(github.posts.lock().unwrap().is_empty());
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }

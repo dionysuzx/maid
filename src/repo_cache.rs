@@ -107,6 +107,7 @@ mod tests {
             owner: owner.to_string(),
             repo: repo.to_string(),
             number: 46,
+            author: "dionysuzx".to_string(),
             api_url: "https://api.github.com/repos/o/r/pulls/46".to_string(),
             html_url: "https://github.com/o/r/pull/46".to_string(),
             clone_url: "https://github.com/o/r.git".to_string(),

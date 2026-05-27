@@ -3,12 +3,16 @@
 ![Maid banner](assets/maid-banner.png)
 
 Maid is a small Rust + Axum server that polls GitHub notifications as a bot
-account. When a pull request comment mentions that bot, Maid checks out the PR
-in its own cache, runs local `codex` from that checkout, and posts Codex's final
-answer as a normal PR comment.
+account. When a pull request comment mentions that bot, or when a configured
+master account opens a pull request, Maid checks out the PR in its own cache,
+runs local `codex` from that checkout, and posts Codex's final answer as a
+normal PR comment.
 
 Maid uses polling, not webhooks. It expects `git`, `gh`, and `codex` to be on
 `PATH`.
+Maid marks work in progress with an `eyes` reaction and completed work with a
+`+1` reaction. Mention requests use reactions on the mention comment; automatic
+PR-open reviews use reactions on the PR description.
 
 ## Quick Start
 
@@ -22,8 +26,14 @@ just logs     # follow ~/.maid/maid.log
 
 Fill in `bot_login` and `master_accounts` in `~/.maid/config.toml` before
 starting. Maid only responds to mentions authored by one of the configured
-master accounts. Maid asks `gh` for the bot account's token, so the bot account
-must be logged in locally:
+master accounts. `auto_review_accounts` controls which master accounts also get
+automatic reviews when they open a PR; if omitted, it defaults to
+`master_accounts`. Set it to `[]` to disable automatic PR-open reviews.
+For PR-open reviews, the bot account must receive repository notifications,
+such as by watching the repository.
+
+Maid asks `gh` for the bot account's token, so the bot account must be logged in
+locally:
 
 ```sh
 gh auth login
@@ -40,6 +50,7 @@ Config options:
 ```toml
 bot_login = ""                    # required
 master_accounts = ["dionysuzx"]   # required
+auto_review_accounts = ["dionysuzx"] # defaults to master_accounts when omitted
 bind = "127.0.0.1:3000"
 poll_seconds = 20
 cache_dir = "~/.maid/cache"
