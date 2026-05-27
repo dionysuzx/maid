@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
         config.bot_login.clone(),
         config.master_accounts.clone(),
         config.auto_review_accounts.clone(),
+        config.auto_review_repos.clone(),
     );
 
     let app = Router::new().route("/healthz", get(|| async { "ok" }));
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
         poll_seconds = config.poll_interval.as_secs(),
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),
+        auto_review_repos = config.auto_review_repos.len(),
         "maid started"
     );
 

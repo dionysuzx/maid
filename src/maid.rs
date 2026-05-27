@@ -1,5 +1,5 @@
 use crate::domain::{
-    CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, Notification, PullRequest,
+    CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,7 +13,7 @@ use tracing::{error, info};
 pub trait GithubClient: Send + Sync {
     async fn notifications(&self) -> Result<Vec<Notification>>;
     async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>>;
-    async fn pull_request_for(&self, notification: &Notification) -> Result<Option<PullRequest>>;
+    async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
     -> Result<ReviewState>;
@@ -55,6 +55,7 @@ pub struct Maid<G, R, C> {
     bot_login: String,
     master_accounts: HashSet<String>,
     auto_review_accounts: HashSet<String>,
+    auto_review_repos: Vec<RepoSlug>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -78,6 +79,7 @@ where
         bot_login: impl Into<String>,
         master_accounts: impl IntoIterator<Item = impl Into<String>>,
         auto_review_accounts: impl IntoIterator<Item = impl Into<String>>,
+        auto_review_repos: impl IntoIterator<Item = RepoSlug>,
     ) -> Self {
         Self {
             github,
@@ -86,6 +88,7 @@ where
             bot_login: bot_login.into(),
             master_accounts: normalized_logins(master_accounts),
             auto_review_accounts: normalized_logins(auto_review_accounts),
+            auto_review_repos: auto_review_repos.into_iter().collect(),
         }
     }
 
@@ -118,16 +121,32 @@ where
             }
         }
 
+        for repo in &self.auto_review_repos {
+            let pull_requests = self.github.open_pull_requests(repo).await?;
+            report.seen += pull_requests.len();
+
+            for pr in pull_requests {
+                match self.handle_auto_review_pr(&pr).await {
+                    Ok(HandleOutcome::Responded) => report.responded += 1,
+                    Ok(HandleOutcome::Skipped) => report.skipped += 1,
+                    Err(err) => {
+                        report.failed += 1;
+                        error!(
+                            pr = %pr.html_url,
+                            error = ?err,
+                            "failed to handle auto-review pull request"
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(report)
     }
 
     async fn handle_notification(&self, notification: &Notification) -> Result<HandleOutcome> {
         if notification.is_pr_mention_candidate() {
             return self.handle_mention(notification).await;
-        }
-
-        if notification.is_pr_open_candidate() {
-            return self.handle_pr_open(notification).await;
         }
 
         self.github.mark_notification_handled(notification).await?;
@@ -229,13 +248,8 @@ where
         Ok(HandleOutcome::Responded)
     }
 
-    async fn handle_pr_open(&self, notification: &Notification) -> Result<HandleOutcome> {
-        let Some(pr) = self.github.pull_request_for(notification).await? else {
-            return Ok(HandleOutcome::Skipped);
-        };
-
+    async fn handle_auto_review_pr(&self, pr: &PullRequest) -> Result<HandleOutcome> {
         if pr.author.eq_ignore_ascii_case(&self.bot_login) {
-            self.github.mark_notification_handled(notification).await?;
             return Ok(HandleOutcome::Skipped);
         }
 
@@ -244,37 +258,32 @@ where
             .contains(&pr.author.to_ascii_lowercase())
         {
             info!(
-                notification_id = notification.id,
                 pr = %pr.html_url,
                 author = %pr.author,
-                "skipping opened PR from account without auto review"
+                "skipping pull request from account without auto review"
             );
-            self.github.mark_notification_handled(notification).await?;
             return Ok(HandleOutcome::Skipped);
         }
 
-        match self.github.pr_state(&pr, &self.bot_login).await? {
+        match self.github.pr_state(pr, &self.bot_login).await? {
             ReviewState::Pending => {}
             ReviewState::Handled => {
                 info!(
-                    notification_id = notification.id,
                     pr = %pr.html_url,
-                    "skipping already handled opened PR"
+                    "skipping already handled auto-review pull request"
                 );
-                self.github.mark_notification_handled(notification).await?;
                 return Ok(HandleOutcome::Skipped);
             }
         }
 
-        self.github.mark_pr_started(&pr).await?;
+        self.github.mark_pr_started(pr).await?;
         info!(
-            notification_id = notification.id,
             pr = %pr.html_url,
             author = %pr.author,
-            "started handling opened PR"
+            "started handling auto-review pull request"
         );
 
-        let checkout = self.repos.prepare(&pr).await?;
+        let checkout = self.repos.prepare(pr).await?;
         let task = CodexTask {
             pr_url: pr.html_url.clone(),
             origin: CodexTaskOrigin::PullRequestOpened {
@@ -283,36 +292,30 @@ where
         };
         let codex_run = self.codex.run(&checkout, &task).await?;
 
-        self.github
-            .post_pr_comment(&pr, &codex_run.response)
-            .await?;
-        if let Err(err) = self.github.mark_pr_handled(&pr).await {
+        self.github.post_pr_comment(pr, &codex_run.response).await?;
+        if let Err(err) = self.github.mark_pr_handled(pr).await {
             error!(
-                notification_id = notification.id,
                 pr = %pr.html_url,
                 error = ?err,
-                "failed to mark opened PR handled after posting response"
+                "failed to mark auto-review pull request handled after posting response"
             );
         }
-        self.github.mark_notification_handled(notification).await?;
 
         if let Some(session_id) = &codex_run.session_id {
             let resume_command =
                 format!("codex resume --include-non-interactive --all {session_id}");
             info!(
-                notification_id = notification.id,
                 pr = %pr.html_url,
                 author = %pr.author,
                 codex_session_id = %session_id,
                 codex_resume = %resume_command,
-                "responded to opened PR"
+                "responded to auto-review pull request"
             );
         } else {
             info!(
-                notification_id = notification.id,
                 pr = %pr.html_url,
                 author = %pr.author,
-                "responded to opened PR"
+                "responded to auto-review pull request"
             );
         }
         Ok(HandleOutcome::Responded)
@@ -347,13 +350,11 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
 
     type FakeMentionResult = Option<Result<Option<CommentMention>, String>>;
-    type FakePullRequestResult = Option<Result<Option<PullRequest>, String>>;
-
     #[derive(Clone, Default)]
     struct FakeGithub {
         notifications: Arc<StdMutex<Vec<Notification>>>,
         mention: Arc<StdMutex<FakeMentionResult>>,
-        pull_request: Arc<StdMutex<FakePullRequestResult>>,
+        pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         posts: Arc<StdMutex<Vec<String>>>,
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
@@ -387,20 +388,8 @@ mod tests {
             }
         }
 
-        async fn pull_request_for(
-            &self,
-            _notification: &Notification,
-        ) -> Result<Option<PullRequest>> {
-            match self
-                .pull_request
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| Ok(None))
-            {
-                Ok(value) => Ok(value),
-                Err(message) => Err(anyhow!(message)),
-            }
+        async fn open_pull_requests(&self, _repo: &RepoSlug) -> Result<Vec<PullRequest>> {
+            Ok(self.pull_requests.lock().unwrap().clone())
         }
 
         async fn post_pr_comment(&self, _pr: &PullRequest, body: &str) -> Result<()> {
@@ -537,16 +526,6 @@ mod tests {
         }
     }
 
-    fn opened_pr_notification(id: &str) -> Notification {
-        Notification {
-            id: id.to_string(),
-            reason: "subscribed".to_string(),
-            subject_kind: "PullRequest".to_string(),
-            subject_url: Some("https://api.github.com/repos/o/r/pulls/1".to_string()),
-            latest_comment_url: None,
-        }
-    }
-
     fn irrelevant_notification(id: &str) -> Notification {
         Notification {
             id: id.to_string(),
@@ -599,6 +578,10 @@ mod tests {
             "maid-bot",
             ["dionysuzx"],
             ["dionysuzx"],
+            [RepoSlug {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+            }],
         )
     }
 
@@ -659,8 +642,7 @@ mod tests {
     async fn responds_to_opened_pr_from_auto_review_account() {
         let checkout = PathBuf::from("/tmp/maid-test-checkout");
         let github = FakeGithub::default();
-        *github.notifications.lock().unwrap() = vec![opened_pr_notification("n1")];
-        *github.pull_request.lock().unwrap() = Some(Ok(Some(pr())));
+        *github.pull_requests.lock().unwrap() = vec![pr()];
         let repos = FakeRepos {
             checkout: checkout.clone(),
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -673,12 +655,13 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(github.marks.lock().unwrap().is_empty());
         assert_eq!(
             *github.events.lock().unwrap(),
-            vec!["start_pr", "post", "handled_pr", "mark"]
+            vec!["start_pr", "post", "handled_pr"]
         );
         assert_eq!(
             *github.started_prs.lock().unwrap(),
@@ -706,8 +689,7 @@ mod tests {
     #[tokio::test]
     async fn skips_opened_pr_from_account_without_auto_review() {
         let github = FakeGithub::default();
-        *github.notifications.lock().unwrap() = vec![opened_pr_notification("n1")];
-        *github.pull_request.lock().unwrap() = Some(Ok(Some(pr_with_author("mayushii"))));
+        *github.pull_requests.lock().unwrap() = vec![pr_with_author("mayushii")];
         let repos = FakeRepos {
             checkout: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -720,9 +702,10 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(github.marks.lock().unwrap().is_empty());
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
@@ -730,8 +713,7 @@ mod tests {
     #[tokio::test]
     async fn skips_opened_pr_with_durable_handled_marker_after_restart() {
         let github = FakeGithub::default();
-        *github.notifications.lock().unwrap() = vec![opened_pr_notification("n1")];
-        *github.pull_request.lock().unwrap() = Some(Ok(Some(pr())));
+        *github.pull_requests.lock().unwrap() = vec![pr()];
         github
             .handled_prs
             .lock()
@@ -749,10 +731,11 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
-        assert_eq!(*github.events.lock().unwrap(), vec!["mark"]);
+        assert!(github.marks.lock().unwrap().is_empty());
+        assert!(github.events.lock().unwrap().is_empty());
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
@@ -760,8 +743,7 @@ mod tests {
     #[tokio::test]
     async fn ignores_self_authored_opened_prs() {
         let github = FakeGithub::default();
-        *github.notifications.lock().unwrap() = vec![opened_pr_notification("n1")];
-        *github.pull_request.lock().unwrap() = Some(Ok(Some(pr_with_author("maid-bot"))));
+        *github.pull_requests.lock().unwrap() = vec![pr_with_author("maid-bot")];
         let repos = FakeRepos {
             checkout: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -774,9 +756,10 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(github.marks.lock().unwrap().is_empty());
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }

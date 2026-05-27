@@ -1,5 +1,5 @@
 use crate::{
-    domain::{CommentMention, Notification, PullRequest},
+    domain::{CommentMention, Notification, PullRequest, RepoSlug},
     maid::{GithubClient, ReviewState},
 };
 use anyhow::{Context, Result, anyhow};
@@ -96,7 +96,9 @@ impl GitHubRestClient {
 impl GithubClient for GitHubRestClient {
     async fn notifications(&self) -> Result<Vec<Notification>> {
         let notifications = self
-            .get::<Vec<ApiNotification>>("https://api.github.com/notifications?per_page=50")
+            .get::<Vec<ApiNotification>>(
+                "https://api.github.com/notifications?participating=true&per_page=50",
+            )
             .await?;
 
         Ok(notifications
@@ -140,12 +142,16 @@ impl GithubClient for GitHubRestClient {
         }))
     }
 
-    async fn pull_request_for(&self, notification: &Notification) -> Result<Option<PullRequest>> {
-        let Some(pr_url) = notification.subject_url.as_deref() else {
-            return Ok(None);
-        };
-
-        self.pull_request_from_url(pr_url).await.map(Some)
+    async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/pulls?state=open&sort=created&direction=desc&per_page=50",
+            repo.owner, repo.repo
+        );
+        let pull_requests = self.get::<Vec<ApiPullRequest>>(&url).await?;
+        pull_requests
+            .into_iter()
+            .map(Self::pull_request_from_api)
+            .collect()
     }
 
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
@@ -213,6 +219,10 @@ impl GithubClient for GitHubRestClient {
 impl GitHubRestClient {
     async fn pull_request_from_url(&self, pr_url: &str) -> Result<PullRequest> {
         let pr = self.get::<ApiPullRequest>(pr_url).await?;
+        Self::pull_request_from_api(pr)
+    }
+
+    fn pull_request_from_api(pr: ApiPullRequest) -> Result<PullRequest> {
         let Some(owner) = pr.base.repo.owner else {
             return Err(anyhow!("pull request base repo has no owner"));
         };

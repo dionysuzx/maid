@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use regex::Regex;
+use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Notification {
@@ -17,12 +18,40 @@ impl Notification {
             && self.subject_url.is_some()
             && self.latest_comment_url.is_some()
     }
+}
 
-    pub fn is_pr_open_candidate(&self) -> bool {
-        self.reason == "subscribed"
-            && self.subject_kind == "PullRequest"
-            && self.subject_url.is_some()
-            && self.latest_comment_url.is_none()
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RepoSlug {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl RepoSlug {
+    pub fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        let Some((owner, repo)) = value.split_once('/') else {
+            return Err(anyhow!(
+                "repository must be formatted as owner/repo: {value:?}"
+            ));
+        };
+        if repo.contains('/') {
+            return Err(anyhow!(
+                "repository must be formatted as owner/repo: {value:?}"
+            ));
+        }
+
+        validate_repo_name_part(owner, "repository owner")?;
+        validate_repo_name_part(repo, "repository name")?;
+        Ok(Self {
+            owner: owner.to_ascii_lowercase(),
+            repo: repo.to_ascii_lowercase(),
+        })
+    }
+}
+
+impl fmt::Display for RepoSlug {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.owner, self.repo)
     }
 }
 
@@ -154,6 +183,8 @@ pub enum CodexTaskOrigin {
 
 pub fn validate_repo_name_part(value: &str, label: &str) -> Result<()> {
     let valid = !value.is_empty()
+        && value != "."
+        && value != ".."
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
@@ -198,38 +229,6 @@ mod tests {
             },
         ] {
             assert!(!notification.is_pr_mention_candidate());
-        }
-    }
-
-    #[test]
-    fn filters_to_pull_request_open_notifications_without_comment_urls() {
-        let eligible = Notification {
-            id: "1".to_string(),
-            reason: "subscribed".to_string(),
-            subject_kind: "PullRequest".to_string(),
-            subject_url: Some("https://api.github.com/repos/o/r/pulls/1".to_string()),
-            latest_comment_url: None,
-        };
-
-        assert!(eligible.is_pr_open_candidate());
-
-        for notification in [
-            Notification {
-                reason: "mention".to_string(),
-                ..eligible.clone()
-            },
-            Notification {
-                subject_kind: "Issue".to_string(),
-                ..eligible.clone()
-            },
-            Notification {
-                latest_comment_url: Some(
-                    "https://api.github.com/repos/o/r/issues/comments/2".to_string(),
-                ),
-                ..eligible.clone()
-            },
-        ] {
-            assert!(!notification.is_pr_open_candidate());
         }
     }
 
@@ -286,5 +285,20 @@ mod tests {
         assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Opened by:\ndionysuzx"));
         assert!(prompt.contains("Review request:\nplease review"));
+    }
+
+    #[test]
+    fn parses_repository_slugs() {
+        assert_eq!(
+            RepoSlug::parse(" Dionysuzx/Maid ").unwrap(),
+            RepoSlug {
+                owner: "dionysuzx".to_string(),
+                repo: "maid".to_string(),
+            }
+        );
+
+        assert!(RepoSlug::parse("dionysuzx").is_err());
+        assert!(RepoSlug::parse("dionysuzx/maid/extra").is_err());
+        assert!(RepoSlug::parse("../maid").is_err());
     }
 }
