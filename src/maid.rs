@@ -161,24 +161,72 @@ where
             return Ok(HandleOutcome::Skipped);
         };
 
-        let pr = mention.pr.clone();
+        match self.github.mention_state(&mention, &self.bot_login).await? {
+            ReviewState::Pending => {}
+            ReviewState::Handled => {
+                info!(
+                    notification_id = notification.id,
+                    mention = %mention.html_url,
+                    "skipping already handled mention"
+                );
+                self.github.mark_notification_handled(notification).await?;
+                return Ok(HandleOutcome::Skipped);
+            }
+        }
+
+        self.github.mark_mention_started(&mention).await?;
+        info!(
+            notification_id = notification.id,
+            pr = %mention.pr.html_url,
+            mention = %mention.html_url,
+            "started handling mention"
+        );
+
+        let checkout = self.repos.prepare(&mention.pr).await?;
         let task = CodexTask {
-            pr_url: pr.html_url.clone(),
+            pr_url: mention.pr.html_url.clone(),
             origin: CodexTaskOrigin::Mention {
                 mention_url: mention.html_url.clone(),
                 raw_body: request.raw_body,
                 cleaned_text: request.cleaned_text,
             },
         };
-        self.run_review(
-            notification,
-            ReviewWork {
-                pr,
-                task,
-                marker: ReviewMarker::Mention(Box::new(mention)),
-            },
-        )
-        .await
+        let codex_run = self.codex.run(&checkout, &task).await?;
+
+        self.github
+            .post_pr_comment(&mention.pr, &codex_run.response)
+            .await?;
+        if let Err(err) = self.github.mark_mention_handled(&mention).await {
+            error!(
+                notification_id = notification.id,
+                pr = %mention.pr.html_url,
+                mention = %mention.html_url,
+                error = ?err,
+                "failed to mark mention handled after posting response"
+            );
+        }
+        self.github.mark_notification_handled(notification).await?;
+
+        if let Some(session_id) = &codex_run.session_id {
+            let resume_command =
+                format!("codex resume --include-non-interactive --all {session_id}");
+            info!(
+                notification_id = notification.id,
+                pr = %mention.pr.html_url,
+                mention = %mention.html_url,
+                codex_session_id = %session_id,
+                codex_resume = %resume_command,
+                "responded to mention"
+            );
+        } else {
+            info!(
+                notification_id = notification.id,
+                pr = %mention.pr.html_url,
+                mention = %mention.html_url,
+                "responded to mention"
+            );
+        }
+        Ok(HandleOutcome::Responded)
     }
 
     async fn handle_pr_open(&self, notification: &Notification) -> Result<HandleOutcome> {
@@ -205,63 +253,45 @@ where
             return Ok(HandleOutcome::Skipped);
         }
 
-        let task = CodexTask {
-            pr_url: pr.html_url.clone(),
-            origin: CodexTaskOrigin::PullRequestOpened {
-                author: pr.author.clone(),
-            },
-        };
-        self.run_review(
-            notification,
-            ReviewWork {
-                pr,
-                task,
-                marker: ReviewMarker::PullRequest,
-            },
-        )
-        .await
-    }
-
-    async fn run_review(
-        &self,
-        notification: &Notification,
-        work: ReviewWork,
-    ) -> Result<HandleOutcome> {
-        match self.review_state(&work).await? {
+        match self.github.pr_state(&pr, &self.bot_login).await? {
             ReviewState::Pending => {}
             ReviewState::Handled => {
                 info!(
                     notification_id = notification.id,
-                    pr = %work.pr.html_url,
-                    trigger = %work.task.trigger_url(),
-                    "skipping already handled review"
+                    pr = %pr.html_url,
+                    "skipping already handled opened PR"
                 );
                 self.github.mark_notification_handled(notification).await?;
                 return Ok(HandleOutcome::Skipped);
             }
         }
 
-        self.mark_review_started(&work).await?;
+        self.github.mark_pr_started(&pr).await?;
         info!(
             notification_id = notification.id,
-            pr = %work.pr.html_url,
-            trigger = %work.task.trigger_url(),
-            "started handling review"
+            pr = %pr.html_url,
+            author = %pr.author,
+            "started handling opened PR"
         );
 
-        let checkout = self.repos.prepare(&work.pr).await?;
-        let codex_run = self.codex.run(&checkout, &work.task).await?;
+        let checkout = self.repos.prepare(&pr).await?;
+        let task = CodexTask {
+            pr_url: pr.html_url.clone(),
+            origin: CodexTaskOrigin::PullRequestOpened {
+                author: pr.author.clone(),
+            },
+        };
+        let codex_run = self.codex.run(&checkout, &task).await?;
 
         self.github
-            .post_pr_comment(&work.pr, &codex_run.response)
+            .post_pr_comment(&pr, &codex_run.response)
             .await?;
-        if let Err(err) = self.mark_review_handled(&work).await {
+        if let Err(err) = self.github.mark_pr_handled(&pr).await {
             error!(
                 notification_id = notification.id,
-                pr = %work.pr.html_url,
-                trigger = %work.task.trigger_url(),
+                pr = %pr.html_url,
                 error = ?err,
-                "failed to mark review handled after posting response"
+                "failed to mark opened PR handled after posting response"
             );
         }
         self.github.mark_notification_handled(notification).await?;
@@ -271,44 +301,21 @@ where
                 format!("codex resume --include-non-interactive --all {session_id}");
             info!(
                 notification_id = notification.id,
-                pr = %work.pr.html_url,
-                trigger = %work.task.trigger_url(),
+                pr = %pr.html_url,
+                author = %pr.author,
                 codex_session_id = %session_id,
                 codex_resume = %resume_command,
-                "responded to review request"
+                "responded to opened PR"
             );
         } else {
             info!(
                 notification_id = notification.id,
-                pr = %work.pr.html_url,
-                trigger = %work.task.trigger_url(),
-                "responded to review request"
+                pr = %pr.html_url,
+                author = %pr.author,
+                "responded to opened PR"
             );
         }
         Ok(HandleOutcome::Responded)
-    }
-
-    async fn review_state(&self, work: &ReviewWork) -> Result<ReviewState> {
-        match &work.marker {
-            ReviewMarker::Mention(mention) => {
-                self.github.mention_state(mention, &self.bot_login).await
-            }
-            ReviewMarker::PullRequest => self.github.pr_state(&work.pr, &self.bot_login).await,
-        }
-    }
-
-    async fn mark_review_started(&self, work: &ReviewWork) -> Result<()> {
-        match &work.marker {
-            ReviewMarker::Mention(mention) => self.github.mark_mention_started(mention).await,
-            ReviewMarker::PullRequest => self.github.mark_pr_started(&work.pr).await,
-        }
-    }
-
-    async fn mark_review_handled(&self, work: &ReviewWork) -> Result<()> {
-        match &work.marker {
-            ReviewMarker::Mention(mention) => self.github.mark_mention_handled(mention).await,
-            ReviewMarker::PullRequest => self.github.mark_pr_handled(&work.pr).await,
-        }
     }
 }
 
@@ -331,17 +338,6 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
 enum HandleOutcome {
     Responded,
     Skipped,
-}
-
-struct ReviewWork {
-    pr: PullRequest,
-    task: CodexTask,
-    marker: ReviewMarker,
-}
-
-enum ReviewMarker {
-    Mention(Box<CommentMention>),
-    PullRequest,
 }
 
 #[cfg(test)]
