@@ -1,3 +1,4 @@
+use crate::domain::RepoSlug;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::{
@@ -15,6 +16,7 @@ pub struct Config {
     pub bot_login: String,
     pub master_accounts: Vec<String>,
     pub auto_review_accounts: Vec<String>,
+    pub auto_review_repos: Vec<RepoSlug>,
     pub cache_dir: PathBuf,
     pub poll_interval: Duration,
     pub codex_bin: String,
@@ -42,6 +44,7 @@ impl Config {
                 bail!("auto_review_accounts must be a subset of master_accounts: {login}");
             }
         }
+        let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
         let github_token = gh_token_for(&bot_login)?;
         let bind_addr = non_empty(file.bind)
             .unwrap_or_else(|| "127.0.0.1:3000".to_string())
@@ -64,6 +67,7 @@ impl Config {
             bot_login,
             master_accounts,
             auto_review_accounts,
+            auto_review_repos,
             cache_dir,
             poll_interval: Duration::from_secs(poll_seconds),
             codex_bin,
@@ -77,6 +81,7 @@ struct ConfigFile {
     bot_login: Option<String>,
     master_accounts: Option<Vec<String>>,
     auto_review_accounts: Option<Vec<String>>,
+    auto_review_repos: Option<Vec<String>>,
     bind: Option<String>,
     cache_dir: Option<String>,
     poll_seconds: Option<u64>,
@@ -130,6 +135,21 @@ fn optional_logins(value: Option<Vec<String>>, key: &str) -> Result<Option<Vec<S
     value
         .map(|raw_logins| normalize_logins(raw_logins, key))
         .transpose()
+}
+
+fn optional_repos(value: Option<Vec<String>>, key: &str) -> Result<Vec<RepoSlug>> {
+    let Some(raw_repos) = value else {
+        return Ok(Vec::new());
+    };
+
+    let mut repos = Vec::new();
+    for repo in raw_repos {
+        let repo = RepoSlug::parse(&repo).with_context(|| format!("invalid {key} entry"))?;
+        if !repos.contains(&repo) {
+            repos.push(repo);
+        }
+    }
+    Ok(repos)
 }
 
 fn normalize_logins(raw_logins: Vec<String>, key: &str) -> Result<Vec<String>> {
@@ -203,6 +223,7 @@ mod tests {
 bot_login = "maid-bot"
 master_accounts = ["dionysuzx"]
 auto_review_accounts = ["dionysuzx"]
+auto_review_repos = ["dionysuzx/maid"]
 bind = "127.0.0.1:4000"
 cache_dir = "~/.maid/cache"
 poll_seconds = 30
@@ -220,6 +241,10 @@ github_api_ip = "127.0.0.1"
             config.auto_review_accounts,
             Some(vec!["dionysuzx".to_string()])
         );
+        assert_eq!(
+            config.auto_review_repos,
+            Some(vec!["dionysuzx/maid".to_string()])
+        );
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:4000"));
         assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
         assert_eq!(config.poll_seconds, Some(30));
@@ -234,6 +259,7 @@ github_api_ip = "127.0.0.1"
         assert_eq!(config.bot_login, None);
         assert_eq!(config.master_accounts, None);
         assert_eq!(config.auto_review_accounts, None);
+        assert_eq!(config.auto_review_repos, None);
         assert_eq!(config.poll_seconds, None);
     }
 
@@ -282,6 +308,33 @@ github_api_ip = "127.0.0.1"
         );
         assert!(optional_logins(Some(vec![" ".to_string()]), "auto_review_accounts").is_err());
         assert_eq!(optional_logins(None, "auto_review_accounts").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_repositories_parse_to_slugs() {
+        assert_eq!(
+            optional_repos(
+                Some(vec![
+                    "  Dionysuzx/Maid  ".to_string(),
+                    "dionysuzx/maid".to_string()
+                ]),
+                "auto_review_repos"
+            )
+            .unwrap(),
+            vec![RepoSlug {
+                owner: "dionysuzx".to_string(),
+                repo: "maid".to_string(),
+            }]
+        );
+        assert_eq!(
+            optional_repos(Some(Vec::new()), "auto_review_repos").unwrap(),
+            Vec::<RepoSlug>::new()
+        );
+        assert!(optional_repos(Some(vec!["dionysuzx".to_string()]), "auto_review_repos").is_err());
+        assert_eq!(
+            optional_repos(None, "auto_review_repos").unwrap(),
+            Vec::<RepoSlug>::new()
+        );
     }
 
     #[test]

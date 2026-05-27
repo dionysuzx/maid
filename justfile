@@ -32,10 +32,11 @@ init:
         printf '%s\n' 'bot_login = ""'
         printf '%s\n' 'master_accounts = ["dionysuzx"]'
         printf '%s\n' 'auto_review_accounts = ["dionysuzx"]'
+        printf '%s\n' 'auto_review_repos = ["dionysuzx/maid"]'
     } >"$config_file"
 
     echo "created $config_file"
-    echo "edit bot_login, master_accounts, and auto_review_accounts, then run: just start"
+    echo "edit bot_login, master_accounts, auto_review_accounts, and auto_review_repos, then run: just start"
 
 start:
     #!/usr/bin/env bash
