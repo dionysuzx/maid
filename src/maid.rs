@@ -130,6 +130,7 @@ where
             return self.handle_pr_open(notification).await;
         }
 
+        self.github.mark_notification_handled(notification).await?;
         Ok(HandleOutcome::Skipped)
     }
 
@@ -160,72 +161,24 @@ where
             return Ok(HandleOutcome::Skipped);
         };
 
-        match self.github.mention_state(&mention, &self.bot_login).await? {
-            ReviewState::Pending => {}
-            ReviewState::Handled => {
-                info!(
-                    notification_id = notification.id,
-                    mention = %mention.html_url,
-                    "skipping already handled mention"
-                );
-                self.github.mark_notification_handled(notification).await?;
-                return Ok(HandleOutcome::Skipped);
-            }
-        }
-
-        self.github.mark_mention_started(&mention).await?;
-        info!(
-            notification_id = notification.id,
-            pr = %mention.pr.html_url,
-            mention = %mention.html_url,
-            "started handling mention"
-        );
-
-        let checkout = self.repos.prepare(&mention.pr).await?;
+        let pr = mention.pr.clone();
         let task = CodexTask {
-            pr_url: mention.pr.html_url.clone(),
+            pr_url: pr.html_url.clone(),
             origin: CodexTaskOrigin::Mention {
                 mention_url: mention.html_url.clone(),
                 raw_body: request.raw_body,
                 cleaned_text: request.cleaned_text,
             },
         };
-        let codex_run = self.codex.run(&checkout, &task).await?;
-
-        self.github
-            .post_pr_comment(&mention.pr, &codex_run.response)
-            .await?;
-        if let Err(err) = self.github.mark_mention_handled(&mention).await {
-            error!(
-                notification_id = notification.id,
-                pr = %mention.pr.html_url,
-                mention = %mention.html_url,
-                error = ?err,
-                "failed to mark mention handled after posting response"
-            );
-        }
-        self.github.mark_notification_handled(notification).await?;
-
-        if let Some(session_id) = &codex_run.session_id {
-            let resume_command =
-                format!("codex resume --include-non-interactive --all {session_id}");
-            info!(
-                notification_id = notification.id,
-                pr = %mention.pr.html_url,
-                mention = %mention.html_url,
-                codex_session_id = %session_id,
-                codex_resume = %resume_command,
-                "responded to mention"
-            );
-        } else {
-            info!(
-                notification_id = notification.id,
-                pr = %mention.pr.html_url,
-                mention = %mention.html_url,
-                "responded to mention"
-            );
-        }
-        Ok(HandleOutcome::Responded)
+        self.run_review(
+            notification,
+            ReviewWork {
+                pr,
+                task,
+                marker: ReviewMarker::Mention(Box::new(mention)),
+            },
+        )
+        .await
     }
 
     async fn handle_pr_open(&self, notification: &Notification) -> Result<HandleOutcome> {
@@ -252,45 +205,63 @@ where
             return Ok(HandleOutcome::Skipped);
         }
 
-        match self.github.pr_state(&pr, &self.bot_login).await? {
-            ReviewState::Pending => {}
-            ReviewState::Handled => {
-                info!(
-                    notification_id = notification.id,
-                    pr = %pr.html_url,
-                    "skipping already handled opened PR"
-                );
-                self.github.mark_notification_handled(notification).await?;
-                return Ok(HandleOutcome::Skipped);
-            }
-        }
-
-        self.github.mark_pr_started(&pr).await?;
-        info!(
-            notification_id = notification.id,
-            pr = %pr.html_url,
-            author = %pr.author,
-            "started handling opened PR"
-        );
-
-        let checkout = self.repos.prepare(&pr).await?;
         let task = CodexTask {
             pr_url: pr.html_url.clone(),
             origin: CodexTaskOrigin::PullRequestOpened {
                 author: pr.author.clone(),
             },
         };
-        let codex_run = self.codex.run(&checkout, &task).await?;
+        self.run_review(
+            notification,
+            ReviewWork {
+                pr,
+                task,
+                marker: ReviewMarker::PullRequest,
+            },
+        )
+        .await
+    }
+
+    async fn run_review(
+        &self,
+        notification: &Notification,
+        work: ReviewWork,
+    ) -> Result<HandleOutcome> {
+        match self.review_state(&work).await? {
+            ReviewState::Pending => {}
+            ReviewState::Handled => {
+                info!(
+                    notification_id = notification.id,
+                    pr = %work.pr.html_url,
+                    trigger = %work.task.trigger_url(),
+                    "skipping already handled review"
+                );
+                self.github.mark_notification_handled(notification).await?;
+                return Ok(HandleOutcome::Skipped);
+            }
+        }
+
+        self.mark_review_started(&work).await?;
+        info!(
+            notification_id = notification.id,
+            pr = %work.pr.html_url,
+            trigger = %work.task.trigger_url(),
+            "started handling review"
+        );
+
+        let checkout = self.repos.prepare(&work.pr).await?;
+        let codex_run = self.codex.run(&checkout, &work.task).await?;
 
         self.github
-            .post_pr_comment(&pr, &codex_run.response)
+            .post_pr_comment(&work.pr, &codex_run.response)
             .await?;
-        if let Err(err) = self.github.mark_pr_handled(&pr).await {
+        if let Err(err) = self.mark_review_handled(&work).await {
             error!(
                 notification_id = notification.id,
-                pr = %pr.html_url,
+                pr = %work.pr.html_url,
+                trigger = %work.task.trigger_url(),
                 error = ?err,
-                "failed to mark opened PR handled after posting response"
+                "failed to mark review handled after posting response"
             );
         }
         self.github.mark_notification_handled(notification).await?;
@@ -300,21 +271,44 @@ where
                 format!("codex resume --include-non-interactive --all {session_id}");
             info!(
                 notification_id = notification.id,
-                pr = %pr.html_url,
-                author = %pr.author,
+                pr = %work.pr.html_url,
+                trigger = %work.task.trigger_url(),
                 codex_session_id = %session_id,
                 codex_resume = %resume_command,
-                "responded to opened PR"
+                "responded to review request"
             );
         } else {
             info!(
                 notification_id = notification.id,
-                pr = %pr.html_url,
-                author = %pr.author,
-                "responded to opened PR"
+                pr = %work.pr.html_url,
+                trigger = %work.task.trigger_url(),
+                "responded to review request"
             );
         }
         Ok(HandleOutcome::Responded)
+    }
+
+    async fn review_state(&self, work: &ReviewWork) -> Result<ReviewState> {
+        match &work.marker {
+            ReviewMarker::Mention(mention) => {
+                self.github.mention_state(mention, &self.bot_login).await
+            }
+            ReviewMarker::PullRequest => self.github.pr_state(&work.pr, &self.bot_login).await,
+        }
+    }
+
+    async fn mark_review_started(&self, work: &ReviewWork) -> Result<()> {
+        match &work.marker {
+            ReviewMarker::Mention(mention) => self.github.mark_mention_started(mention).await,
+            ReviewMarker::PullRequest => self.github.mark_pr_started(&work.pr).await,
+        }
+    }
+
+    async fn mark_review_handled(&self, work: &ReviewWork) -> Result<()> {
+        match &work.marker {
+            ReviewMarker::Mention(mention) => self.github.mark_mention_handled(mention).await,
+            ReviewMarker::PullRequest => self.github.mark_pr_handled(&work.pr).await,
+        }
     }
 }
 
@@ -337,6 +331,17 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
 enum HandleOutcome {
     Responded,
     Skipped,
+}
+
+struct ReviewWork {
+    pr: PullRequest,
+    task: CodexTask,
+    marker: ReviewMarker,
+}
+
+enum ReviewMarker {
+    Mention(Box<CommentMention>),
+    PullRequest,
 }
 
 #[cfg(test)]
@@ -542,6 +547,16 @@ mod tests {
             reason: "subscribed".to_string(),
             subject_kind: "PullRequest".to_string(),
             subject_url: Some("https://api.github.com/repos/o/r/pulls/1".to_string()),
+            latest_comment_url: None,
+        }
+    }
+
+    fn irrelevant_notification(id: &str) -> Notification {
+        Notification {
+            id: id.to_string(),
+            reason: "subscribed".to_string(),
+            subject_kind: "Issue".to_string(),
+            subject_url: Some("https://api.github.com/repos/o/r/issues/1".to_string()),
             latest_comment_url: None,
         }
     }
@@ -790,6 +805,29 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn marks_irrelevant_unread_notifications_handled() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![irrelevant_notification("n1")];
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(github.posts.lock().unwrap().is_empty());
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
