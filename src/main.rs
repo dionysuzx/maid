@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
         GitRepoCache::new(config.cache_dir.clone(), config.github_token.clone()),
         CodexCli::new(config.codex_bin.clone()),
         config.bot_login.clone(),
+        config.master_accounts.clone(),
     );
 
     let app = Router::new().route("/healthz", get(|| async { "ok" }));
@@ -45,6 +46,7 @@ async fn main() -> Result<()> {
         addr = %config.bind_addr,
         cache_dir = %config.cache_dir.display(),
         poll_seconds = config.poll_interval.as_secs(),
+        master_accounts = config.master_accounts.len(),
         "maid started"
     );
 

@@ -28,12 +28,13 @@ init:
     fi
 
     {
-        printf '%s\n' '# Fill in your GitHub bot account login before starting Maid.'
+        printf '%s\n' '# Fill in the GitHub bot account login and master accounts before starting Maid.'
         printf '%s\n' 'bot_login = ""'
+        printf '%s\n' 'master_accounts = ["dionysuzx"]'
     } >"$config_file"
 
     echo "created $config_file"
-    echo "edit bot_login, then run: just start"
+    echo "edit bot_login and master_accounts, then run: just start"
 
 start:
     #!/usr/bin/env bash

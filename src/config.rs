@@ -13,6 +13,7 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub github_token: String,
     pub bot_login: String,
+    pub master_accounts: Vec<String>,
     pub cache_dir: PathBuf,
     pub poll_interval: Duration,
     pub codex_bin: String,
@@ -30,6 +31,8 @@ impl Config {
                 config_path.display()
             )
         })?;
+        let master_accounts = required_logins(file.master_accounts, "master_accounts")
+            .with_context(|| format!("master_accounts is required in {}", config_path.display()))?;
         let github_token = gh_token_for(&bot_login)?;
         let bind_addr = non_empty(file.bind)
             .unwrap_or_else(|| "127.0.0.1:3000".to_string())
@@ -50,6 +53,7 @@ impl Config {
             bind_addr,
             github_token,
             bot_login,
+            master_accounts,
             cache_dir,
             poll_interval: Duration::from_secs(poll_seconds),
             codex_bin,
@@ -61,6 +65,7 @@ impl Config {
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     bot_login: Option<String>,
+    master_accounts: Option<Vec<String>>,
     bind: Option<String>,
     cache_dir: Option<String>,
     poll_seconds: Option<u64>,
@@ -95,6 +100,31 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn required_logins(value: Option<Vec<String>>, key: &str) -> Result<Vec<String>> {
+    let Some(raw_logins) = value else {
+        bail!("{key} must list at least one GitHub login");
+    };
+
+    let mut logins = Vec::new();
+    for login in raw_logins {
+        let login = login.trim();
+        if login.is_empty() {
+            bail!("{key} cannot contain empty GitHub logins");
+        }
+
+        let normalized = login.to_ascii_lowercase();
+        if !logins.contains(&normalized) {
+            logins.push(normalized);
+        }
+    }
+
+    if logins.is_empty() {
+        bail!("{key} must list at least one GitHub login");
+    }
+
+    Ok(logins)
 }
 
 fn expand_home(path: &str) -> Result<PathBuf> {
@@ -149,6 +179,7 @@ mod tests {
             file,
             r#"
 bot_login = "maid-bot"
+master_accounts = ["dionysuzx"]
 bind = "127.0.0.1:4000"
 cache_dir = "~/.maid/cache"
 poll_seconds = 30
@@ -161,6 +192,7 @@ github_api_ip = "127.0.0.1"
         let config = ConfigFile::read(file.path()).unwrap();
 
         assert_eq!(config.bot_login.as_deref(), Some("maid-bot"));
+        assert_eq!(config.master_accounts, Some(vec!["dionysuzx".to_string()]));
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:4000"));
         assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
         assert_eq!(config.poll_seconds, Some(30));
@@ -173,6 +205,7 @@ github_api_ip = "127.0.0.1"
         let config = ConfigFile::read(Path::new("/tmp/maid-missing-config-for-test.toml")).unwrap();
 
         assert_eq!(config.bot_login, None);
+        assert_eq!(config.master_accounts, None);
         assert_eq!(config.poll_seconds, None);
     }
 
@@ -183,6 +216,26 @@ github_api_ip = "127.0.0.1"
             Some("maid-bot")
         );
         assert_eq!(non_empty(Some("  ".to_string())), None);
+    }
+
+    #[test]
+    fn validates_required_login_lists() {
+        assert_eq!(
+            required_logins(
+                Some(vec![
+                    "  Dionysuzx  ".to_string(),
+                    "dionysuzx".to_string(),
+                    "mayushii-admin".to_string()
+                ]),
+                "master_accounts"
+            )
+            .unwrap(),
+            vec!["dionysuzx".to_string(), "mayushii-admin".to_string()]
+        );
+
+        assert!(required_logins(None, "master_accounts").is_err());
+        assert!(required_logins(Some(Vec::new()), "master_accounts").is_err());
+        assert!(required_logins(Some(vec![" ".to_string()]), "master_accounts").is_err());
     }
 
     #[test]
