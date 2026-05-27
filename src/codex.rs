@@ -135,7 +135,7 @@ impl CodexJsonEvents {
             if let Some(session_id) = events.observe_line(&line) {
                 info!(
                     pr = %task.pr_url,
-                    mention = %task.mention_url,
+                    trigger = %task.trigger_url(),
                     checkout = %checkout.display(),
                     codex_session_id = %session_id,
                     "codex session started"

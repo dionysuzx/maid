@@ -17,6 +17,13 @@ impl Notification {
             && self.subject_url.is_some()
             && self.latest_comment_url.is_some()
     }
+
+    pub fn is_pr_open_candidate(&self) -> bool {
+        self.reason == "subscribed"
+            && self.subject_kind == "PullRequest"
+            && self.subject_url.is_some()
+            && self.latest_comment_url.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +31,7 @@ pub struct PullRequest {
     pub owner: String,
     pub repo: String,
     pub number: u64,
+    pub author: String,
     pub api_url: String,
     pub html_url: String,
     pub clone_url: String,
@@ -67,16 +75,19 @@ impl MentionRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexTask {
-    pub mention_url: String,
     pub pr_url: String,
-    pub raw_body: String,
-    pub cleaned_text: String,
+    pub origin: CodexTaskOrigin,
 }
 
 impl CodexTask {
     pub fn prompt(&self) -> String {
-        format!(
-            "\
+        match &self.origin {
+            CodexTaskOrigin::Mention {
+                mention_url,
+                raw_body,
+                cleaned_text,
+            } => format!(
+                "\
 You are responding to a GitHub pull request mention.
 
 Inspect the checkout in your current working directory and answer the request.
@@ -94,12 +105,51 @@ Raw mention body:
 Cleaned request text:
 {cleaned_text}
 ",
-            mention_url = self.mention_url,
-            pr_url = self.pr_url,
-            raw_body = self.raw_body,
-            cleaned_text = self.cleaned_text,
-        )
+                mention_url = mention_url,
+                pr_url = self.pr_url,
+                raw_body = raw_body,
+                cleaned_text = cleaned_text,
+            ),
+            CodexTaskOrigin::PullRequestOpened { author } => format!(
+                "\
+You are responding automatically to a GitHub pull request opened by a trusted account.
+
+Inspect the checkout in your current working directory and review the pull request.
+Return only the GitHub comment body to post. Do not include tool logs or wrappers.
+
+Pull request URL:
+{pr_url}
+
+Opened by:
+{author}
+
+Review request:
+please review
+",
+                pr_url = self.pr_url,
+                author = author,
+            ),
+        }
     }
+
+    pub fn trigger_url(&self) -> &str {
+        match &self.origin {
+            CodexTaskOrigin::Mention { mention_url, .. } => mention_url,
+            CodexTaskOrigin::PullRequestOpened { .. } => &self.pr_url,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodexTaskOrigin {
+    Mention {
+        mention_url: String,
+        raw_body: String,
+        cleaned_text: String,
+    },
+    PullRequestOpened {
+        author: String,
+    },
 }
 
 pub fn validate_repo_name_part(value: &str, label: &str) -> Result<()> {
@@ -152,6 +202,38 @@ mod tests {
     }
 
     #[test]
+    fn filters_to_pull_request_open_notifications_without_comment_urls() {
+        let eligible = Notification {
+            id: "1".to_string(),
+            reason: "subscribed".to_string(),
+            subject_kind: "PullRequest".to_string(),
+            subject_url: Some("https://api.github.com/repos/o/r/pulls/1".to_string()),
+            latest_comment_url: None,
+        };
+
+        assert!(eligible.is_pr_open_candidate());
+
+        for notification in [
+            Notification {
+                reason: "mention".to_string(),
+                ..eligible.clone()
+            },
+            Notification {
+                subject_kind: "Issue".to_string(),
+                ..eligible.clone()
+            },
+            Notification {
+                latest_comment_url: Some(
+                    "https://api.github.com/repos/o/r/issues/comments/2".to_string(),
+                ),
+                ..eligible.clone()
+            },
+        ] {
+            assert!(!notification.is_pr_open_candidate());
+        }
+    }
+
+    #[test]
     fn parses_mentions_and_cleans_request_text() {
         let request = MentionRequest::parse("@maid-bot please review this PR", "maid-bot")
             .unwrap()
@@ -175,10 +257,12 @@ mod tests {
     #[test]
     fn builds_codex_prompt_with_required_context() {
         let task = CodexTask {
-            mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
             pr_url: "https://github.com/o/r/pull/1".to_string(),
-            raw_body: "@maid-bot review".to_string(),
-            cleaned_text: "review".to_string(),
+            origin: CodexTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot review".to_string(),
+                cleaned_text: "review".to_string(),
+            },
         };
 
         let prompt = task.prompt();
@@ -186,5 +270,21 @@ mod tests {
         assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Raw mention body:\n@maid-bot review"));
         assert!(prompt.contains("Cleaned request text:\nreview"));
+    }
+
+    #[test]
+    fn builds_codex_prompt_for_automatic_pull_request_review() {
+        let task = CodexTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: CodexTaskOrigin::PullRequestOpened {
+                author: "dionysuzx".to_string(),
+            },
+        };
+
+        let prompt = task.prompt();
+        assert!(prompt.contains("automatically to a GitHub pull request"));
+        assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
+        assert!(prompt.contains("Opened by:\ndionysuzx"));
+        assert!(prompt.contains("Review request:\nplease review"));
     }
 }

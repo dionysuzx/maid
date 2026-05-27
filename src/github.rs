@@ -1,6 +1,6 @@
 use crate::{
     domain::{CommentMention, Notification, PullRequest},
-    maid::{GithubClient, MentionState},
+    maid::{GithubClient, ReviewState},
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -96,9 +96,7 @@ impl GitHubRestClient {
 impl GithubClient for GitHubRestClient {
     async fn notifications(&self) -> Result<Vec<Notification>> {
         let notifications = self
-            .get::<Vec<ApiNotification>>(
-                "https://api.github.com/notifications?participating=true&per_page=50",
-            )
+            .get::<Vec<ApiNotification>>("https://api.github.com/notifications?per_page=50")
             .await?;
 
         Ok(notifications
@@ -131,25 +129,23 @@ impl GithubClient for GitHubRestClient {
             return Ok(None);
         };
 
-        let pr = self.get::<ApiPullRequest>(&pr_url).await?;
-        let Some(owner) = pr.base.repo.owner else {
-            return Err(anyhow!("pull request base repo has no owner"));
-        };
+        let pr = self.pull_request_from_url(&pr_url).await?;
 
         Ok(Some(CommentMention {
             author: comment.user.login,
             body: comment.body,
             api_url: comment_url.to_string(),
             html_url: comment.html_url,
-            pr: PullRequest {
-                owner: owner.login,
-                repo: pr.base.repo.name,
-                number: pr.number,
-                api_url: pr.url,
-                html_url: pr.html_url,
-                clone_url: pr.base.repo.clone_url,
-            },
+            pr,
         }))
+    }
+
+    async fn pull_request_for(&self, notification: &Notification) -> Result<Option<PullRequest>> {
+        let Some(pr_url) = notification.subject_url.as_deref() else {
+            return Ok(None);
+        };
+
+        self.pull_request_from_url(pr_url).await.map(Some)
     }
 
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
@@ -164,14 +160,14 @@ impl GithubClient for GitHubRestClient {
         &self,
         mention: &CommentMention,
         bot_login: &str,
-    ) -> Result<MentionState> {
+    ) -> Result<ReviewState> {
         if self
             .mention_has_reaction(mention, bot_login, HANDLED_REACTION)
             .await?
         {
-            Ok(MentionState::Handled)
+            Ok(ReviewState::Handled)
         } else {
-            Ok(MentionState::Pending)
+            Ok(ReviewState::Pending)
         }
     }
 
@@ -181,6 +177,25 @@ impl GithubClient for GitHubRestClient {
 
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()> {
         self.add_reaction(mention, HANDLED_REACTION).await
+    }
+
+    async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState> {
+        if self
+            .pr_has_reaction(pr, bot_login, HANDLED_REACTION)
+            .await?
+        {
+            Ok(ReviewState::Handled)
+        } else {
+            Ok(ReviewState::Pending)
+        }
+    }
+
+    async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()> {
+        self.add_pr_reaction(pr, STARTED_REACTION).await
+    }
+
+    async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()> {
+        self.add_pr_reaction(pr, HANDLED_REACTION).await
     }
 
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
@@ -196,6 +211,23 @@ impl GithubClient for GitHubRestClient {
 }
 
 impl GitHubRestClient {
+    async fn pull_request_from_url(&self, pr_url: &str) -> Result<PullRequest> {
+        let pr = self.get::<ApiPullRequest>(pr_url).await?;
+        let Some(owner) = pr.base.repo.owner else {
+            return Err(anyhow!("pull request base repo has no owner"));
+        };
+
+        Ok(PullRequest {
+            owner: owner.login,
+            repo: pr.base.repo.name,
+            number: pr.number,
+            author: pr.user.login,
+            api_url: pr.url,
+            html_url: pr.html_url,
+            clone_url: pr.base.repo.clone_url,
+        })
+    }
+
     async fn mention_has_reaction(
         &self,
         mention: &CommentMention,
@@ -214,6 +246,33 @@ impl GitHubRestClient {
     async fn add_reaction(&self, mention: &CommentMention, content: &str) -> Result<()> {
         let url = format!("{}/reactions", mention.api_url);
         self.post_json(&url, &PostReaction { content }).await
+    }
+
+    async fn pr_has_reaction(
+        &self,
+        pr: &PullRequest,
+        bot_login: &str,
+        content: &str,
+    ) -> Result<bool> {
+        let reactions = self
+            .get::<Vec<ApiReaction>>(&format!("{}?per_page=100", self.pr_reactions_url(pr)))
+            .await?;
+
+        Ok(reactions.into_iter().any(|reaction| {
+            reaction.content == content && reaction.user.login.eq_ignore_ascii_case(bot_login)
+        }))
+    }
+
+    async fn add_pr_reaction(&self, pr: &PullRequest, content: &str) -> Result<()> {
+        self.post_json(&self.pr_reactions_url(pr), &PostReaction { content })
+            .await
+    }
+
+    fn pr_reactions_url(&self, pr: &PullRequest) -> String {
+        format!(
+            "https://api.github.com/repos/{}/{}/issues/{}/reactions",
+            pr.owner, pr.repo, pr.number
+        )
     }
 }
 
@@ -267,6 +326,7 @@ struct ApiPullRequest {
     url: String,
     html_url: String,
     number: u64,
+    user: ApiUser,
     base: ApiPullRequestBase,
 }
 
