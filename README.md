@@ -1,57 +1,55 @@
 # Maid
 
-![Maid banner](assets/maid-banner.png)
+![Maid banner](assets/maid-banner-v2.jpg)
 
-Maid is a small Rust + Axum server that polls GitHub as a bot account. When a
-pull request comment mentions that bot, or when a configured master account has
-an open pull request in an allowlisted repository, Maid checks out the PR in its
-own cache, runs local `codex` from that checkout, and posts Codex's final answer
-as a normal PR comment.
+Maid is a small Rust + Axum bot runner for GitHub pull requests. It polls GitHub
+as a bot account, checks out eligible PRs into a local cache, runs `codex` from
+that checkout, and posts Codex's final answer as a normal PR comment.
 
-Maid uses polling, not webhooks. It expects `git`, `gh`, and `codex` to be on
-`PATH`.
-Maid marks work in progress with an `eyes` reaction and completed work with a
-`+1` reaction. Mention requests use reactions on the mention comment; automatic
-PR-open reviews use reactions on the PR description.
+Maid handles two workflows:
+
+- Mention requests: an allowed master account mentions the bot in a PR comment.
+- Automatic reviews: an allowed master account opens a PR in an allowlisted repo.
+
+It uses polling, not webhooks. It expects `git`, `gh`, and `codex` on `PATH`.
+In-progress work gets an `eyes` reaction; completed work gets a `+1` reaction.
 
 ## Quick Start
+
+Run setup as the GitHub bot account; Maid reads that account's token from `gh`.
 
 ```sh
 git clone https://github.com/dionysuzx/maid.git
 cd maid
 just init     # create ~/.maid/config.toml
+just config   # fill in bot_login and master_accounts
+gh auth login
+gh auth status --hostname github.com
 just start    # start Maid in the background
 just logs     # follow ~/.maid/maid.log
 ```
 
-Fill in `bot_login` and `master_accounts` in `~/.maid/config.toml` before
-starting. Maid only responds to mentions authored by one of the configured
-master accounts. `auto_review_accounts` controls which master accounts can get
-automatic reviews in allowlisted repositories; if omitted, it defaults to
-`master_accounts`. `auto_review_repos` lists the repositories to poll for open
-PRs. Set either option to `[]` to disable automatic PR-open reviews.
-`task_limit_per_24h` caps how many mention and automatic review tasks Maid will
-start in a rolling 24-hour window. Omit it for no limit; set it to `0` to pause
-new task starts without marking eligible work handled. Maid stores that rolling
-task-start ledger at `~/.maid/task-starts.json` by default.
+## Configuration
 
-Maid asks `gh` for the bot account's token, so the bot account must be logged in
-locally:
+Runtime config lives at `~/.maid/config.toml`. The required fields are
+`bot_login` and `master_accounts`.
 
-```sh
-gh auth login
-gh auth status --hostname github.com
-```
+- `auto_review_accounts`: master accounts eligible for automatic PR reviews;
+  defaults to `master_accounts`.
+- `auto_review_repos`: repositories to poll for automatic PR reviews; empty or
+  omitted means mention-only mode.
+- `task_limit_per_24h`: optional rolling 24-hour cap. Omit it for no limit; set
+  it to `0` to pause new task starts.
 
-`just start` runs Maid in the background. Runtime state lives in `~/.maid`,
-including `~/.maid/maid.log`, `~/.maid/maid.pid`, and the default repo cache.
-Use `just status` to check it, `just stop` to stop it, `just config` to edit
-the config in Vim, `just restart` to stop and start it again, and `just update`
-to pull the latest `main`, edit the config, and start it again.
+See [config.example.toml](config.example.toml) for every option.
 
-See [config.example.toml](config.example.toml) for all config options and example values.
+## Operations
 
-Development:
+Runtime state lives in `~/.maid`: config, logs, PID, repo cache, and the
+task-start ledger. Use `just status`, `just stop`, `just restart`, or
+`just update` to manage the background process.
+
+## Development
 
 ```sh
 just dev
