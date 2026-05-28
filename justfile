@@ -50,7 +50,7 @@ config:
         just init
     fi
 
-    vim "{{config_file}}"
+    nvim "{{config_file}}"
 
 start:
     #!/usr/bin/env bash
