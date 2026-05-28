@@ -119,9 +119,9 @@ impl GithubClient for GitHubRestClient {
         };
 
         let comment = self.get::<ApiComment>(comment_url).await?;
-        let pr_url = if let Some(pull_request_url) = comment.pull_request_url.clone() {
+        let pr_url = if let Some(pull_request_url) = comment.pull_request_url {
             pull_request_url
-        } else if let Some(issue_url) = comment.issue_url.clone() {
+        } else if let Some(issue_url) = comment.issue_url {
             let issue = self.get::<ApiIssue>(&issue_url).await?;
             match issue.pull_request {
                 Some(pull_request) => pull_request.url,
