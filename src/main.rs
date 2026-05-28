@@ -1,11 +1,9 @@
 use anyhow::Result;
-use axum::{Router, routing::get};
 use maid::{
     codex::CodexCli, config::Config, github::GitHubRestClient, maid::Maid,
     repo_cache::GitRepoCache, task_limit::FileTaskStartRecorder,
 };
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -30,8 +28,6 @@ async fn main() -> Result<()> {
         config.task_start_ledger_path.clone(),
     ));
 
-    let app = Router::new().route("/healthz", get(|| async { "ok" }));
-    let listener = TcpListener::bind(config.bind_addr).await?;
     let poll_interval = config.poll_interval;
     let task_limit_per_24h = config
         .task_limit_per_24h
@@ -53,7 +49,6 @@ async fn main() -> Result<()> {
     });
 
     info!(
-        addr = %config.bind_addr,
         cache_dir = %config.cache_dir.display(),
         task_start_ledger = %config.task_start_ledger_path.display(),
         poll_seconds = config.poll_interval.as_secs(),
@@ -64,10 +59,9 @@ async fn main() -> Result<()> {
         "maid started"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    shutdown_signal().await;
     poller.abort();
+    let _ = poller.await;
 
     Ok(())
 }

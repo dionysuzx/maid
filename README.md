@@ -1,8 +1,8 @@
 ![Maid banner](assets/maid-banner-v2.jpg)
 
-Maid is a small Rust + Axum bot runner for GitHub pull requests. It polls GitHub
-as a bot account, checks out eligible PRs into a local cache, runs `codex` from
-that checkout, and posts Codex's final answer as a normal PR comment.
+Maid is a small Rust bot runner for GitHub pull requests. It polls GitHub as a
+bot account, checks out eligible PRs into a local cache, runs `codex` from that
+checkout, and posts Codex's final answer as a normal PR comment.
 
 Maid handles two workflows:
 
