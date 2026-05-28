@@ -109,54 +109,28 @@ pub struct CodexTask {
 }
 
 impl CodexTask {
-    pub fn prompt(&self) -> String {
+    pub fn prompt(&self, templates: &CodexPromptTemplates) -> Result<String> {
         match &self.origin {
             CodexTaskOrigin::Mention {
                 mention_url,
                 raw_body,
                 cleaned_text,
-            } => format!(
-                "\
-You are responding to a GitHub pull request mention.
-
-Inspect the checkout in your current working directory and answer the request.
-Return only the GitHub comment body to post. Do not include tool logs or wrappers.
-
-Mention URL:
-{mention_url}
-
-Pull request URL:
-{pr_url}
-
-Raw mention body:
-{raw_body}
-
-Cleaned request text:
-{cleaned_text}
-",
-                mention_url = mention_url,
-                pr_url = self.pr_url,
-                raw_body = raw_body,
-                cleaned_text = cleaned_text,
+            } => render_template(
+                &templates.mention,
+                &[
+                    ("mention_url", mention_url.as_str()),
+                    ("pr_url", self.pr_url.as_str()),
+                    ("raw_body", raw_body.as_str()),
+                    ("cleaned_text", cleaned_text.as_str()),
+                ],
             ),
-            CodexTaskOrigin::PullRequestOpened { author } => format!(
-                "\
-You are responding automatically to a GitHub pull request opened by a trusted account.
-
-Inspect the checkout in your current working directory and review the pull request.
-Return only the GitHub comment body to post. Do not include tool logs or wrappers.
-
-Pull request URL:
-{pr_url}
-
-Opened by:
-{author}
-
-Review request:
-please review
-",
-                pr_url = self.pr_url,
-                author = author,
+            CodexTaskOrigin::PullRequestOpened { author } => render_template(
+                &templates.pull_request_opened,
+                &[
+                    ("pr_url", self.pr_url.as_str()),
+                    ("author", author.as_str()),
+                    ("review_request", "please review"),
+                ],
             ),
         }
     }
@@ -179,6 +153,95 @@ pub enum CodexTaskOrigin {
     PullRequestOpened {
         author: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexPromptTemplates {
+    pub mention: String,
+    pub pull_request_opened: String,
+}
+
+impl Default for CodexPromptTemplates {
+    fn default() -> Self {
+        Self {
+            mention: "\
+You are responding to a GitHub pull request mention.
+
+Inspect the checkout in your current working directory and answer the request.
+Return only the GitHub comment body to post. Do not include tool logs or wrappers.
+
+Mention URL:
+{{mention_url}}
+
+Pull request URL:
+{{pr_url}}
+
+Raw mention body:
+{{raw_body}}
+
+Cleaned request text:
+{{cleaned_text}}
+"
+            .to_string(),
+            pull_request_opened: "\
+You are responding automatically to a GitHub pull request opened by a trusted account.
+
+Inspect the checkout in your current working directory and review the pull request.
+Return only the GitHub comment body to post. Do not include tool logs or wrappers.
+
+Pull request URL:
+{{pr_url}}
+
+Opened by:
+{{author}}
+
+Review request:
+{{review_request}}
+"
+            .to_string(),
+        }
+    }
+}
+
+impl CodexPromptTemplates {
+    pub fn with_overrides(mut self, overrides: CodexPromptTemplateOverrides) -> Self {
+        if let Some(mention) = overrides.mention {
+            self.mention = mention;
+        }
+        if let Some(pull_request_opened) = overrides.pull_request_opened {
+            self.pull_request_opened = pull_request_opened;
+        }
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CodexPromptTemplateOverrides {
+    pub mention: Option<String>,
+    pub pull_request_opened: Option<String>,
+}
+
+fn render_template(template: &str, values: &[(&str, &str)]) -> Result<String> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(start) = rest.find("{{") {
+        rendered.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            return Err(anyhow!("Codex prompt template has an unclosed placeholder"));
+        };
+
+        let name = after_open[..end].trim();
+        let Some((_, value)) = values.iter().find(|(key, _)| *key == name) else {
+            return Err(anyhow!("unknown Codex prompt template placeholder: {name}"));
+        };
+        rendered.push_str(value);
+        rest = &after_open[end + 2..];
+    }
+
+    rendered.push_str(rest);
+    Ok(rendered)
 }
 
 pub fn validate_repo_name_part(value: &str, label: &str) -> Result<()> {
@@ -264,7 +327,7 @@ mod tests {
             },
         };
 
-        let prompt = task.prompt();
+        let prompt = task.prompt(&CodexPromptTemplates::default()).unwrap();
         assert!(prompt.contains("Mention URL:\nhttps://github.com/o/r/pull/1#issuecomment-2"));
         assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Raw mention body:\n@maid-bot review"));
@@ -280,11 +343,49 @@ mod tests {
             },
         };
 
-        let prompt = task.prompt();
+        let prompt = task.prompt(&CodexPromptTemplates::default()).unwrap();
         assert!(prompt.contains("automatically to a GitHub pull request"));
         assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Opened by:\ndionysuzx"));
         assert!(prompt.contains("Review request:\nplease review"));
+    }
+
+    #[test]
+    fn renders_configured_codex_prompt_templates() {
+        let task = CodexTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: CodexTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot review".to_string(),
+                cleaned_text: "review".to_string(),
+            },
+        };
+        let templates =
+            CodexPromptTemplates::default().with_overrides(CodexPromptTemplateOverrides {
+                mention: Some("PR={{ pr_url }} REQUEST={{cleaned_text}}".to_string()),
+                pull_request_opened: None,
+            });
+
+        assert_eq!(
+            task.prompt(&templates).unwrap(),
+            "PR=https://github.com/o/r/pull/1 REQUEST=review"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_codex_prompt_placeholders() {
+        let task = CodexTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: CodexTaskOrigin::PullRequestOpened {
+                author: "dionysuzx".to_string(),
+            },
+        };
+        let templates = CodexPromptTemplates {
+            mention: String::new(),
+            pull_request_opened: "{{missing}}".to_string(),
+        };
+
+        assert!(task.prompt(&templates).is_err());
     }
 
     #[test]

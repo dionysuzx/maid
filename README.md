@@ -38,6 +38,16 @@ Runtime config lives at `~/.maid/config.toml`. The required fields are
   omitted means mention-only mode.
 - `task_limit_per_24h`: optional rolling 24-hour cap. Omit it for no limit; set
   it to `0` to pause new task starts.
+- `codex_model` and `codex_reasoning_effort`: optional Codex invocation
+  overrides. When omitted, Codex uses its own config defaults.
+- `[codex_prompts]`: optional prompt templates for the internal Codex run.
+  Mention templates support `{{mention_url}}`, `{{pr_url}}`, `{{raw_body}}`,
+  and `{{cleaned_text}}`. Automatic review templates support `{{pr_url}}`,
+  `{{author}}`, and `{{review_request}}`.
+
+Posted comments include a small Codex metadata footer with the configured
+model, reasoning effort, session id, and the input prompt collapsed behind a
+details block.
 
 See [config.example.toml](config.example.toml) for every option.
 

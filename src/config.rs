@@ -1,4 +1,4 @@
-use crate::domain::RepoSlug;
+use crate::domain::{CodexPromptTemplateOverrides, CodexPromptTemplates, RepoSlug};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::{
@@ -22,6 +22,9 @@ pub struct Config {
     pub task_start_ledger_path: PathBuf,
     pub task_limit_per_24h: Option<usize>,
     pub codex_bin: String,
+    pub codex_model: Option<String>,
+    pub codex_reasoning_effort: Option<String>,
+    pub codex_prompts: CodexPromptTemplates,
     pub github_api_ip: Option<IpAddr>,
 }
 
@@ -59,6 +62,10 @@ impl Config {
         let poll_seconds = file.poll_seconds.unwrap_or(20).max(10);
         let task_limit_per_24h = file.task_limit_per_24h;
         let codex_bin = non_empty(file.codex_bin).unwrap_or_else(|| "codex".to_string());
+        let codex_model = non_empty(file.codex_model);
+        let codex_reasoning_effort = non_empty(file.codex_reasoning_effort);
+        let codex_prompts = CodexPromptTemplates::default()
+            .with_overrides(file.codex_prompts.unwrap_or_default().into_overrides());
         let github_api_ip = non_empty(file.github_api_ip)
             .map(|value| value.parse::<IpAddr>())
             .transpose()
@@ -76,6 +83,9 @@ impl Config {
             task_start_ledger_path: maid_home.join("task-starts.json"),
             task_limit_per_24h,
             codex_bin,
+            codex_model,
+            codex_reasoning_effort,
+            codex_prompts,
             github_api_ip,
         })
     }
@@ -92,7 +102,27 @@ struct ConfigFile {
     poll_seconds: Option<u64>,
     task_limit_per_24h: Option<usize>,
     codex_bin: Option<String>,
+    codex_model: Option<String>,
+    codex_reasoning_effort: Option<String>,
+    codex_prompts: Option<CodexPromptsFile>,
     github_api_ip: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+struct CodexPromptsFile {
+    mention: Option<String>,
+    pull_request_opened: Option<String>,
+}
+
+impl CodexPromptsFile {
+    fn into_overrides(self) -> CodexPromptTemplateOverrides {
+        CodexPromptTemplateOverrides {
+            mention: self.mention.and_then(|prompt| non_empty(Some(prompt))),
+            pull_request_opened: self
+                .pull_request_opened
+                .and_then(|prompt| non_empty(Some(prompt))),
+        }
+    }
 }
 
 impl ConfigFile {
@@ -235,7 +265,13 @@ cache_dir = "~/.maid/cache"
 poll_seconds = 30
 task_limit_per_24h = 5
 codex_bin = "codex-test"
+codex_model = "gpt-test"
+codex_reasoning_effort = "high"
 github_api_ip = "127.0.0.1"
+
+[codex_prompts]
+mention = "mention {{{{cleaned_text}}}}"
+pull_request_opened = "review {{{{pr_url}}}}"
 "#
         )
         .unwrap();
@@ -257,6 +293,17 @@ github_api_ip = "127.0.0.1"
         assert_eq!(config.poll_seconds, Some(30));
         assert_eq!(config.task_limit_per_24h, Some(5));
         assert_eq!(config.codex_bin.as_deref(), Some("codex-test"));
+        assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
+        assert_eq!(config.codex_reasoning_effort.as_deref(), Some("high"));
+        let codex_prompts = config.codex_prompts.unwrap();
+        assert_eq!(
+            codex_prompts.mention.as_deref(),
+            Some("mention {{cleaned_text}}")
+        );
+        assert_eq!(
+            codex_prompts.pull_request_opened.as_deref(),
+            Some("review {{pr_url}}")
+        );
         assert_eq!(config.github_api_ip.as_deref(), Some("127.0.0.1"));
     }
 
@@ -270,6 +317,7 @@ github_api_ip = "127.0.0.1"
         assert_eq!(config.auto_review_repos, None);
         assert_eq!(config.poll_seconds, None);
         assert_eq!(config.task_limit_per_24h, None);
+        assert_eq!(config.codex_prompts, None);
     }
 
     #[test]

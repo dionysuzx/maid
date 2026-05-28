@@ -1,6 +1,6 @@
 use crate::{
-    domain::CodexTask,
-    maid::{CodexRun, CodexRunner},
+    domain::{CodexPromptTemplates, CodexTask},
+    maid::{CodexRun, CodexRunMetadata, CodexRunner},
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -14,11 +14,33 @@ use tracing::info;
 #[derive(Clone, Debug)]
 pub struct CodexCli {
     bin: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    prompts: CodexPromptTemplates,
 }
 
 impl CodexCli {
     pub fn new(bin: impl Into<String>) -> Self {
-        Self { bin: bin.into() }
+        Self {
+            bin: bin.into(),
+            model: None,
+            reasoning_effort: None,
+            prompts: CodexPromptTemplates::default(),
+        }
+    }
+
+    pub fn with_options(
+        bin: impl Into<String>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        prompts: CodexPromptTemplates,
+    ) -> Self {
+        Self {
+            bin: bin.into(),
+            model,
+            reasoning_effort,
+            prompts,
+        }
     }
 }
 
@@ -28,9 +50,20 @@ impl CodexRunner for CodexCli {
         let output_file = NamedTempFile::new().context("failed to create Codex output file")?;
         let output_path = output_file.path().to_path_buf();
 
-        let mut child = Command::new(&self.bin)
-            .arg("--ask-for-approval")
-            .arg("never")
+        let prompt = task.prompt(&self.prompts)?;
+
+        let mut command = Command::new(&self.bin);
+        command.arg("--ask-for-approval").arg("never");
+        if let Some(model) = &self.model {
+            command.arg("--model").arg(model);
+        }
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            command.arg("--config").arg(codex_config_string(
+                "model_reasoning_effort",
+                reasoning_effort,
+            ));
+        }
+        let mut child = command
             .arg("exec")
             .arg("--color")
             .arg("never")
@@ -48,7 +81,6 @@ impl CodexRunner for CodexCli {
             .spawn()
             .with_context(|| format!("failed to start {}", self.bin))?;
 
-        let prompt = task.prompt();
         let mut stdin = child
             .stdin
             .take()
@@ -100,8 +132,17 @@ impl CodexRunner for CodexCli {
         Ok(CodexRun {
             response,
             session_id: json.session_id,
+            metadata: Some(CodexRunMetadata {
+                model: self.model.clone(),
+                reasoning_effort: self.reasoning_effort.clone(),
+                prompt,
+            }),
         })
     }
+}
+
+fn codex_config_string(key: &str, value: &str) -> String {
+    format!("{key}={}", toml::Value::String(value.to_string()))
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -220,5 +261,13 @@ mod tests {
         );
 
         assert_eq!(events, CodexJsonEvents::default());
+    }
+
+    #[test]
+    fn formats_codex_config_string_values_as_toml() {
+        assert_eq!(
+            codex_config_string("model_reasoning_effort", "high"),
+            "model_reasoning_effort=\"high\""
+        );
     }
 }

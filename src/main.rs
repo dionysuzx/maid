@@ -19,7 +19,12 @@ async fn main() -> Result<()> {
     let maid = Maid::new(
         GitHubRestClient::with_api_ip(config.github_token.clone(), config.github_api_ip),
         GitRepoCache::new(config.cache_dir.clone(), config.github_token.clone()),
-        CodexCli::new(config.codex_bin.clone()),
+        CodexCli::with_options(
+            config.codex_bin.clone(),
+            config.codex_model.clone(),
+            config.codex_reasoning_effort.clone(),
+            config.codex_prompts.clone(),
+        ),
         config.bot_login.clone(),
         config.master_accounts.clone(),
         config.auto_review_accounts.clone(),
