@@ -9,7 +9,6 @@ auto_review_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
 
 # Optional. Defaults shown below.
-bind = "127.0.0.1:3000"
 poll_seconds = 20
 cache_dir = "~/.maid/cache"
 codex_bin = "codex"
