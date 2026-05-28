@@ -1,5 +1,3 @@
-# Maid
-
 ![Maid banner](assets/maid-banner-v2.jpg)
 
 Maid is a small Rust + Axum bot runner for GitHub pull requests. It polls GitHub
