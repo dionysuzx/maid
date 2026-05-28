@@ -3,7 +3,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::{
     env,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -11,7 +11,6 @@ use std::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
-    pub bind_addr: SocketAddr,
     pub github_token: String,
     pub bot_login: String,
     pub master_accounts: Vec<String>,
@@ -51,10 +50,6 @@ impl Config {
         }
         let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
         let github_token = gh_token_for(&bot_login)?;
-        let bind_addr = non_empty(file.bind)
-            .unwrap_or_else(|| "127.0.0.1:3000".to_string())
-            .parse()
-            .context("bind must be a socket address like 127.0.0.1:3000")?;
         let cache_dir = non_empty(file.cache_dir)
             .map(|path| expand_home(&path))
             .transpose()?
@@ -72,7 +67,6 @@ impl Config {
             .context("github_api_ip must be an IPv4 or IPv6 address")?;
 
         Ok(Self {
-            bind_addr,
             github_token,
             bot_login,
             master_accounts,
@@ -97,7 +91,6 @@ struct ConfigFile {
     master_accounts: Option<Vec<String>>,
     auto_review_accounts: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
-    bind: Option<String>,
     cache_dir: Option<String>,
     poll_seconds: Option<u64>,
     task_limit_per_24h: Option<usize>,
@@ -260,7 +253,6 @@ bot_login = "maid-bot"
 master_accounts = ["dionysuzx"]
 auto_review_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
-bind = "127.0.0.1:4000"
 cache_dir = "~/.maid/cache"
 poll_seconds = 30
 task_limit_per_24h = 5
@@ -288,7 +280,6 @@ pull_request_opened = "review {{{{pr_url}}}}"
             config.auto_review_repos,
             Some(vec!["dionysuzx/maid".to_string()])
         );
-        assert_eq!(config.bind.as_deref(), Some("127.0.0.1:4000"));
         assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
         assert_eq!(config.poll_seconds, Some(30));
         assert_eq!(config.task_limit_per_24h, Some(5));
