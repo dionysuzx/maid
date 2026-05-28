@@ -47,6 +47,17 @@ pub struct CodexRun {
     pub session_id: Option<String>,
 }
 
+impl CodexRun {
+    pub fn resume_command(&self) -> Option<(&str, String)> {
+        self.session_id.as_deref().map(|session_id| {
+            (
+                session_id,
+                format!("codex resume --include-non-interactive --all {session_id}"),
+            )
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Maid<G, R, C> {
     github: G,
@@ -226,9 +237,7 @@ where
         }
         self.github.mark_notification_handled(notification).await?;
 
-        if let Some(session_id) = &codex_run.session_id {
-            let resume_command =
-                format!("codex resume --include-non-interactive --all {session_id}");
+        if let Some((session_id, resume_command)) = codex_run.resume_command() {
             info!(
                 notification_id = notification.id,
                 pr = %mention.pr.html_url,
@@ -301,9 +310,7 @@ where
             );
         }
 
-        if let Some(session_id) = &codex_run.session_id {
-            let resume_command =
-                format!("codex resume --include-non-interactive --all {session_id}");
+        if let Some((session_id, resume_command)) = codex_run.resume_command() {
             info!(
                 pr = %pr.html_url,
                 author = %pr.author,
@@ -325,8 +332,9 @@ where
 fn work_key(notification: &Notification) -> String {
     notification
         .latest_comment_url
-        .clone()
-        .unwrap_or_else(|| notification.id.clone())
+        .as_deref()
+        .unwrap_or(&notification.id)
+        .to_string()
 }
 
 fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> HashSet<String> {
@@ -583,6 +591,23 @@ mod tests {
                 repo: "r".to_string(),
             }],
         )
+    }
+
+    #[test]
+    fn builds_codex_resume_command_from_session_id() {
+        let run = CodexRun {
+            response: "done".to_string(),
+            session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
+        };
+
+        assert_eq!(
+            run.resume_command(),
+            Some((
+                "019e64fd-8369-7453-9cdc-4b14b388f618",
+                "codex resume --include-non-interactive --all 019e64fd-8369-7453-9cdc-4b14b388f618"
+                    .to_string()
+            ))
+        );
     }
 
     #[tokio::test]
