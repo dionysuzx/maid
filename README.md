@@ -45,8 +45,9 @@ gh auth status --hostname github.com
 
 `just start` runs Maid in the background. Runtime state lives in `~/.maid`,
 including `~/.maid/maid.log`, `~/.maid/maid.pid`, and the default repo cache.
-Use `just status` to check it, `just stop` to stop it, and `just update` to
-pull the latest `main` and restart.
+Use `just status` to check it, `just stop` to stop it, `just config` to edit
+the config in Vim, `just restart` to stop and start it again, and `just update`
+to pull the latest `main`, edit the config, and start it again.
 
 See [config.example.toml](config.example.toml) for all config options and example values.
 
