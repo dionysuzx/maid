@@ -1,4 +1,4 @@
-use crate::domain::{CodexPromptTemplateOverrides, CodexPromptTemplates, RepoSlug};
+use crate::domain::{CodexPromptTemplates, RepoSlug};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::{
@@ -59,8 +59,8 @@ impl Config {
         let codex_bin = non_empty(file.codex_bin).unwrap_or_else(|| "codex".to_string());
         let codex_model = non_empty(file.codex_model);
         let codex_reasoning_effort = non_empty(file.codex_reasoning_effort);
-        let codex_prompts = CodexPromptTemplates::default()
-            .with_overrides(file.codex_prompts.unwrap_or_default().into_overrides());
+        let codex_prompts = required_codex_prompts(file.codex_prompts)
+            .with_context(|| format!("codex_prompts is required in {}", config_path.display()))?;
         let github_api_ip = non_empty(file.github_api_ip)
             .map(|value| value.parse::<IpAddr>())
             .transpose()
@@ -105,17 +105,6 @@ struct ConfigFile {
 struct CodexPromptsFile {
     mention: Option<String>,
     pull_request_opened: Option<String>,
-}
-
-impl CodexPromptsFile {
-    fn into_overrides(self) -> CodexPromptTemplateOverrides {
-        CodexPromptTemplateOverrides {
-            mention: self.mention.and_then(|prompt| non_empty(Some(prompt))),
-            pull_request_opened: self
-                .pull_request_opened
-                .and_then(|prompt| non_empty(Some(prompt))),
-        }
-    }
 }
 
 impl ConfigFile {
@@ -179,6 +168,22 @@ fn optional_repos(value: Option<Vec<String>>, key: &str) -> Result<Vec<RepoSlug>
         }
     }
     Ok(repos)
+}
+
+fn required_codex_prompts(value: Option<CodexPromptsFile>) -> Result<CodexPromptTemplates> {
+    let Some(prompts) = value else {
+        bail!("codex_prompts must include mention and pull_request_opened templates");
+    };
+
+    let mention = non_empty(prompts.mention)
+        .ok_or_else(|| anyhow!("codex_prompts.mention must not be empty"))?;
+    let pull_request_opened = non_empty(prompts.pull_request_opened)
+        .ok_or_else(|| anyhow!("codex_prompts.pull_request_opened must not be empty"))?;
+
+    Ok(CodexPromptTemplates {
+        mention,
+        pull_request_opened,
+    })
 }
 
 fn normalize_logins(raw_logins: Vec<String>, key: &str) -> Result<Vec<String>> {
@@ -309,6 +314,37 @@ pull_request_opened = "review {{{{pr_url}}}}"
         assert_eq!(config.poll_seconds, None);
         assert_eq!(config.task_limit_per_24h, None);
         assert_eq!(config.codex_prompts, None);
+    }
+
+    #[test]
+    fn requires_codex_prompt_templates() {
+        assert!(required_codex_prompts(None).is_err());
+        assert!(
+            required_codex_prompts(Some(CodexPromptsFile {
+                mention: Some("mention".to_string()),
+                pull_request_opened: None,
+            }))
+            .is_err()
+        );
+        assert!(
+            required_codex_prompts(Some(CodexPromptsFile {
+                mention: Some(" ".to_string()),
+                pull_request_opened: Some("review".to_string()),
+            }))
+            .is_err()
+        );
+
+        assert_eq!(
+            required_codex_prompts(Some(CodexPromptsFile {
+                mention: Some("mention".to_string()),
+                pull_request_opened: Some("review".to_string()),
+            }))
+            .unwrap(),
+            CodexPromptTemplates {
+                mention: "mention".to_string(),
+                pull_request_opened: "review".to_string(),
+            }
+        );
     }
 
     #[test]

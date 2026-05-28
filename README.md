@@ -35,10 +35,11 @@ Runtime config lives at `~/.maid/config.toml`. The required fields are
   it to `0` to pause new task starts.
 - `codex_model` and `codex_reasoning_effort`: optional Codex invocation
   overrides. When omitted, Codex uses its own config defaults.
-- `[codex_prompts]`: optional prompt templates for the internal Codex run.
+- `[codex_prompts]`: required prompt templates for the internal Codex run.
+  These are the full prompts Maid sends after placeholder interpolation.
   Mention templates support `{{mention_url}}`, `{{pr_url}}`, `{{raw_body}}`,
-  and `{{cleaned_text}}`. Automatic review templates support `{{pr_url}}`,
-  `{{author}}`, and `{{review_request}}`.
+  and `{{cleaned_text}}`. Automatic review templates support `{{pr_url}}`
+  and `{{author}}`.
 
 Posted comments include a small Codex metadata footer with the configured
 model, reasoning effort, session id, and the input prompt collapsed behind a

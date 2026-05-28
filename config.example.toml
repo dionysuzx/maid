@@ -23,11 +23,11 @@ codex_reasoning_effort = "high"
 # Optional. Leave omitted unless you need to pin api.github.com.
 # github_api_ip = "127.0.0.1"
 
-# Optional. Omit this section to use Maid's built-in prompts.
+# Required. These templates are the full prompts Maid sends to Codex.
 # Supported mention placeholders:
 # {{mention_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
 # Supported pull_request_opened placeholders:
-# {{pr_url}}, {{author}}, {{review_request}}
+# {{pr_url}}, {{author}}
 [codex_prompts]
 mention = """
 You are responding to a GitHub pull request mention.
@@ -60,5 +60,5 @@ Opened by:
 {{author}}
 
 Review request:
-{{review_request}}
+please review
 """

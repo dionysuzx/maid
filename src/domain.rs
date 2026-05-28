@@ -129,7 +129,6 @@ impl CodexTask {
                 &[
                     ("pr_url", self.pr_url.as_str()),
                     ("author", author.as_str()),
-                    ("review_request", "please review"),
                 ],
             ),
         }
@@ -159,66 +158,6 @@ pub enum CodexTaskOrigin {
 pub struct CodexPromptTemplates {
     pub mention: String,
     pub pull_request_opened: String,
-}
-
-impl Default for CodexPromptTemplates {
-    fn default() -> Self {
-        Self {
-            mention: "\
-You are responding to a GitHub pull request mention.
-
-Inspect the checkout in your current working directory and answer the request.
-Return only the GitHub comment body to post. Do not include tool logs or wrappers.
-
-Mention URL:
-{{mention_url}}
-
-Pull request URL:
-{{pr_url}}
-
-Raw mention body:
-{{raw_body}}
-
-Cleaned request text:
-{{cleaned_text}}
-"
-            .to_string(),
-            pull_request_opened: "\
-You are responding automatically to a GitHub pull request opened by a trusted account.
-
-Inspect the checkout in your current working directory and review the pull request.
-Return only the GitHub comment body to post. Do not include tool logs or wrappers.
-
-Pull request URL:
-{{pr_url}}
-
-Opened by:
-{{author}}
-
-Review request:
-{{review_request}}
-"
-            .to_string(),
-        }
-    }
-}
-
-impl CodexPromptTemplates {
-    pub fn with_overrides(mut self, overrides: CodexPromptTemplateOverrides) -> Self {
-        if let Some(mention) = overrides.mention {
-            self.mention = mention;
-        }
-        if let Some(pull_request_opened) = overrides.pull_request_opened {
-            self.pull_request_opened = pull_request_opened;
-        }
-        self
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CodexPromptTemplateOverrides {
-    pub mention: Option<String>,
-    pub pull_request_opened: Option<String>,
 }
 
 fn render_template(template: &str, values: &[(&str, &str)]) -> Result<String> {
@@ -327,7 +266,7 @@ mod tests {
             },
         };
 
-        let prompt = task.prompt(&CodexPromptTemplates::default()).unwrap();
+        let prompt = task.prompt(&test_prompts()).unwrap();
         assert!(prompt.contains("Mention URL:\nhttps://github.com/o/r/pull/1#issuecomment-2"));
         assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Raw mention body:\n@maid-bot review"));
@@ -343,8 +282,7 @@ mod tests {
             },
         };
 
-        let prompt = task.prompt(&CodexPromptTemplates::default()).unwrap();
-        assert!(prompt.contains("automatically to a GitHub pull request"));
+        let prompt = task.prompt(&test_prompts()).unwrap();
         assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Opened by:\ndionysuzx"));
         assert!(prompt.contains("Review request:\nplease review"));
@@ -360,11 +298,10 @@ mod tests {
                 cleaned_text: "review".to_string(),
             },
         };
-        let templates =
-            CodexPromptTemplates::default().with_overrides(CodexPromptTemplateOverrides {
-                mention: Some("PR={{ pr_url }} REQUEST={{cleaned_text}}".to_string()),
-                pull_request_opened: None,
-            });
+        let templates = CodexPromptTemplates {
+            mention: "PR={{ pr_url }} REQUEST={{cleaned_text}}".to_string(),
+            pull_request_opened: String::new(),
+        };
 
         assert_eq!(
             task.prompt(&templates).unwrap(),
@@ -401,5 +338,35 @@ mod tests {
         assert!(RepoSlug::parse("dionysuzx").is_err());
         assert!(RepoSlug::parse("dionysuzx/maid/extra").is_err());
         assert!(RepoSlug::parse("../maid").is_err());
+    }
+
+    fn test_prompts() -> CodexPromptTemplates {
+        CodexPromptTemplates {
+            mention: "\
+Mention URL:
+{{mention_url}}
+
+Pull request URL:
+{{pr_url}}
+
+Raw mention body:
+{{raw_body}}
+
+Cleaned request text:
+{{cleaned_text}}
+"
+            .to_string(),
+            pull_request_opened: "\
+Pull request URL:
+{{pr_url}}
+
+Opened by:
+{{author}}
+
+Review request:
+please review
+"
+            .to_string(),
+        }
     }
 }

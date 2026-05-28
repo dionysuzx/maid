@@ -20,12 +20,12 @@ pub struct CodexCli {
 }
 
 impl CodexCli {
-    pub fn new(bin: impl Into<String>) -> Self {
+    pub fn new(bin: impl Into<String>, prompts: CodexPromptTemplates) -> Self {
         Self {
             bin: bin.into(),
             model: None,
             reasoning_effort: None,
-            prompts: CodexPromptTemplates::default(),
+            prompts,
         }
     }
 
