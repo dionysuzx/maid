@@ -35,6 +35,7 @@ pub struct ImplementationActor {
     pub github_token: String,
     pub git_auth: ImplementationGitAuth,
     pub commit_identity: ImplementationCommitIdentity,
+    pub expected_git_identity: Option<ExpectedGitIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +48,14 @@ pub enum ImplementationGitAuth {
 pub enum ImplementationCommitIdentity {
     Bot,
     Host,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpectedGitIdentity {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub gpgsign: Option<bool>,
+    pub gpg_format: Option<String>,
 }
 
 impl Config {
@@ -143,6 +152,15 @@ struct ImplementationActorFile {
     login: Option<String>,
     git_auth: Option<String>,
     commit_identity: Option<String>,
+    expected_git_identity: Option<ExpectedGitIdentityFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExpectedGitIdentityFile {
+    name: Option<String>,
+    email: Option<String>,
+    gpgsign: Option<bool>,
+    gpg_format: Option<String>,
 }
 
 impl ConfigFile {
@@ -168,13 +186,39 @@ fn implementation_actor(
     } else {
         gh_token_for(&login)?
     };
+    let git_auth = implementation_git_auth(file.git_auth)?;
+    let commit_identity = implementation_commit_identity(file.commit_identity)?;
+    let expected_git_identity = expected_git_identity(file.expected_git_identity);
+    if expected_git_identity.is_some() && commit_identity != ImplementationCommitIdentity::Host {
+        bail!("implementation_actor.expected_git_identity requires commit_identity = \"host\"");
+    }
 
     Ok(ImplementationActor {
         login,
         github_token,
-        git_auth: implementation_git_auth(file.git_auth)?,
-        commit_identity: implementation_commit_identity(file.commit_identity)?,
+        git_auth,
+        commit_identity,
+        expected_git_identity,
     })
+}
+
+fn expected_git_identity(file: Option<ExpectedGitIdentityFile>) -> Option<ExpectedGitIdentity> {
+    let file = file?;
+    let identity = ExpectedGitIdentity {
+        name: non_empty(file.name),
+        email: non_empty(file.email),
+        gpgsign: file.gpgsign,
+        gpg_format: non_empty(file.gpg_format),
+    };
+    if identity.name.is_none()
+        && identity.email.is_none()
+        && identity.gpgsign.is_none()
+        && identity.gpg_format.is_none()
+    {
+        None
+    } else {
+        Some(identity)
+    }
 }
 
 fn implementation_git_auth(value: Option<String>) -> Result<ImplementationGitAuth> {
@@ -341,6 +385,12 @@ github_api_ip = "127.0.0.1"
 login = "dionysuzx"
 git_auth = "host"
 commit_identity = "host"
+
+[implementation_actor.expected_git_identity]
+name = "Dionysus"
+email = "dionysuzx@users.noreply.github.com"
+gpgsign = true
+gpg_format = "ssh"
 "#
         )
         .unwrap();
@@ -374,6 +424,14 @@ commit_identity = "host"
             implementation_actor.commit_identity.as_deref(),
             Some("host")
         );
+        let expected_git_identity = implementation_actor.expected_git_identity.unwrap();
+        assert_eq!(expected_git_identity.name.as_deref(), Some("Dionysus"));
+        assert_eq!(
+            expected_git_identity.email.as_deref(),
+            Some("dionysuzx@users.noreply.github.com")
+        );
+        assert_eq!(expected_git_identity.gpgsign, Some(true));
+        assert_eq!(expected_git_identity.gpg_format.as_deref(), Some("ssh"));
         assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
         assert_eq!(config.poll_seconds, Some(30));
         assert_eq!(config.task_limit_per_24h, Some(5));
@@ -418,6 +476,24 @@ commit_identity = "host"
         );
         assert!(implementation_git_auth(Some("ssh".to_string())).is_err());
         assert!(implementation_commit_identity(Some("machine".to_string())).is_err());
+    }
+
+    #[test]
+    fn expected_git_identity_requires_host_commit_identity() {
+        assert!(
+            implementation_actor(
+                Some(ImplementationActorFile {
+                    expected_git_identity: Some(ExpectedGitIdentityFile {
+                        email: Some("dionysuzx@users.noreply.github.com".to_string()),
+                        ..ExpectedGitIdentityFile::default()
+                    }),
+                    ..ImplementationActorFile::default()
+                }),
+                "maid-bot",
+                "token",
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::{
     domain::{Issue, PullRequest, validate_repo_name_part},
     maid::RepoWorkspace,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
 use std::{
@@ -17,6 +17,7 @@ pub struct GitRepoCache {
     bot_auth: GitAuth,
     issue_git_auth: GitAuth,
     issue_commit_identity: CommitIdentity,
+    expected_git_identity: Option<ExpectedGitIdentity>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +30,14 @@ pub enum IssueGitAuth {
 pub enum IssueCommitIdentity {
     Bot,
     Host,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExpectedGitIdentity {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub gpgsign: Option<bool>,
+    pub gpg_format: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +70,7 @@ impl GitRepoCache {
                 name: bot_login.clone(),
                 email: format!("{bot_login}@users.noreply.github.com"),
             },
+            expected_git_identity: None,
         }
     }
 
@@ -76,6 +86,11 @@ impl GitRepoCache {
         if matches!(commit_identity, IssueCommitIdentity::Host) {
             self.issue_commit_identity = CommitIdentity::Host;
         }
+        self
+    }
+
+    pub fn with_expected_git_identity(mut self, expected: Option<ExpectedGitIdentity>) -> Self {
+        self.expected_git_identity = expected;
         self
     }
 
@@ -132,6 +147,36 @@ impl GitRepoCache {
         Err(anyhow!(
             "git {} failed: {}",
             args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+
+    async fn git_config_value(&self, checkout: &Path, key: &str) -> Result<Option<String>> {
+        let output = Command::new("git")
+            .args(["config", "--get", key])
+            .current_dir(checkout)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("failed to run git config")?;
+
+        if output.status.success() {
+            return Ok(Some(
+                String::from_utf8(output.stdout)
+                    .context("git config returned output that was not valid UTF-8")?
+                    .trim()
+                    .to_string(),
+            ));
+        }
+
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+
+        Err(anyhow!(
+            "git config --get {key} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
@@ -260,6 +305,24 @@ impl RepoWorkspace for GitRepoCache {
         Ok(checkout)
     }
 
+    async fn verify_issue_commit_identity(&self, checkout: &Path) -> Result<()> {
+        let CommitIdentity::Host = self.issue_commit_identity else {
+            return Ok(());
+        };
+        let Some(expected) = &self.expected_git_identity else {
+            return Ok(());
+        };
+
+        let actual = EffectiveGitIdentity {
+            name: self.git_config_value(checkout, "user.name").await?,
+            email: self.git_config_value(checkout, "user.email").await?,
+            gpgsign: self.git_config_value(checkout, "commit.gpgsign").await?,
+            gpg_format: self.git_config_value(checkout, "gpg.format").await?,
+        };
+
+        verify_expected_git_identity(expected, &actual)
+    }
+
     async fn has_changes(&self, checkout: &Path) -> Result<bool> {
         let output = self
             .git_output(
@@ -310,6 +373,76 @@ impl RepoWorkspace for GitRepoCache {
             &["push", "--force-with-lease", "origin", &refspec],
         )
         .await
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct EffectiveGitIdentity {
+    name: Option<String>,
+    email: Option<String>,
+    gpgsign: Option<String>,
+    gpg_format: Option<String>,
+}
+
+fn verify_expected_git_identity(
+    expected: &ExpectedGitIdentity,
+    actual: &EffectiveGitIdentity,
+) -> Result<()> {
+    verify_expected_string(
+        "user.name",
+        expected.name.as_deref(),
+        actual.name.as_deref(),
+    )?;
+    verify_expected_string(
+        "user.email",
+        expected.email.as_deref(),
+        actual.email.as_deref(),
+    )?;
+    verify_expected_string(
+        "gpg.format",
+        expected.gpg_format.as_deref(),
+        actual.gpg_format.as_deref(),
+    )?;
+
+    if let Some(expected_gpgsign) = expected.gpgsign {
+        let Some(actual_gpgsign) = &actual.gpgsign else {
+            bail!(
+                "host git identity mismatch for commit.gpgsign: expected {expected_gpgsign}, got unset"
+            );
+        };
+        let actual_gpgsign = parse_git_bool(actual_gpgsign).with_context(|| {
+            format!(
+                "host git identity mismatch for commit.gpgsign: invalid value {actual_gpgsign:?}"
+            )
+        })?;
+        if actual_gpgsign != expected_gpgsign {
+            bail!(
+                "host git identity mismatch for commit.gpgsign: expected {expected_gpgsign}, got {actual_gpgsign}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_expected_string(key: &str, expected: Option<&str>, actual: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    match actual {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => {
+            bail!("host git identity mismatch for {key}: expected {expected:?}, got {actual:?}")
+        }
+        None => bail!("host git identity mismatch for {key}: expected {expected:?}, got unset"),
+    }
+}
+
+fn parse_git_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        value => bail!("not a git boolean: {value:?}"),
     }
 }
 
@@ -386,5 +519,46 @@ mod tests {
             cache.issue_remote_url(&issue("o", "r")),
             "https://github.com/o/r.git"
         );
+    }
+
+    #[test]
+    fn accepts_matching_expected_git_identity() {
+        let expected = ExpectedGitIdentity {
+            name: Some("Dionysus".to_string()),
+            email: Some("dionysuzx@users.noreply.github.com".to_string()),
+            gpgsign: Some(true),
+            gpg_format: Some("ssh".to_string()),
+        };
+        let actual = EffectiveGitIdentity {
+            name: Some("Dionysus".to_string()),
+            email: Some("dionysuzx@users.noreply.github.com".to_string()),
+            gpgsign: Some("yes".to_string()),
+            gpg_format: Some("ssh".to_string()),
+        };
+
+        verify_expected_git_identity(&expected, &actual).unwrap();
+    }
+
+    #[test]
+    fn rejects_mismatched_expected_git_identity() {
+        let expected = ExpectedGitIdentity {
+            email: Some("dionysuzx@users.noreply.github.com".to_string()),
+            ..ExpectedGitIdentity::default()
+        };
+        let actual = EffectiveGitIdentity {
+            email: Some("maid-bot@users.noreply.github.com".to_string()),
+            ..EffectiveGitIdentity::default()
+        };
+
+        assert!(verify_expected_git_identity(&expected, &actual).is_err());
+    }
+
+    #[test]
+    fn parses_git_boolean_values() {
+        assert!(parse_git_bool("true").unwrap());
+        assert!(parse_git_bool("on").unwrap());
+        assert!(!parse_git_bool("false").unwrap());
+        assert!(!parse_git_bool("0").unwrap());
+        assert!(parse_git_bool("sometimes").is_err());
     }
 }

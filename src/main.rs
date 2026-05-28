@@ -4,7 +4,10 @@ use maid::{
     config::{Config, ImplementationCommitIdentity, ImplementationGitAuth},
     github::GitHubRestClient,
     maid::{Maid, MaidSettings},
-    repo_cache::{GitRepoCache, IssueCommitIdentity, IssueGitAuth},
+    repo_cache::{
+        ExpectedGitIdentity as ExpectedRepoGitIdentity, GitRepoCache, IssueCommitIdentity,
+        IssueGitAuth,
+    },
     task_limit::FileTaskStartRecorder,
 };
 use std::time::Duration;
@@ -32,6 +35,16 @@ async fn main() -> Result<()> {
         ImplementationCommitIdentity::Bot => IssueCommitIdentity::Bot,
         ImplementationCommitIdentity::Host => IssueCommitIdentity::Host,
     };
+    let expected_git_identity = config
+        .implementation_actor
+        .expected_git_identity
+        .clone()
+        .map(|identity| ExpectedRepoGitIdentity {
+            name: identity.name,
+            email: identity.email,
+            gpgsign: identity.gpgsign,
+            gpg_format: identity.gpg_format,
+        });
 
     let maid = Maid::new(
         bot_github,
@@ -41,7 +54,8 @@ async fn main() -> Result<()> {
             config.github_token.clone(),
             config.bot_login.clone(),
         )
-        .with_issue_publish_mode(issue_git_auth, issue_commit_identity),
+        .with_issue_publish_mode(issue_git_auth, issue_commit_identity)
+        .with_expected_git_identity(expected_git_identity),
         CodexCli::new(config.codex_bin.clone()),
         MaidSettings {
             bot_login: config.bot_login.clone(),

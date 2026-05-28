@@ -34,3 +34,12 @@ codex_bin = "codex"
 login = "your-name"
 git_auth = "host"
 commit_identity = "host"
+
+# Optional. Checked only when commit_identity = "host".
+# Maid reads the effective git config from the prepared checkout before running
+# Codex and only verifies fields configured here.
+[implementation_actor.expected_git_identity]
+name = "Your Name"
+email = "your-name@users.noreply.github.com"
+gpgsign = true
+gpg_format = "ssh"

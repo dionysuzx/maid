@@ -70,13 +70,21 @@ but it uses the implementation actor's `gh` token to open PRs:
 login = "your-name"
 git_auth = "host"
 commit_identity = "host"
+
+[implementation_actor.expected_git_identity]
+name = "Your Name"
+email = "your-name@users.noreply.github.com"
+gpgsign = true
+gpg_format = "ssh"
 ```
 
 With `git_auth = "host"`, Maid uses the repository SSH remote for implementation
 branches and does not inject the bot token into git commands. With
 `commit_identity = "host"`, Maid lets the host git config choose author,
-committer, signing key, and signing behavior. The host must be able to commit
-and push non-interactively:
+committer, signing key, and signing behavior. `expected_git_identity` is
+optional; when present, Maid checks only the configured fields from the prepared
+checkout before running Codex. The host must be able to commit and push
+non-interactively:
 
 ```sh
 gh auth login --user maid-bot
@@ -85,6 +93,7 @@ gh auth status --hostname github.com
 git config --global user.name
 git config --global user.email
 git config --global commit.gpgsign
+git config --global gpg.format
 ssh -T git@github.com
 ```
 

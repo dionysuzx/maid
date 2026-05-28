@@ -61,6 +61,7 @@ pub enum ReviewState {
 pub trait RepoWorkspace: Send + Sync {
     async fn prepare_pr_review(&self, pr: &PullRequest) -> Result<PathBuf>;
     async fn prepare_issue_branch(&self, issue: &Issue, branch: &str) -> Result<PathBuf>;
+    async fn verify_issue_commit_identity(&self, checkout: &Path) -> Result<()>;
     async fn has_changes(&self, checkout: &Path) -> Result<bool>;
     async fn commit_all(&self, checkout: &Path, message: &str) -> Result<()>;
     async fn push_branch(&self, checkout: &Path, branch: &str) -> Result<()>;
@@ -492,6 +493,7 @@ where
         );
 
         let checkout = self.repos.prepare_issue_branch(issue, &branch).await?;
+        self.repos.verify_issue_commit_identity(&checkout).await?;
         let task = CodexTask {
             subject_url: issue.html_url.clone(),
             origin: CodexTaskOrigin::IssueImplementation {
@@ -843,6 +845,20 @@ mod tests {
             Ok(self.checkout.clone())
         }
 
+        async fn verify_issue_commit_identity(&self, _checkout: &Path) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("verify_identity".to_string());
+            if self.checkout.file_name().and_then(|name| name.to_str()) == Some("bad-identity") {
+                return Err(anyhow!("bad host git identity"));
+            }
+            if let Some(message) = self.error.lock().unwrap().take() {
+                return Err(anyhow!(message));
+            }
+            Ok(())
+        }
+
         async fn has_changes(&self, _checkout: &Path) -> Result<bool> {
             Ok(true)
         }
@@ -1169,6 +1185,7 @@ mod tests {
             *repos.calls.lock().unwrap(),
             vec![
                 "o/r:maid/issue-3",
+                "verify_identity",
                 "commit:Implement issue #3: Add the thing",
                 "push:maid/issue-3"
             ]
@@ -1231,6 +1248,32 @@ mod tests {
         assert!(github.events.lock().unwrap().is_empty());
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn verifies_issue_git_identity_before_running_codex() {
+        let github = FakeGithub::default();
+        *github.issues.lock().unwrap() = vec![issue()];
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/bad-identity"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            *repos.calls.lock().unwrap(),
+            vec!["o/r:maid/issue-3", "verify_identity"]
+        );
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert_eq!(*github.events.lock().unwrap(), vec!["start_issue"]);
     }
 
     #[tokio::test]
