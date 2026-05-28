@@ -10,6 +10,8 @@ auto_review_repos = ["dionysuzx/maid"]
 
 # Optional. Empty or omitted disables automatic issue implementation.
 # Maid polls open issues in these repositories that have auto_implement_label.
+# auto_implement_accounts defaults to master_accounts when omitted.
+auto_implement_accounts = ["dionysuzx"]
 auto_implement_repos = ["dionysuzx/maid"]
 auto_implement_label = "maid"
 auto_implement_window_days = 30

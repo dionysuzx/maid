@@ -18,6 +18,7 @@ pub struct Config {
     pub master_accounts: Vec<String>,
     pub auto_review_accounts: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
+    pub auto_implement_accounts: Vec<String>,
     pub auto_implement_repos: Vec<RepoSlug>,
     pub auto_implement_label: String,
     pub auto_implement_window_days: u64,
@@ -71,6 +72,14 @@ impl Config {
             }
         }
         let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
+        let auto_implement_accounts =
+            optional_logins(file.auto_implement_accounts, "auto_implement_accounts")?
+                .unwrap_or_else(|| master_accounts.clone());
+        for login in &auto_implement_accounts {
+            if !master_accounts.contains(login) {
+                bail!("auto_implement_accounts must be a subset of master_accounts: {login}");
+            }
+        }
         let auto_implement_repos =
             optional_repos(file.auto_implement_repos, "auto_implement_repos")?;
         let auto_implement_label =
@@ -103,6 +112,7 @@ impl Config {
             master_accounts,
             auto_review_accounts,
             auto_review_repos,
+            auto_implement_accounts,
             auto_implement_repos,
             auto_implement_label,
             auto_implement_window_days,
@@ -122,6 +132,7 @@ struct ConfigFile {
     master_accounts: Option<Vec<String>>,
     auto_review_accounts: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
+    auto_implement_accounts: Option<Vec<String>>,
     auto_implement_repos: Option<Vec<String>>,
     auto_implement_label: Option<String>,
     auto_implement_window_days: Option<u64>,
@@ -323,6 +334,7 @@ bot_login = "maid-bot"
 master_accounts = ["dionysuzx"]
 auto_review_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
+auto_implement_accounts = ["dionysuzx"]
 auto_implement_repos = ["dionysuzx/maid"]
 auto_implement_label = "maid"
 auto_implement_window_days = 14
@@ -354,6 +366,10 @@ commit_identity = "host"
             Some(vec!["dionysuzx/maid".to_string()])
         );
         assert_eq!(
+            config.auto_implement_accounts,
+            Some(vec!["dionysuzx".to_string()])
+        );
+        assert_eq!(
             config.auto_implement_repos,
             Some(vec!["dionysuzx/maid".to_string()])
         );
@@ -382,6 +398,7 @@ commit_identity = "host"
         assert_eq!(config.master_accounts, None);
         assert_eq!(config.auto_review_accounts, None);
         assert_eq!(config.auto_review_repos, None);
+        assert_eq!(config.auto_implement_accounts, None);
         assert_eq!(config.auto_implement_repos, None);
         assert_eq!(config.auto_implement_label, None);
         assert_eq!(config.auto_implement_window_days, None);

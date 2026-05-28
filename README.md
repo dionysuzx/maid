@@ -34,8 +34,11 @@ automatic reviews in allowlisted repositories; if omitted, it defaults to
 PRs. Set either option to `[]` to disable automatic PR-open reviews.
 `auto_implement_repos` lists repositories where Maid should poll open issues
 with `auto_implement_label` and create implementation PRs. It is disabled when
-omitted or empty. `auto_implement_window_days` bounds issue polling to recently
-updated issues and defaults to 30 days.
+omitted or empty. `auto_implement_accounts` controls which master accounts can
+author issues that trigger automatic implementation; if omitted, it defaults to
+`master_accounts`. This keeps labeled issues from untrusted authors out of the
+write-capable Codex path. `auto_implement_window_days` bounds issue polling to
+recently updated issues and defaults to 30 days.
 `task_limit_per_24h` caps how many mention, automatic review, and issue
 implementation tasks Maid will start in a rolling 24-hour window. Omit it for no
 limit; set it to `0` to pause new task starts without marking eligible work

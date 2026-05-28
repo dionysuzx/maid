@@ -98,6 +98,7 @@ pub struct Maid<G, R, C> {
     master_accounts: HashSet<String>,
     auto_review_accounts: HashSet<String>,
     auto_review_repos: Vec<RepoSlug>,
+    auto_implement_accounts: HashSet<String>,
     auto_implement_repos: Vec<RepoSlug>,
     auto_implement_label: String,
     auto_implement_window: Duration,
@@ -110,6 +111,7 @@ pub struct MaidSettings {
     pub master_accounts: Vec<String>,
     pub auto_review_accounts: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
+    pub auto_implement_accounts: Vec<String>,
     pub auto_implement_repos: Vec<RepoSlug>,
     pub auto_implement_label: String,
     pub auto_implement_window: Duration,
@@ -148,6 +150,7 @@ pub struct SkipBreakdown {
     pub auto_review_disabled: usize,
     pub already_handled_pr: usize,
     pub self_authored_issue: usize,
+    pub auto_implement_disabled: usize,
     pub already_handled_issue: usize,
     pub existing_issue_pr: usize,
     pub issue_without_changes: usize,
@@ -168,6 +171,7 @@ impl SkipBreakdown {
             SkipReason::AutoReviewDisabled => self.auto_review_disabled += 1,
             SkipReason::AlreadyHandledPr => self.already_handled_pr += 1,
             SkipReason::SelfAuthoredIssue => self.self_authored_issue += 1,
+            SkipReason::AutoImplementDisabled => self.auto_implement_disabled += 1,
             SkipReason::AlreadyHandledIssue => self.already_handled_issue += 1,
             SkipReason::ExistingIssuePr => self.existing_issue_pr += 1,
             SkipReason::IssueWithoutChanges => self.issue_without_changes += 1,
@@ -198,6 +202,7 @@ where
             master_accounts: normalized_logins(settings.master_accounts),
             auto_review_accounts: normalized_logins(settings.auto_review_accounts),
             auto_review_repos: settings.auto_review_repos,
+            auto_implement_accounts: normalized_logins(settings.auto_implement_accounts),
             auto_implement_repos: settings.auto_implement_repos,
             auto_implement_label: settings.auto_implement_label,
             auto_implement_window: settings.auto_implement_window,
@@ -512,6 +517,18 @@ where
             return Ok(HandleOutcome::Skipped(SkipReason::SelfAuthoredIssue));
         }
 
+        if !self
+            .auto_implement_accounts
+            .contains(&issue.author.to_ascii_lowercase())
+        {
+            debug!(
+                issue = %issue.html_url,
+                author = %issue.author,
+                "skipping issue from account without auto implementation"
+            );
+            return Ok(HandleOutcome::Skipped(SkipReason::AutoImplementDisabled));
+        }
+
         match self.github.issue_state(issue, &self.bot_login).await? {
             ReviewState::Pending => {}
             ReviewState::Handled => {
@@ -673,6 +690,7 @@ enum SkipReason {
     AutoReviewDisabled,
     AlreadyHandledPr,
     SelfAuthoredIssue,
+    AutoImplementDisabled,
     AlreadyHandledIssue,
     ExistingIssuePr,
     IssueWithoutChanges,
@@ -1018,11 +1036,15 @@ mod tests {
     }
 
     fn issue() -> Issue {
+        issue_with_author("dionysuzx")
+    }
+
+    fn issue_with_author(author: &str) -> Issue {
         Issue {
             owner: "o".to_string(),
             repo: "r".to_string(),
             number: 3,
-            author: "mayushii".to_string(),
+            author: author.to_string(),
             title: "Add the thing".to_string(),
             body: "Please add the missing thing.".to_string(),
             api_url: "https://api.github.com/repos/o/r/issues/3".to_string(),
@@ -1065,6 +1087,7 @@ mod tests {
                     owner: "o".to_string(),
                     repo: "r".to_string(),
                 }],
+                auto_implement_accounts: vec!["dionysuzx".to_string()],
                 auto_implement_repos: vec![RepoSlug {
                     owner: "o".to_string(),
                     repo: "r".to_string(),
@@ -1283,6 +1306,30 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert_eq!(report.skip_breakdown.existing_issue_pr, 1);
         assert_eq!(*github.events.lock().unwrap(), vec!["handled_issue"]);
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn skips_labeled_issue_from_account_without_auto_implementation() {
+        let github = FakeGithub::default();
+        *github.issues.lock().unwrap() = vec![issue_with_author("mayushii")];
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.skip_breakdown.auto_implement_disabled, 1);
+        assert!(github.events.lock().unwrap().is_empty());
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
