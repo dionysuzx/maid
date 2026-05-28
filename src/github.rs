@@ -192,6 +192,7 @@ impl GithubClient for GitHubRestClient {
                 api_url: issue.url,
                 html_url: issue.html_url,
                 clone_url: repo_details.clone_url.clone(),
+                ssh_url: repo_details.ssh_url.clone(),
                 default_branch: repo_details.default_branch.clone(),
             })
             .collect())
@@ -518,6 +519,7 @@ struct ApiRepo {
 #[derive(Debug, Deserialize)]
 struct ApiRepoDetails {
     clone_url: String,
+    ssh_url: String,
     default_branch: String,
 }
 

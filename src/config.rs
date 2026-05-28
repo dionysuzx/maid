@@ -14,6 +14,7 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub github_token: String,
     pub bot_login: String,
+    pub implementation_actor: ImplementationActor,
     pub master_accounts: Vec<String>,
     pub auto_review_accounts: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
@@ -26,6 +27,26 @@ pub struct Config {
     pub task_limit_per_24h: Option<usize>,
     pub codex_bin: String,
     pub github_api_ip: Option<IpAddr>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementationActor {
+    pub login: String,
+    pub github_token: String,
+    pub git_auth: ImplementationGitAuth,
+    pub commit_identity: ImplementationCommitIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImplementationGitAuth {
+    Bot,
+    Host,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImplementationCommitIdentity {
+    Bot,
+    Host,
 }
 
 impl Config {
@@ -56,6 +77,8 @@ impl Config {
             non_empty(file.auto_implement_label).unwrap_or_else(|| "maid".to_string());
         let auto_implement_window_days = file.auto_implement_window_days.unwrap_or(30).max(1);
         let github_token = gh_token_for(&bot_login)?;
+        let implementation_actor =
+            implementation_actor(file.implementation_actor, &bot_login, &github_token)?;
         let bind_addr = non_empty(file.bind)
             .unwrap_or_else(|| "127.0.0.1:3000".to_string())
             .parse()
@@ -76,6 +99,7 @@ impl Config {
             bind_addr,
             github_token,
             bot_login,
+            implementation_actor,
             master_accounts,
             auto_review_accounts,
             auto_review_repos,
@@ -101,12 +125,20 @@ struct ConfigFile {
     auto_implement_repos: Option<Vec<String>>,
     auto_implement_label: Option<String>,
     auto_implement_window_days: Option<u64>,
+    implementation_actor: Option<ImplementationActorFile>,
     bind: Option<String>,
     cache_dir: Option<String>,
     poll_seconds: Option<u64>,
     task_limit_per_24h: Option<usize>,
     codex_bin: Option<String>,
     github_api_ip: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ImplementationActorFile {
+    login: Option<String>,
+    git_auth: Option<String>,
+    commit_identity: Option<String>,
 }
 
 impl ConfigFile {
@@ -116,6 +148,53 @@ impl ConfigFile {
                 .with_context(|| format!("failed to parse {}", path.display())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+        }
+    }
+}
+
+fn implementation_actor(
+    file: Option<ImplementationActorFile>,
+    bot_login: &str,
+    bot_token: &str,
+) -> Result<ImplementationActor> {
+    let file = file.unwrap_or_default();
+    let login = non_empty(file.login).unwrap_or_else(|| bot_login.to_string());
+    let github_token = if login.eq_ignore_ascii_case(bot_login) {
+        bot_token.to_string()
+    } else {
+        gh_token_for(&login)?
+    };
+
+    Ok(ImplementationActor {
+        login,
+        github_token,
+        git_auth: implementation_git_auth(file.git_auth)?,
+        commit_identity: implementation_commit_identity(file.commit_identity)?,
+    })
+}
+
+fn implementation_git_auth(value: Option<String>) -> Result<ImplementationGitAuth> {
+    match non_empty(value)
+        .unwrap_or_else(|| "bot".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "bot" => Ok(ImplementationGitAuth::Bot),
+        "host" => Ok(ImplementationGitAuth::Host),
+        value => bail!("implementation_actor.git_auth must be \"bot\" or \"host\": {value:?}"),
+    }
+}
+
+fn implementation_commit_identity(value: Option<String>) -> Result<ImplementationCommitIdentity> {
+    match non_empty(value)
+        .unwrap_or_else(|| "bot".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "bot" => Ok(ImplementationCommitIdentity::Bot),
+        "host" => Ok(ImplementationCommitIdentity::Host),
+        value => {
+            bail!("implementation_actor.commit_identity must be \"bot\" or \"host\": {value:?}")
         }
     }
 }
@@ -253,6 +332,11 @@ poll_seconds = 30
 task_limit_per_24h = 5
 codex_bin = "codex-test"
 github_api_ip = "127.0.0.1"
+
+[implementation_actor]
+login = "dionysuzx"
+git_auth = "host"
+commit_identity = "host"
 "#
         )
         .unwrap();
@@ -275,6 +359,13 @@ github_api_ip = "127.0.0.1"
         );
         assert_eq!(config.auto_implement_label.as_deref(), Some("maid"));
         assert_eq!(config.auto_implement_window_days, Some(14));
+        let implementation_actor = config.implementation_actor.unwrap();
+        assert_eq!(implementation_actor.login.as_deref(), Some("dionysuzx"));
+        assert_eq!(implementation_actor.git_auth.as_deref(), Some("host"));
+        assert_eq!(
+            implementation_actor.commit_identity.as_deref(),
+            Some("host")
+        );
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:4000"));
         assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
         assert_eq!(config.poll_seconds, Some(30));
@@ -294,8 +385,31 @@ github_api_ip = "127.0.0.1"
         assert_eq!(config.auto_implement_repos, None);
         assert_eq!(config.auto_implement_label, None);
         assert_eq!(config.auto_implement_window_days, None);
+        assert!(config.implementation_actor.is_none());
         assert_eq!(config.poll_seconds, None);
         assert_eq!(config.task_limit_per_24h, None);
+    }
+
+    #[test]
+    fn parses_implementation_actor_modes() {
+        assert_eq!(
+            implementation_git_auth(Some(" host ".to_string())).unwrap(),
+            ImplementationGitAuth::Host
+        );
+        assert_eq!(
+            implementation_git_auth(None).unwrap(),
+            ImplementationGitAuth::Bot
+        );
+        assert_eq!(
+            implementation_commit_identity(Some("host".to_string())).unwrap(),
+            ImplementationCommitIdentity::Host
+        );
+        assert_eq!(
+            implementation_commit_identity(None).unwrap(),
+            ImplementationCommitIdentity::Bot
+        );
+        assert!(implementation_git_auth(Some("ssh".to_string())).is_err());
+        assert!(implementation_commit_identity(Some("machine".to_string())).is_err());
     }
 
     #[test]

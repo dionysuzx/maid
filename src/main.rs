@@ -2,10 +2,10 @@ use anyhow::Result;
 use axum::{Router, routing::get};
 use maid::{
     codex::CodexCli,
-    config::Config,
+    config::{Config, ImplementationCommitIdentity, ImplementationGitAuth},
     github::GitHubRestClient,
     maid::{Maid, MaidSettings},
-    repo_cache::GitRepoCache,
+    repo_cache::{GitRepoCache, IssueCommitIdentity, IssueGitAuth},
     task_limit::FileTaskStartRecorder,
 };
 use std::time::Duration;
@@ -20,13 +20,30 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let bot_github =
+        GitHubRestClient::with_api_ip(config.github_token.clone(), config.github_api_ip);
+    let implementation_github = GitHubRestClient::with_api_ip(
+        config.implementation_actor.github_token.clone(),
+        config.github_api_ip,
+    );
+    let issue_git_auth = match config.implementation_actor.git_auth {
+        ImplementationGitAuth::Bot => IssueGitAuth::Bot,
+        ImplementationGitAuth::Host => IssueGitAuth::Host,
+    };
+    let issue_commit_identity = match config.implementation_actor.commit_identity {
+        ImplementationCommitIdentity::Bot => IssueCommitIdentity::Bot,
+        ImplementationCommitIdentity::Host => IssueCommitIdentity::Host,
+    };
+
     let maid = Maid::new(
-        GitHubRestClient::with_api_ip(config.github_token.clone(), config.github_api_ip),
+        bot_github,
+        implementation_github,
         GitRepoCache::new(
             config.cache_dir.clone(),
             config.github_token.clone(),
             config.bot_login.clone(),
-        ),
+        )
+        .with_issue_publish_mode(issue_git_auth, issue_commit_identity),
         CodexCli::new(config.codex_bin.clone()),
         MaidSettings {
             bot_login: config.bot_login.clone(),
@@ -117,6 +134,9 @@ async fn main() -> Result<()> {
         auto_implement_repos = config.auto_implement_repos.len(),
         auto_implement_label = %config.auto_implement_label,
         auto_implement_window_days = config.auto_implement_window_days,
+        implementation_actor = %config.implementation_actor.login,
+        implementation_git_auth = ?config.implementation_actor.git_auth,
+        implementation_commit_identity = ?config.implementation_actor.commit_identity,
         "maid started"
     );
 

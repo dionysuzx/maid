@@ -25,3 +25,11 @@ codex_bin = "codex"
 
 # Optional. Leave omitted unless you need to pin api.github.com.
 # github_api_ip = "127.0.0.1"
+
+# Optional. Defaults to the bot account and bot-token git/commit behavior.
+# Use host modes when the machine's git config, SSH credentials, and signing
+# setup should author, sign, and push issue implementation PRs.
+[implementation_actor]
+login = "dionysuzx"
+git_auth = "host"
+commit_identity = "host"

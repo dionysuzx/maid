@@ -50,10 +50,37 @@ gh auth login
 gh auth status --hostname github.com
 ```
 
-For automatic issue implementation, the bot account also needs repository write
-access so Maid can push deterministic branches like `maid/issue-123` and open
-pull requests. Maid performs the commit, push, and PR creation itself; Codex only
-edits the checkout and returns the PR body.
+For automatic issue implementation, the configured publishing identity needs
+repository write access so Maid can push deterministic branches like
+`maid/issue-123` and open pull requests. Maid performs the commit, push, and PR
+creation itself; Codex only edits the checkout and returns the PR body.
+
+If issue implementation PRs should be opened by another GitHub account, configure
+`implementation_actor`. Maid still polls, comments, and marks work as the bot,
+but it uses the implementation actor's `gh` token to open PRs:
+
+```toml
+[implementation_actor]
+login = "dionysuzx"
+git_auth = "host"
+commit_identity = "host"
+```
+
+With `git_auth = "host"`, Maid uses the repository SSH remote for implementation
+branches and does not inject the bot token into git commands. With
+`commit_identity = "host"`, Maid lets the host git config choose author,
+committer, signing key, and signing behavior. The host must be able to commit
+and push non-interactively:
+
+```sh
+gh auth login --user maid-bot
+gh auth login --user dionysuzx
+gh auth status --hostname github.com
+git config --global user.name
+git config --global user.email
+git config --global commit.gpgsign
+ssh -T git@github.com
+```
 
 `just start` runs Maid in the background. Runtime state lives in `~/.maid`,
 including `~/.maid/maid.log`, `~/.maid/maid.pid`, and the default repo cache.

@@ -91,6 +91,7 @@ impl CodexRun {
 #[derive(Clone)]
 pub struct Maid<G, R, C> {
     github: G,
+    implementation_github: G,
     repos: R,
     codex: C,
     bot_login: String,
@@ -181,9 +182,16 @@ where
     R: RepoWorkspace,
     C: CodexRunner,
 {
-    pub fn new(github: G, repos: R, codex: C, settings: MaidSettings) -> Self {
+    pub fn new(
+        github: G,
+        implementation_github: G,
+        repos: R,
+        codex: C,
+        settings: MaidSettings,
+    ) -> Self {
         Self {
             github,
+            implementation_github,
             repos,
             codex,
             bot_login: settings.bot_login,
@@ -575,7 +583,7 @@ where
             .await?;
         self.repos.push_branch(&checkout, &branch).await?;
         let pr = self
-            .github
+            .implementation_github
             .create_pull_request(
                 issue,
                 &branch,
@@ -1020,6 +1028,7 @@ mod tests {
             api_url: "https://api.github.com/repos/o/r/issues/3".to_string(),
             html_url: "https://github.com/o/r/issues/3".to_string(),
             clone_url: "https://github.com/o/r.git".to_string(),
+            ssh_url: "git@github.com:o/r.git".to_string(),
             default_branch: "main".to_string(),
         }
     }
@@ -1044,6 +1053,7 @@ mod tests {
         codex: FakeCodex,
     ) -> Maid<FakeGithub, FakeRepos, FakeCodex> {
         Maid::new(
+            github.clone(),
             github,
             repos,
             codex,

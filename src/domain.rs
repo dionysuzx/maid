@@ -83,6 +83,7 @@ pub struct Issue {
     pub api_url: String,
     pub html_url: String,
     pub clone_url: String,
+    pub ssh_url: String,
     pub default_branch: String,
 }
 

@@ -14,9 +14,33 @@ use tokio::process::Command;
 #[derive(Clone, Debug)]
 pub struct GitRepoCache {
     root: PathBuf,
-    auth_header: String,
-    commit_author_name: String,
-    commit_author_email: String,
+    bot_auth: GitAuth,
+    issue_git_auth: GitAuth,
+    issue_commit_identity: CommitIdentity,
+}
+
+#[derive(Clone, Debug)]
+pub enum IssueGitAuth {
+    Bot,
+    Host,
+}
+
+#[derive(Clone, Debug)]
+pub enum IssueCommitIdentity {
+    Bot,
+    Host,
+}
+
+#[derive(Clone, Debug)]
+enum GitAuth {
+    ExtraHeader(String),
+    Host,
+}
+
+#[derive(Clone, Debug)]
+enum CommitIdentity {
+    Bot { name: String, email: String },
+    Host,
 }
 
 impl GitRepoCache {
@@ -28,12 +52,31 @@ impl GitRepoCache {
         let credential = format!("x-access-token:{}", github_token.into());
         let encoded = general_purpose::STANDARD.encode(credential);
         let bot_login = bot_login.into();
+        let bot_auth = GitAuth::ExtraHeader(format!("Authorization: Basic {encoded}"));
         Self {
             root: root.into(),
-            auth_header: format!("Authorization: Basic {encoded}"),
-            commit_author_name: bot_login.clone(),
-            commit_author_email: format!("{bot_login}@users.noreply.github.com"),
+            bot_auth: bot_auth.clone(),
+            issue_git_auth: bot_auth,
+            issue_commit_identity: CommitIdentity::Bot {
+                name: bot_login.clone(),
+                email: format!("{bot_login}@users.noreply.github.com"),
+            },
         }
+    }
+
+    pub fn with_issue_publish_mode(
+        mut self,
+        git_auth: IssueGitAuth,
+        commit_identity: IssueCommitIdentity,
+    ) -> Self {
+        self.issue_git_auth = match git_auth {
+            IssueGitAuth::Bot => self.bot_auth.clone(),
+            IssueGitAuth::Host => GitAuth::Host,
+        };
+        if matches!(commit_identity, IssueCommitIdentity::Host) {
+            self.issue_commit_identity = CommitIdentity::Host;
+        }
+        self
     }
 
     pub fn repo_dir(&self, pr: &PullRequest) -> Result<PathBuf> {
@@ -48,20 +91,35 @@ impl GitRepoCache {
         Ok(self.root.join("repos").join(&issue.owner).join(&issue.repo))
     }
 
-    async fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<()> {
-        self.git_output(cwd, args).await.map(|_| ())
+    fn issue_remote_url<'a>(&self, issue: &'a Issue) -> &'a str {
+        match &self.issue_git_auth {
+            GitAuth::ExtraHeader(_) => &issue.clone_url,
+            GitAuth::Host => &issue.ssh_url,
+        }
     }
 
-    async fn git_output(&self, cwd: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
+    async fn run_git(&self, auth: &GitAuth, cwd: Option<&Path>, args: &[&str]) -> Result<()> {
+        self.git_output(auth, cwd, args).await.map(|_| ())
+    }
+
+    async fn git_output(
+        &self,
+        auth: &GitAuth,
+        cwd: Option<&Path>,
+        args: &[&str],
+    ) -> Result<Vec<u8>> {
         let mut command = Command::new("git");
         command
             .args(args)
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "http.extraheader")
-            .env("GIT_CONFIG_VALUE_0", &self.auth_header)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let GitAuth::ExtraHeader(auth_header) = auth {
+            command
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "http.extraheader")
+                .env("GIT_CONFIG_VALUE_0", auth_header);
+        }
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
@@ -92,26 +150,37 @@ impl RepoWorkspace for GitRepoCache {
 
         if !checkout.join(".git").exists() {
             let checkout_string = checkout.to_string_lossy().to_string();
-            self.run_git(None, &["clone", &pr.clone_url, &checkout_string])
-                .await
-                .with_context(|| format!("failed to clone {}", pr.repo_key()))?;
+            self.run_git(
+                &self.bot_auth,
+                None,
+                &["clone", &pr.clone_url, &checkout_string],
+            )
+            .await
+            .with_context(|| format!("failed to clone {}", pr.repo_key()))?;
         }
 
         self.run_git(
+            &self.bot_auth,
             Some(&checkout),
             &["remote", "set-url", "origin", &pr.clone_url],
         )
         .await?;
         let pr_head = format!("pull/{}/head", pr.number);
-        self.run_git(Some(&checkout), &["fetch", "--prune", "origin", &pr_head])
-            .await
-            .with_context(|| format!("failed to fetch PR {}", pr.html_url))?;
         self.run_git(
+            &self.bot_auth,
+            Some(&checkout),
+            &["fetch", "--prune", "origin", &pr_head],
+        )
+        .await
+        .with_context(|| format!("failed to fetch PR {}", pr.html_url))?;
+        self.run_git(
+            &self.bot_auth,
             Some(&checkout),
             &["switch", "--detach", "--force", "FETCH_HEAD"],
         )
         .await?;
-        self.run_git(Some(&checkout), &["clean", "-fdx"]).await?;
+        self.run_git(&self.bot_auth, Some(&checkout), &["clean", "-fdx"])
+            .await?;
 
         Ok(checkout)
     }
@@ -127,14 +196,19 @@ impl RepoWorkspace for GitRepoCache {
 
         if !checkout.join(".git").exists() {
             let checkout_string = checkout.to_string_lossy().to_string();
-            self.run_git(None, &["clone", &issue.clone_url, &checkout_string])
-                .await
-                .with_context(|| format!("failed to clone {}", issue.repo_key()))?;
+            self.run_git(
+                &self.issue_git_auth,
+                None,
+                &["clone", self.issue_remote_url(issue), &checkout_string],
+            )
+            .await
+            .with_context(|| format!("failed to clone {}", issue.repo_key()))?;
         }
 
         self.run_git(
+            &self.issue_git_auth,
             Some(&checkout),
-            &["remote", "set-url", "origin", &issue.clone_url],
+            &["remote", "set-url", "origin", self.issue_remote_url(issue)],
         )
         .await?;
         let remote_ref = format!(
@@ -142,6 +216,7 @@ impl RepoWorkspace for GitRepoCache {
             issue.default_branch, issue.default_branch
         );
         self.run_git(
+            &self.issue_git_auth,
             Some(&checkout),
             &["fetch", "--prune", "origin", &remote_ref],
         )
@@ -150,6 +225,7 @@ impl RepoWorkspace for GitRepoCache {
         let remote_branch_ref = format!("refs/heads/{branch}");
         if self
             .git_output(
+                &self.issue_git_auth,
                 Some(&checkout),
                 &["ls-remote", "--exit-code", "origin", &remote_branch_ref],
             )
@@ -157,47 +233,79 @@ impl RepoWorkspace for GitRepoCache {
             .is_ok()
         {
             let remote_issue_ref = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-            self.run_git(Some(&checkout), &["fetch", "origin", &remote_issue_ref])
-                .await
-                .with_context(|| format!("failed to fetch existing issue branch {branch}"))?;
+            self.run_git(
+                &self.issue_git_auth,
+                Some(&checkout),
+                &["fetch", "origin", &remote_issue_ref],
+            )
+            .await
+            .with_context(|| format!("failed to fetch existing issue branch {branch}"))?;
         }
         let base = format!("origin/{}", issue.default_branch);
-        self.run_git(Some(&checkout), &["switch", "-C", branch, &base])
+        self.run_git(
+            &self.issue_git_auth,
+            Some(&checkout),
+            &["switch", "-C", branch, &base],
+        )
+        .await?;
+        self.run_git(
+            &self.issue_git_auth,
+            Some(&checkout),
+            &["reset", "--hard", &base],
+        )
+        .await?;
+        self.run_git(&self.issue_git_auth, Some(&checkout), &["clean", "-fdx"])
             .await?;
-        self.run_git(Some(&checkout), &["reset", "--hard", &base])
-            .await?;
-        self.run_git(Some(&checkout), &["clean", "-fdx"]).await?;
 
         Ok(checkout)
     }
 
     async fn has_changes(&self, checkout: &Path) -> Result<bool> {
         let output = self
-            .git_output(Some(checkout), &["status", "--porcelain"])
+            .git_output(
+                &self.issue_git_auth,
+                Some(checkout),
+                &["status", "--porcelain"],
+            )
             .await?;
         Ok(!output.is_empty())
     }
 
     async fn commit_all(&self, checkout: &Path, message: &str) -> Result<()> {
-        self.run_git(Some(checkout), &["add", "-A"]).await?;
-        self.run_git(
-            Some(checkout),
-            &[
-                "-c",
-                &format!("user.name={}", self.commit_author_name),
-                "-c",
-                &format!("user.email={}", self.commit_author_email),
-                "commit",
-                "-m",
-                message,
-            ],
-        )
-        .await
+        self.run_git(&self.issue_git_auth, Some(checkout), &["add", "-A"])
+            .await?;
+        match &self.issue_commit_identity {
+            CommitIdentity::Bot { name, email } => {
+                self.run_git(
+                    &self.issue_git_auth,
+                    Some(checkout),
+                    &[
+                        "-c",
+                        &format!("user.name={name}"),
+                        "-c",
+                        &format!("user.email={email}"),
+                        "commit",
+                        "-m",
+                        message,
+                    ],
+                )
+                .await
+            }
+            CommitIdentity::Host => {
+                self.run_git(
+                    &self.issue_git_auth,
+                    Some(checkout),
+                    &["commit", "-m", message],
+                )
+                .await
+            }
+        }
     }
 
     async fn push_branch(&self, checkout: &Path, branch: &str) -> Result<()> {
         let refspec = format!("HEAD:refs/heads/{branch}");
         self.run_git(
+            &self.issue_git_auth,
             Some(checkout),
             &["push", "--force-with-lease", "origin", &refspec],
         )
@@ -221,6 +329,22 @@ mod tests {
         }
     }
 
+    fn issue(owner: &str, repo: &str) -> Issue {
+        Issue {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number: 12,
+            author: "dionysuzx".to_string(),
+            title: "Add issue mode".to_string(),
+            body: "body".to_string(),
+            api_url: "https://api.github.com/repos/o/r/issues/12".to_string(),
+            html_url: "https://github.com/o/r/issues/12".to_string(),
+            clone_url: "https://github.com/o/r.git".to_string(),
+            ssh_url: "git@github.com:o/r.git".to_string(),
+            default_branch: "main".to_string(),
+        }
+    }
+
     #[test]
     fn maps_repositories_into_the_maid_cache() {
         let cache = GitRepoCache::new("/tmp/maid-cache", "token", "maid-bot");
@@ -241,5 +365,26 @@ mod tests {
 
         assert!(cache.repo_dir(&pr("../dionysuzx", "forkcast")).is_err());
         assert!(cache.repo_dir(&pr("dionysuzx", "forkcast/slash")).is_err());
+    }
+
+    #[test]
+    fn host_issue_git_auth_uses_ssh_remote() {
+        let cache = GitRepoCache::new("/tmp/maid-cache", "token", "maid-bot")
+            .with_issue_publish_mode(IssueGitAuth::Host, IssueCommitIdentity::Host);
+
+        assert_eq!(
+            cache.issue_remote_url(&issue("o", "r")),
+            "git@github.com:o/r.git"
+        );
+    }
+
+    #[test]
+    fn bot_issue_git_auth_uses_https_remote() {
+        let cache = GitRepoCache::new("/tmp/maid-cache", "token", "maid-bot");
+
+        assert_eq!(
+            cache.issue_remote_url(&issue("o", "r")),
+            "https://github.com/o/r.git"
+        );
     }
 }
