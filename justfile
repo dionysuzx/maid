@@ -31,7 +31,7 @@ init:
     fi
 
     cp "{{ justfile_directory() }}/config.example.toml" "{{config_file}}"
-    perl -0pi -e 's/^bot_login = "maid-bot"/bot_login = ""/m; s/master_accounts = \["your-name"\]/master_accounts = ["dionysuzx"]/m' "{{config_file}}"
+    perl -0pi -e 's/^bot_login = "maid-bot"/bot_login = ""/m; s/your-name/dionysuzx/g' "{{config_file}}"
 
     echo "created {{config_file}}"
     echo "edit bot_login and master_accounts, then run: just start"
