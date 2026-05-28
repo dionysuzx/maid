@@ -10,7 +10,7 @@ Automatic reviews can be enabled for allowlisted repos.
 ## Prerequisites
 
 - A GitHub bot account authenticated with `gh`; Maid uses that account's token.
-- Rust/Cargo, `git`, `gh`, `codex`, and `just` on `PATH`.
+- Rust/Cargo, `git`, `gh`, `codex`, `just`, and `nvim` on `PATH`.
 
 ## Quick Start
 
