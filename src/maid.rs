@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 #[async_trait]
 pub trait GithubClient: Send + Sync {
@@ -121,63 +121,8 @@ pub struct MaidSettings {
 pub struct PollReport {
     pub seen: usize,
     pub skipped: usize,
-    pub skip_breakdown: SkipBreakdown,
     pub responded: usize,
     pub failed: usize,
-}
-
-impl PollReport {
-    fn record_skip(&mut self, reason: SkipReason) {
-        self.skipped += 1;
-        self.skip_breakdown.record(reason);
-    }
-
-    pub fn has_actionable_result(&self) -> bool {
-        self.responded > 0 || self.failed > 0
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SkipBreakdown {
-    pub duplicate_notification: usize,
-    pub non_pr_notification: usize,
-    pub missing_mention: usize,
-    pub self_authored_mention: usize,
-    pub non_master_mention: usize,
-    pub no_bot_request: usize,
-    pub already_handled_mention: usize,
-    pub self_authored_pr: usize,
-    pub auto_review_disabled: usize,
-    pub already_handled_pr: usize,
-    pub self_authored_issue: usize,
-    pub auto_implement_disabled: usize,
-    pub already_handled_issue: usize,
-    pub existing_issue_pr: usize,
-    pub issue_without_changes: usize,
-    pub task_limit_reached: usize,
-}
-
-impl SkipBreakdown {
-    fn record(&mut self, reason: SkipReason) {
-        match reason {
-            SkipReason::DuplicateNotification => self.duplicate_notification += 1,
-            SkipReason::NonPrNotification => self.non_pr_notification += 1,
-            SkipReason::MissingMention => self.missing_mention += 1,
-            SkipReason::SelfAuthoredMention => self.self_authored_mention += 1,
-            SkipReason::NonMasterMention => self.non_master_mention += 1,
-            SkipReason::NoBotRequest => self.no_bot_request += 1,
-            SkipReason::AlreadyHandledMention => self.already_handled_mention += 1,
-            SkipReason::SelfAuthoredPr => self.self_authored_pr += 1,
-            SkipReason::AutoReviewDisabled => self.auto_review_disabled += 1,
-            SkipReason::AlreadyHandledPr => self.already_handled_pr += 1,
-            SkipReason::SelfAuthoredIssue => self.self_authored_issue += 1,
-            SkipReason::AutoImplementDisabled => self.auto_implement_disabled += 1,
-            SkipReason::AlreadyHandledIssue => self.already_handled_issue += 1,
-            SkipReason::ExistingIssuePr => self.existing_issue_pr += 1,
-            SkipReason::IssueWithoutChanges => self.issue_without_changes += 1,
-            SkipReason::TaskLimitReached => self.task_limit_reached += 1,
-        }
-    }
 }
 
 impl<G, R, C> Maid<G, R, C>
@@ -229,17 +174,13 @@ where
         for notification in notifications {
             let work_key = work_key(&notification);
             if !seen_this_poll.insert(work_key) {
-                report.record_skip(SkipReason::DuplicateNotification);
-                debug!(
-                    notification_id = notification.id,
-                    "skipped duplicate notification for latest comment"
-                );
+                report.skipped += 1;
                 continue;
             }
 
             match self.handle_notification(&notification).await {
                 Ok(HandleOutcome::Responded) => report.responded += 1,
-                Ok(HandleOutcome::Skipped(reason)) => report.record_skip(reason),
+                Ok(HandleOutcome::Skipped) => report.skipped += 1,
                 Err(err) => {
                     report.failed += 1;
                     error!(
@@ -258,7 +199,7 @@ where
             for pr in pull_requests {
                 match self.handle_auto_review_pr(&pr).await {
                     Ok(HandleOutcome::Responded) => report.responded += 1,
-                    Ok(HandleOutcome::Skipped(reason)) => report.record_skip(reason),
+                    Ok(HandleOutcome::Skipped) => report.skipped += 1,
                     Err(err) => {
                         report.failed += 1;
                         error!(
@@ -284,7 +225,7 @@ where
             for issue in issues {
                 match self.handle_auto_implement_issue(&issue).await {
                     Ok(HandleOutcome::Responded) => report.responded += 1,
-                    Ok(HandleOutcome::Skipped(reason)) => report.record_skip(reason),
+                    Ok(HandleOutcome::Skipped) => report.skipped += 1,
                     Err(err) => {
                         report.failed += 1;
                         error!(
@@ -306,64 +247,46 @@ where
         }
 
         self.github.mark_notification_handled(notification).await?;
-        debug!(
-            notification_id = notification.id,
-            "skipped non-PR notification"
-        );
-        Ok(HandleOutcome::Skipped(SkipReason::NonPrNotification))
+        Ok(HandleOutcome::Skipped)
     }
 
     async fn handle_mention(&self, notification: &Notification) -> Result<HandleOutcome> {
         let Some(mention) = self.github.mention_for(notification).await? else {
-            debug!(
-                notification_id = notification.id,
-                "skipped notification without a resolvable mention"
-            );
-            return Ok(HandleOutcome::Skipped(SkipReason::MissingMention));
+            return Ok(HandleOutcome::Skipped);
         };
 
         if mention.author.eq_ignore_ascii_case(&self.bot_login) {
-            debug!(
-                notification_id = notification.id,
-                mention = %mention.html_url,
-                "skipped mention authored by bot"
-            );
-            return Ok(HandleOutcome::Skipped(SkipReason::SelfAuthoredMention));
+            return Ok(HandleOutcome::Skipped);
         }
 
         if !self
             .master_accounts
             .contains(&mention.author.to_ascii_lowercase())
         {
-            debug!(
+            info!(
                 notification_id = notification.id,
                 mention = %mention.html_url,
                 author = %mention.author,
                 "skipping mention from non-master account"
             );
             self.github.mark_notification_handled(notification).await?;
-            return Ok(HandleOutcome::Skipped(SkipReason::NonMasterMention));
+            return Ok(HandleOutcome::Skipped);
         }
 
         let Some(request) = MentionRequest::parse(&mention.body, &self.bot_login)? else {
-            debug!(
-                notification_id = notification.id,
-                mention = %mention.html_url,
-                "skipped mention without bot request"
-            );
-            return Ok(HandleOutcome::Skipped(SkipReason::NoBotRequest));
+            return Ok(HandleOutcome::Skipped);
         };
 
         match self.github.mention_state(&mention, &self.bot_login).await? {
             ReviewState::Pending => {}
             ReviewState::Handled => {
-                debug!(
+                info!(
                     notification_id = notification.id,
                     mention = %mention.html_url,
                     "skipping already handled mention"
                 );
                 self.github.mark_notification_handled(notification).await?;
-                return Ok(HandleOutcome::Skipped(SkipReason::AlreadyHandledMention));
+                return Ok(HandleOutcome::Skipped);
             }
         }
 
@@ -374,7 +297,7 @@ where
                 mention = %mention.html_url,
                 "skipping mention because the 24-hour task limit is reached"
             );
-            return Ok(HandleOutcome::Skipped(SkipReason::TaskLimitReached));
+            return Ok(HandleOutcome::Skipped);
         }
 
         self.github.mark_mention_started(&mention).await?;
@@ -432,30 +355,29 @@ where
 
     async fn handle_auto_review_pr(&self, pr: &PullRequest) -> Result<HandleOutcome> {
         if pr.author.eq_ignore_ascii_case(&self.bot_login) {
-            debug!(pr = %pr.html_url, "skipped pull request authored by bot");
-            return Ok(HandleOutcome::Skipped(SkipReason::SelfAuthoredPr));
+            return Ok(HandleOutcome::Skipped);
         }
 
         if !self
             .auto_review_accounts
             .contains(&pr.author.to_ascii_lowercase())
         {
-            debug!(
+            info!(
                 pr = %pr.html_url,
                 author = %pr.author,
                 "skipping pull request from account without auto review"
             );
-            return Ok(HandleOutcome::Skipped(SkipReason::AutoReviewDisabled));
+            return Ok(HandleOutcome::Skipped);
         }
 
         match self.github.pr_state(pr, &self.bot_login).await? {
             ReviewState::Pending => {}
             ReviewState::Handled => {
-                debug!(
+                info!(
                     pr = %pr.html_url,
                     "skipping already handled auto-review pull request"
                 );
-                return Ok(HandleOutcome::Skipped(SkipReason::AlreadyHandledPr));
+                return Ok(HandleOutcome::Skipped);
             }
         }
 
@@ -465,7 +387,7 @@ where
                 author = %pr.author,
                 "skipping auto-review pull request because the 24-hour task limit is reached"
             );
-            return Ok(HandleOutcome::Skipped(SkipReason::TaskLimitReached));
+            return Ok(HandleOutcome::Skipped);
         }
 
         self.github.mark_pr_started(pr).await?;
@@ -513,27 +435,26 @@ where
 
     async fn handle_auto_implement_issue(&self, issue: &Issue) -> Result<HandleOutcome> {
         if issue.author.eq_ignore_ascii_case(&self.bot_login) {
-            debug!(issue = %issue.html_url, "skipped issue authored by bot");
-            return Ok(HandleOutcome::Skipped(SkipReason::SelfAuthoredIssue));
+            return Ok(HandleOutcome::Skipped);
         }
 
         if !self
             .auto_implement_accounts
             .contains(&issue.author.to_ascii_lowercase())
         {
-            debug!(
+            info!(
                 issue = %issue.html_url,
                 author = %issue.author,
                 "skipping issue from account without auto implementation"
             );
-            return Ok(HandleOutcome::Skipped(SkipReason::AutoImplementDisabled));
+            return Ok(HandleOutcome::Skipped);
         }
 
         match self.github.issue_state(issue, &self.bot_login).await? {
             ReviewState::Pending => {}
             ReviewState::Handled => {
-                debug!(issue = %issue.html_url, "skipping already handled issue");
-                return Ok(HandleOutcome::Skipped(SkipReason::AlreadyHandledIssue));
+                info!(issue = %issue.html_url, "skipping already handled issue");
+                return Ok(HandleOutcome::Skipped);
             }
         }
 
@@ -550,7 +471,7 @@ where
                 "skipping issue because a Maid pull request already exists"
             );
             self.github.mark_issue_handled(issue).await?;
-            return Ok(HandleOutcome::Skipped(SkipReason::ExistingIssuePr));
+            return Ok(HandleOutcome::Skipped);
         }
 
         if !self.can_start_task()? {
@@ -559,7 +480,7 @@ where
                 author = %issue.author,
                 "skipping issue implementation because the 24-hour task limit is reached"
             );
-            return Ok(HandleOutcome::Skipped(SkipReason::TaskLimitReached));
+            return Ok(HandleOutcome::Skipped);
         }
 
         self.github.mark_issue_started(issue).await?;
@@ -592,7 +513,7 @@ where
                     "failed to mark issue handled after no-change response"
                 );
             }
-            return Ok(HandleOutcome::Skipped(SkipReason::IssueWithoutChanges));
+            return Ok(HandleOutcome::Skipped);
         }
 
         self.repos
@@ -674,27 +595,7 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HandleOutcome {
     Responded,
-    Skipped(SkipReason),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SkipReason {
-    DuplicateNotification,
-    NonPrNotification,
-    MissingMention,
-    SelfAuthoredMention,
-    NonMasterMention,
-    NoBotRequest,
-    AlreadyHandledMention,
-    SelfAuthoredPr,
-    AutoReviewDisabled,
-    AlreadyHandledPr,
-    SelfAuthoredIssue,
-    AutoImplementDisabled,
-    AlreadyHandledIssue,
-    ExistingIssuePr,
-    IssueWithoutChanges,
-    TaskLimitReached,
+    Skipped,
 }
 
 #[cfg(test)]
@@ -1304,7 +1205,6 @@ mod tests {
 
         assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
-        assert_eq!(report.skip_breakdown.existing_issue_pr, 1);
         assert_eq!(*github.events.lock().unwrap(), vec!["handled_issue"]);
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
@@ -1328,7 +1228,6 @@ mod tests {
 
         assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
-        assert_eq!(report.skip_breakdown.auto_implement_disabled, 1);
         assert!(github.events.lock().unwrap().is_empty());
         assert!(repos.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
@@ -1576,11 +1475,8 @@ mod tests {
 
         assert_eq!(first_report.responded, 1);
         assert_eq!(first_report.skipped, 1);
-        assert_eq!(first_report.skip_breakdown.duplicate_notification, 1);
         assert_eq!(second_report.responded, 0);
         assert_eq!(second_report.skipped, 2);
-        assert_eq!(second_report.skip_breakdown.missing_mention, 1);
-        assert_eq!(second_report.skip_breakdown.duplicate_notification, 1);
         assert_eq!(github.posts.lock().unwrap().len(), 1);
         assert_eq!(github.marks.lock().unwrap().len(), 1);
     }

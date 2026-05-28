@@ -1,23 +1,22 @@
 # Required.
 bot_login = "maid-bot"
-master_accounts = ["dionysuzx"]
+master_accounts = ["your-name"]
 
 # Optional. Defaults to master_accounts when omitted.
-auto_review_accounts = ["dionysuzx"]
+auto_review_accounts = ["your-name"]
 
 # Optional. Empty or omitted disables automatic PR-open reviews.
-auto_review_repos = ["dionysuzx/maid"]
+auto_review_repos = ["your-name/maid"]
 
 # Optional. Empty or omitted disables automatic issue implementation.
 # Maid polls open issues in these repositories that have auto_implement_label.
 # auto_implement_accounts defaults to master_accounts when omitted.
-auto_implement_accounts = ["dionysuzx"]
-auto_implement_repos = ["dionysuzx/maid"]
+auto_implement_accounts = ["your-name"]
+auto_implement_repos = ["your-name/maid"]
 auto_implement_label = "maid"
 auto_implement_window_days = 30
 
 # Optional. Defaults shown below.
-bind = "127.0.0.1:3000"
 poll_seconds = 20
 cache_dir = "~/.maid/cache"
 codex_bin = "codex"
@@ -32,6 +31,6 @@ codex_bin = "codex"
 # Use host modes when the machine's git config, SSH credentials, and signing
 # setup should author, sign, and push issue implementation PRs.
 [implementation_actor]
-login = "dionysuzx"
+login = "your-name"
 git_auth = "host"
 commit_identity = "host"
