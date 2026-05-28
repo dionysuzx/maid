@@ -4,3 +4,4 @@ pub mod domain;
 pub mod github;
 pub mod maid;
 pub mod repo_cache;
+pub mod task_limit;

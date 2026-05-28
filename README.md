@@ -30,6 +30,10 @@ master accounts. `auto_review_accounts` controls which master accounts can get
 automatic reviews in allowlisted repositories; if omitted, it defaults to
 `master_accounts`. `auto_review_repos` lists the repositories to poll for open
 PRs. Set either option to `[]` to disable automatic PR-open reviews.
+`task_limit_per_24h` caps how many mention and automatic review tasks Maid will
+start in a rolling 24-hour window. Omit it for no limit; set it to `0` to pause
+new task starts without marking eligible work handled. Maid stores that rolling
+task-start ledger at `~/.maid/task-starts.json` by default.
 
 Maid asks `gh` for the bot account's token, so the bot account must be logged in
 locally:
@@ -44,19 +48,7 @@ including `~/.maid/maid.log`, `~/.maid/maid.pid`, and the default repo cache.
 Use `just status` to check it, `just stop` to stop it, and `just update` to
 pull the latest `main` and restart.
 
-Config options:
-
-```toml
-bot_login = ""                    # required
-master_accounts = ["dionysuzx"]   # required
-auto_review_accounts = ["dionysuzx"] # defaults to master_accounts when omitted
-auto_review_repos = ["dionysuzx/maid"]
-bind = "127.0.0.1:3000"
-poll_seconds = 20
-cache_dir = "~/.maid/cache"
-codex_bin = "codex"
-github_api_ip = ""          # optional
-```
+See [config.example.toml](config.example.toml) for all config options and example values.
 
 Development:
 
