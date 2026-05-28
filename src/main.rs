@@ -33,6 +33,9 @@ async fn main() -> Result<()> {
     let app = Router::new().route("/healthz", get(|| async { "ok" }));
     let listener = TcpListener::bind(config.bind_addr).await?;
     let poll_interval = config.poll_interval;
+    let task_limit_per_24h = config
+        .task_limit_per_24h
+        .map_or_else(|| "none".to_string(), |limit| limit.to_string());
     let poller = tokio::spawn(async move {
         loop {
             match maid.run_once().await {
@@ -87,7 +90,7 @@ async fn main() -> Result<()> {
         cache_dir = %config.cache_dir.display(),
         task_start_ledger = %config.task_start_ledger_path.display(),
         poll_seconds = config.poll_interval.as_secs(),
-        task_limit_per_24h = ?config.task_limit_per_24h,
+        task_limit_per_24h = %task_limit_per_24h,
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),
