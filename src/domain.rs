@@ -73,6 +73,53 @@ impl PullRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Issue {
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+    pub author: String,
+    pub title: String,
+    pub body: String,
+    pub api_url: String,
+    pub html_url: String,
+    pub clone_url: String,
+    pub default_branch: String,
+}
+
+impl Issue {
+    pub fn repo_key(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+
+    pub fn implementation_branch(&self) -> String {
+        format!("maid/issue-{}", self.number)
+    }
+
+    pub fn pull_request_title(&self) -> String {
+        format!("Implement issue #{}: {}", self.number, self.title)
+    }
+
+    pub fn pull_request_body(&self, summary: &str) -> String {
+        format!(
+            "\
+Closes #{number}
+
+{summary}
+",
+            number = self.number,
+            summary = summary.trim(),
+        )
+    }
+
+    pub fn no_changes_comment(&self) -> String {
+        format!(
+            "I looked at this issue but did not produce a code change for #{}.",
+            self.number
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommentMention {
     pub author: String,
     pub body: String,
@@ -104,7 +151,7 @@ impl MentionRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexTask {
-    pub pr_url: String,
+    pub subject_url: String,
     pub origin: CodexTaskOrigin,
 }
 
@@ -126,7 +173,7 @@ Mention URL:
 {mention_url}
 
 Pull request URL:
-{pr_url}
+{subject_url}
 
 Raw mention body:
 {raw_body}
@@ -135,7 +182,7 @@ Cleaned request text:
 {cleaned_text}
 ",
                 mention_url = mention_url,
-                pr_url = self.pr_url,
+                subject_url = self.subject_url,
                 raw_body = raw_body,
                 cleaned_text = cleaned_text,
             ),
@@ -147,7 +194,7 @@ Inspect the checkout in your current working directory and review the pull reque
 Return only the GitHub comment body to post. Do not include tool logs or wrappers.
 
 Pull request URL:
-{pr_url}
+{subject_url}
 
 Opened by:
 {author}
@@ -155,8 +202,37 @@ Opened by:
 Review request:
 please review
 ",
-                pr_url = self.pr_url,
+                subject_url = self.subject_url,
                 author = author,
+            ),
+            CodexTaskOrigin::IssueImplementation {
+                title,
+                body,
+                branch,
+            } => format!(
+                "\
+You are implementing a GitHub issue from a trusted label trigger.
+
+Inspect the checkout in your current working directory, make the smallest code change that correctly implements the issue, and run the relevant checks when practical.
+Leave your changes in the working tree. Do not commit, push, create branches, or open pull requests.
+Return only a concise pull request body describing what changed and what you checked. Do not include tool logs or wrappers.
+
+Issue URL:
+{subject_url}
+
+Branch Maid will publish:
+{branch}
+
+Issue title:
+{title}
+
+Issue body:
+{body}
+",
+                subject_url = self.subject_url,
+                branch = branch,
+                title = title,
+                body = body,
             ),
         }
     }
@@ -164,7 +240,8 @@ please review
     pub fn trigger_url(&self) -> &str {
         match &self.origin {
             CodexTaskOrigin::Mention { mention_url, .. } => mention_url,
-            CodexTaskOrigin::PullRequestOpened { .. } => &self.pr_url,
+            CodexTaskOrigin::PullRequestOpened { .. }
+            | CodexTaskOrigin::IssueImplementation { .. } => &self.subject_url,
         }
     }
 }
@@ -178,6 +255,11 @@ pub enum CodexTaskOrigin {
     },
     PullRequestOpened {
         author: String,
+    },
+    IssueImplementation {
+        title: String,
+        body: String,
+        branch: String,
     },
 }
 
@@ -256,7 +338,7 @@ mod tests {
     #[test]
     fn builds_codex_prompt_with_required_context() {
         let task = CodexTask {
-            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            subject_url: "https://github.com/o/r/pull/1".to_string(),
             origin: CodexTaskOrigin::Mention {
                 mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
                 raw_body: "@maid-bot review".to_string(),
@@ -274,7 +356,7 @@ mod tests {
     #[test]
     fn builds_codex_prompt_for_automatic_pull_request_review() {
         let task = CodexTask {
-            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            subject_url: "https://github.com/o/r/pull/1".to_string(),
             origin: CodexTaskOrigin::PullRequestOpened {
                 author: "dionysuzx".to_string(),
             },

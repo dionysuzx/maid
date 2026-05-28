@@ -1,8 +1,12 @@
 use anyhow::Result;
 use axum::{Router, routing::get};
 use maid::{
-    codex::CodexCli, config::Config, github::GitHubRestClient, maid::Maid,
-    repo_cache::GitRepoCache, task_limit::FileTaskStartRecorder,
+    codex::CodexCli,
+    config::Config,
+    github::GitHubRestClient,
+    maid::{Maid, MaidSettings},
+    repo_cache::GitRepoCache,
+    task_limit::FileTaskStartRecorder,
 };
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -18,12 +22,23 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let maid = Maid::new(
         GitHubRestClient::with_api_ip(config.github_token.clone(), config.github_api_ip),
-        GitRepoCache::new(config.cache_dir.clone(), config.github_token.clone()),
+        GitRepoCache::new(
+            config.cache_dir.clone(),
+            config.github_token.clone(),
+            config.bot_login.clone(),
+        ),
         CodexCli::new(config.codex_bin.clone()),
-        config.bot_login.clone(),
-        config.master_accounts.clone(),
-        config.auto_review_accounts.clone(),
-        config.auto_review_repos.clone(),
+        MaidSettings {
+            bot_login: config.bot_login.clone(),
+            master_accounts: config.master_accounts.clone(),
+            auto_review_accounts: config.auto_review_accounts.clone(),
+            auto_review_repos: config.auto_review_repos.clone(),
+            auto_implement_repos: config.auto_implement_repos.clone(),
+            auto_implement_label: config.auto_implement_label.clone(),
+            auto_implement_window: Duration::from_secs(
+                config.auto_implement_window_days * 24 * 60 * 60,
+            ),
+        },
     )
     .with_task_start_recorder(FileTaskStartRecorder::new(
         config.task_limit_per_24h,
@@ -54,6 +69,10 @@ async fn main() -> Result<()> {
                             skip_self_authored_pr = skip_breakdown.self_authored_pr,
                             skip_auto_review_disabled = skip_breakdown.auto_review_disabled,
                             skip_already_handled_pr = skip_breakdown.already_handled_pr,
+                            skip_self_authored_issue = skip_breakdown.self_authored_issue,
+                            skip_already_handled_issue = skip_breakdown.already_handled_issue,
+                            skip_existing_issue_pr = skip_breakdown.existing_issue_pr,
+                            skip_issue_without_changes = skip_breakdown.issue_without_changes,
                             next_poll_seconds = poll_interval.as_secs(),
                             "poll completed with actionable result"
                         );
@@ -71,6 +90,10 @@ async fn main() -> Result<()> {
                             skip_self_authored_pr = skip_breakdown.self_authored_pr,
                             skip_auto_review_disabled = skip_breakdown.auto_review_disabled,
                             skip_already_handled_pr = skip_breakdown.already_handled_pr,
+                            skip_self_authored_issue = skip_breakdown.self_authored_issue,
+                            skip_already_handled_issue = skip_breakdown.already_handled_issue,
+                            skip_existing_issue_pr = skip_breakdown.existing_issue_pr,
+                            skip_issue_without_changes = skip_breakdown.issue_without_changes,
                             next_poll_seconds = poll_interval.as_secs(),
                             "poll completed without actionable work"
                         );
@@ -91,6 +114,9 @@ async fn main() -> Result<()> {
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),
+        auto_implement_repos = config.auto_implement_repos.len(),
+        auto_implement_label = %config.auto_implement_label,
+        auto_implement_window_days = config.auto_implement_window_days,
         "maid started"
     );
 

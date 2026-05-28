@@ -1,6 +1,6 @@
 use crate::{
-    domain::{PullRequest, validate_repo_name_part},
-    maid::RepoPreparer,
+    domain::{Issue, PullRequest, validate_repo_name_part},
+    maid::RepoWorkspace,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -15,15 +15,24 @@ use tokio::process::Command;
 pub struct GitRepoCache {
     root: PathBuf,
     auth_header: String,
+    commit_author_name: String,
+    commit_author_email: String,
 }
 
 impl GitRepoCache {
-    pub fn new(root: impl Into<PathBuf>, github_token: impl Into<String>) -> Self {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        github_token: impl Into<String>,
+        bot_login: impl Into<String>,
+    ) -> Self {
         let credential = format!("x-access-token:{}", github_token.into());
         let encoded = general_purpose::STANDARD.encode(credential);
+        let bot_login = bot_login.into();
         Self {
             root: root.into(),
             auth_header: format!("Authorization: Basic {encoded}"),
+            commit_author_name: bot_login.clone(),
+            commit_author_email: format!("{bot_login}@users.noreply.github.com"),
         }
     }
 
@@ -33,7 +42,17 @@ impl GitRepoCache {
         Ok(self.root.join("repos").join(&pr.owner).join(&pr.repo))
     }
 
+    pub fn issue_repo_dir(&self, issue: &Issue) -> Result<PathBuf> {
+        validate_repo_name_part(&issue.owner, "repository owner")?;
+        validate_repo_name_part(&issue.repo, "repository name")?;
+        Ok(self.root.join("repos").join(&issue.owner).join(&issue.repo))
+    }
+
     async fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<()> {
+        self.git_output(cwd, args).await.map(|_| ())
+    }
+
+    async fn git_output(&self, cwd: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
         let mut command = Command::new("git");
         command
             .args(args)
@@ -49,7 +68,7 @@ impl GitRepoCache {
 
         let output = command.output().await.context("failed to run git")?;
         if output.status.success() {
-            return Ok(());
+            return Ok(output.stdout);
         }
 
         Err(anyhow!(
@@ -61,8 +80,8 @@ impl GitRepoCache {
 }
 
 #[async_trait]
-impl RepoPreparer for GitRepoCache {
-    async fn prepare(&self, pr: &PullRequest) -> Result<PathBuf> {
+impl RepoWorkspace for GitRepoCache {
+    async fn prepare_pr_review(&self, pr: &PullRequest) -> Result<PathBuf> {
         let checkout = self.repo_dir(pr)?;
         tokio::fs::create_dir_all(
             checkout
@@ -96,6 +115,94 @@ impl RepoPreparer for GitRepoCache {
 
         Ok(checkout)
     }
+
+    async fn prepare_issue_branch(&self, issue: &Issue, branch: &str) -> Result<PathBuf> {
+        let checkout = self.issue_repo_dir(issue)?;
+        tokio::fs::create_dir_all(
+            checkout
+                .parent()
+                .ok_or_else(|| anyhow!("checkout path has no parent"))?,
+        )
+        .await?;
+
+        if !checkout.join(".git").exists() {
+            let checkout_string = checkout.to_string_lossy().to_string();
+            self.run_git(None, &["clone", &issue.clone_url, &checkout_string])
+                .await
+                .with_context(|| format!("failed to clone {}", issue.repo_key()))?;
+        }
+
+        self.run_git(
+            Some(&checkout),
+            &["remote", "set-url", "origin", &issue.clone_url],
+        )
+        .await?;
+        let remote_ref = format!(
+            "+refs/heads/{}:refs/remotes/origin/{}",
+            issue.default_branch, issue.default_branch
+        );
+        self.run_git(
+            Some(&checkout),
+            &["fetch", "--prune", "origin", &remote_ref],
+        )
+        .await
+        .with_context(|| format!("failed to fetch {}", issue.default_branch))?;
+        let remote_branch_ref = format!("refs/heads/{branch}");
+        if self
+            .git_output(
+                Some(&checkout),
+                &["ls-remote", "--exit-code", "origin", &remote_branch_ref],
+            )
+            .await
+            .is_ok()
+        {
+            let remote_issue_ref = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+            self.run_git(Some(&checkout), &["fetch", "origin", &remote_issue_ref])
+                .await
+                .with_context(|| format!("failed to fetch existing issue branch {branch}"))?;
+        }
+        let base = format!("origin/{}", issue.default_branch);
+        self.run_git(Some(&checkout), &["switch", "-C", branch, &base])
+            .await?;
+        self.run_git(Some(&checkout), &["reset", "--hard", &base])
+            .await?;
+        self.run_git(Some(&checkout), &["clean", "-fdx"]).await?;
+
+        Ok(checkout)
+    }
+
+    async fn has_changes(&self, checkout: &Path) -> Result<bool> {
+        let output = self
+            .git_output(Some(checkout), &["status", "--porcelain"])
+            .await?;
+        Ok(!output.is_empty())
+    }
+
+    async fn commit_all(&self, checkout: &Path, message: &str) -> Result<()> {
+        self.run_git(Some(checkout), &["add", "-A"]).await?;
+        self.run_git(
+            Some(checkout),
+            &[
+                "-c",
+                &format!("user.name={}", self.commit_author_name),
+                "-c",
+                &format!("user.email={}", self.commit_author_email),
+                "commit",
+                "-m",
+                message,
+            ],
+        )
+        .await
+    }
+
+    async fn push_branch(&self, checkout: &Path, branch: &str) -> Result<()> {
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        self.run_git(
+            Some(checkout),
+            &["push", "--force-with-lease", "origin", &refspec],
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -116,7 +223,7 @@ mod tests {
 
     #[test]
     fn maps_repositories_into_the_maid_cache() {
-        let cache = GitRepoCache::new("/tmp/maid-cache", "token");
+        let cache = GitRepoCache::new("/tmp/maid-cache", "token", "maid-bot");
 
         assert_eq!(
             cache.repo_dir(&pr("dionysuzx", "forkcast")).unwrap(),
@@ -130,7 +237,7 @@ mod tests {
 
     #[test]
     fn rejects_repository_parts_that_could_escape_the_cache() {
-        let cache = GitRepoCache::new("/tmp/maid-cache", "token");
+        let cache = GitRepoCache::new("/tmp/maid-cache", "token", "maid-bot");
 
         assert!(cache.repo_dir(&pr("../dionysuzx", "forkcast")).is_err());
         assert!(cache.repo_dir(&pr("dionysuzx", "forkcast/slash")).is_err());

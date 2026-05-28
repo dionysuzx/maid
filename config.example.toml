@@ -8,6 +8,12 @@ auto_review_accounts = ["dionysuzx"]
 # Optional. Empty or omitted disables automatic PR-open reviews.
 auto_review_repos = ["dionysuzx/maid"]
 
+# Optional. Empty or omitted disables automatic issue implementation.
+# Maid polls open issues in these repositories that have auto_implement_label.
+auto_implement_repos = ["dionysuzx/maid"]
+auto_implement_label = "maid"
+auto_implement_window_days = 30
+
 # Optional. Defaults shown below.
 bind = "127.0.0.1:3000"
 poll_seconds = 20

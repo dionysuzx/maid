@@ -1,5 +1,6 @@
 use crate::domain::{
-    CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug,
+    CodexTask, CodexTaskOrigin, CommentMention, Issue, MentionRequest, Notification, PullRequest,
+    RepoSlug,
 };
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
@@ -8,6 +9,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, SystemTime},
 };
 use tracing::{debug, error, info};
 
@@ -16,7 +18,26 @@ pub trait GithubClient: Send + Sync {
     async fn notifications(&self) -> Result<Vec<Notification>>;
     async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>>;
     async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>>;
+    async fn recent_labeled_issues(
+        &self,
+        repo: &RepoSlug,
+        label: &str,
+        since: SystemTime,
+    ) -> Result<Vec<Issue>>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
+    async fn post_issue_comment(&self, issue: &Issue, body: &str) -> Result<()>;
+    async fn open_pull_request_for_branch(
+        &self,
+        issue: &Issue,
+        branch: &str,
+    ) -> Result<Option<PullRequest>>;
+    async fn create_pull_request(
+        &self,
+        issue: &Issue,
+        branch: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<PullRequest>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
     -> Result<ReviewState>;
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
@@ -24,6 +45,9 @@ pub trait GithubClient: Send + Sync {
     async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState>;
     async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()>;
     async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()>;
+    async fn issue_state(&self, issue: &Issue, bot_login: &str) -> Result<ReviewState>;
+    async fn mark_issue_started(&self, issue: &Issue) -> Result<()>;
+    async fn mark_issue_handled(&self, issue: &Issue) -> Result<()>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
 }
 
@@ -34,8 +58,12 @@ pub enum ReviewState {
 }
 
 #[async_trait]
-pub trait RepoPreparer: Send + Sync {
-    async fn prepare(&self, pr: &PullRequest) -> Result<PathBuf>;
+pub trait RepoWorkspace: Send + Sync {
+    async fn prepare_pr_review(&self, pr: &PullRequest) -> Result<PathBuf>;
+    async fn prepare_issue_branch(&self, issue: &Issue, branch: &str) -> Result<PathBuf>;
+    async fn has_changes(&self, checkout: &Path) -> Result<bool>;
+    async fn commit_all(&self, checkout: &Path, message: &str) -> Result<()>;
+    async fn push_branch(&self, checkout: &Path, branch: &str) -> Result<()>;
 }
 
 #[async_trait]
@@ -69,7 +97,21 @@ pub struct Maid<G, R, C> {
     master_accounts: HashSet<String>,
     auto_review_accounts: HashSet<String>,
     auto_review_repos: Vec<RepoSlug>,
+    auto_implement_repos: Vec<RepoSlug>,
+    auto_implement_label: String,
+    auto_implement_window: Duration,
     task_starts: Arc<dyn TaskStartRecorder>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaidSettings {
+    pub bot_login: String,
+    pub master_accounts: Vec<String>,
+    pub auto_review_accounts: Vec<String>,
+    pub auto_review_repos: Vec<RepoSlug>,
+    pub auto_implement_repos: Vec<RepoSlug>,
+    pub auto_implement_label: String,
+    pub auto_implement_window: Duration,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -104,6 +146,10 @@ pub struct SkipBreakdown {
     pub self_authored_pr: usize,
     pub auto_review_disabled: usize,
     pub already_handled_pr: usize,
+    pub self_authored_issue: usize,
+    pub already_handled_issue: usize,
+    pub existing_issue_pr: usize,
+    pub issue_without_changes: usize,
     pub task_limit_reached: usize,
 }
 
@@ -120,6 +166,10 @@ impl SkipBreakdown {
             SkipReason::SelfAuthoredPr => self.self_authored_pr += 1,
             SkipReason::AutoReviewDisabled => self.auto_review_disabled += 1,
             SkipReason::AlreadyHandledPr => self.already_handled_pr += 1,
+            SkipReason::SelfAuthoredIssue => self.self_authored_issue += 1,
+            SkipReason::AlreadyHandledIssue => self.already_handled_issue += 1,
+            SkipReason::ExistingIssuePr => self.existing_issue_pr += 1,
+            SkipReason::IssueWithoutChanges => self.issue_without_changes += 1,
             SkipReason::TaskLimitReached => self.task_limit_reached += 1,
         }
     }
@@ -128,26 +178,21 @@ impl SkipBreakdown {
 impl<G, R, C> Maid<G, R, C>
 where
     G: GithubClient,
-    R: RepoPreparer,
+    R: RepoWorkspace,
     C: CodexRunner,
 {
-    pub fn new(
-        github: G,
-        repos: R,
-        codex: C,
-        bot_login: impl Into<String>,
-        master_accounts: impl IntoIterator<Item = impl Into<String>>,
-        auto_review_accounts: impl IntoIterator<Item = impl Into<String>>,
-        auto_review_repos: impl IntoIterator<Item = RepoSlug>,
-    ) -> Self {
+    pub fn new(github: G, repos: R, codex: C, settings: MaidSettings) -> Self {
         Self {
             github,
             repos,
             codex,
-            bot_login: bot_login.into(),
-            master_accounts: normalized_logins(master_accounts),
-            auto_review_accounts: normalized_logins(auto_review_accounts),
-            auto_review_repos: auto_review_repos.into_iter().collect(),
+            bot_login: settings.bot_login,
+            master_accounts: normalized_logins(settings.master_accounts),
+            auto_review_accounts: normalized_logins(settings.auto_review_accounts),
+            auto_review_repos: settings.auto_review_repos,
+            auto_implement_repos: settings.auto_implement_repos,
+            auto_implement_label: settings.auto_implement_label,
+            auto_implement_window: settings.auto_implement_window,
             task_starts: Arc::new(NoTaskLimit),
         }
     }
@@ -207,6 +252,32 @@ where
                             pr = %pr.html_url,
                             error = ?err,
                             "failed to handle auto-review pull request"
+                        );
+                    }
+                }
+            }
+        }
+
+        let issue_since = SystemTime::now()
+            .checked_sub(self.auto_implement_window)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        for repo in &self.auto_implement_repos {
+            let issues = self
+                .github
+                .recent_labeled_issues(repo, &self.auto_implement_label, issue_since)
+                .await?;
+            report.seen += issues.len();
+
+            for issue in issues {
+                match self.handle_auto_implement_issue(&issue).await {
+                    Ok(HandleOutcome::Responded) => report.responded += 1,
+                    Ok(HandleOutcome::Skipped(reason)) => report.record_skip(reason),
+                    Err(err) => {
+                        report.failed += 1;
+                        error!(
+                            issue = %issue.html_url,
+                            error = ?err,
+                            "failed to handle auto-implement issue"
                         );
                     }
                 }
@@ -301,9 +372,9 @@ where
             "started handling mention"
         );
 
-        let checkout = self.repos.prepare(&mention.pr).await?;
+        let checkout = self.repos.prepare_pr_review(&mention.pr).await?;
         let task = CodexTask {
-            pr_url: mention.pr.html_url.clone(),
+            subject_url: mention.pr.html_url.clone(),
             origin: CodexTaskOrigin::Mention {
                 mention_url: mention.html_url.clone(),
                 raw_body: request.raw_body,
@@ -391,9 +462,9 @@ where
             "started handling auto-review pull request"
         );
 
-        let checkout = self.repos.prepare(pr).await?;
+        let checkout = self.repos.prepare_pr_review(pr).await?;
         let task = CodexTask {
-            pr_url: pr.html_url.clone(),
+            subject_url: pr.html_url.clone(),
             origin: CodexTaskOrigin::PullRequestOpened {
                 author: pr.author.clone(),
             },
@@ -422,6 +493,123 @@ where
                 pr = %pr.html_url,
                 author = %pr.author,
                 "responded to auto-review pull request"
+            );
+        }
+        Ok(HandleOutcome::Responded)
+    }
+
+    async fn handle_auto_implement_issue(&self, issue: &Issue) -> Result<HandleOutcome> {
+        if issue.author.eq_ignore_ascii_case(&self.bot_login) {
+            debug!(issue = %issue.html_url, "skipped issue authored by bot");
+            return Ok(HandleOutcome::Skipped(SkipReason::SelfAuthoredIssue));
+        }
+
+        match self.github.issue_state(issue, &self.bot_login).await? {
+            ReviewState::Pending => {}
+            ReviewState::Handled => {
+                debug!(issue = %issue.html_url, "skipping already handled issue");
+                return Ok(HandleOutcome::Skipped(SkipReason::AlreadyHandledIssue));
+            }
+        }
+
+        let branch = issue.implementation_branch();
+        if let Some(existing_pr) = self
+            .github
+            .open_pull_request_for_branch(issue, &branch)
+            .await?
+        {
+            info!(
+                issue = %issue.html_url,
+                pr = %existing_pr.html_url,
+                branch = %branch,
+                "skipping issue because a Maid pull request already exists"
+            );
+            self.github.mark_issue_handled(issue).await?;
+            return Ok(HandleOutcome::Skipped(SkipReason::ExistingIssuePr));
+        }
+
+        if !self.can_start_task()? {
+            info!(
+                issue = %issue.html_url,
+                author = %issue.author,
+                "skipping issue implementation because the 24-hour task limit is reached"
+            );
+            return Ok(HandleOutcome::Skipped(SkipReason::TaskLimitReached));
+        }
+
+        self.github.mark_issue_started(issue).await?;
+        info!(
+            issue = %issue.html_url,
+            author = %issue.author,
+            branch = %branch,
+            "started handling auto-implement issue"
+        );
+
+        let checkout = self.repos.prepare_issue_branch(issue, &branch).await?;
+        let task = CodexTask {
+            subject_url: issue.html_url.clone(),
+            origin: CodexTaskOrigin::IssueImplementation {
+                title: issue.title.clone(),
+                body: issue.body.clone(),
+                branch: branch.clone(),
+            },
+        };
+        let codex_run = self.codex.run(&checkout, &task).await?;
+
+        if !self.repos.has_changes(&checkout).await? {
+            self.github
+                .post_issue_comment(issue, &issue.no_changes_comment())
+                .await?;
+            if let Err(err) = self.github.mark_issue_handled(issue).await {
+                error!(
+                    issue = %issue.html_url,
+                    error = ?err,
+                    "failed to mark issue handled after no-change response"
+                );
+            }
+            return Ok(HandleOutcome::Skipped(SkipReason::IssueWithoutChanges));
+        }
+
+        self.repos
+            .commit_all(&checkout, &issue.pull_request_title())
+            .await?;
+        self.repos.push_branch(&checkout, &branch).await?;
+        let pr = self
+            .github
+            .create_pull_request(
+                issue,
+                &branch,
+                &issue.pull_request_title(),
+                &issue.pull_request_body(&codex_run.response),
+            )
+            .await?;
+        self.github
+            .post_issue_comment(issue, &format!("Opened pull request: {}", pr.html_url))
+            .await?;
+        if let Err(err) = self.github.mark_issue_handled(issue).await {
+            error!(
+                issue = %issue.html_url,
+                pr = %pr.html_url,
+                error = ?err,
+                "failed to mark issue handled after opening pull request"
+            );
+        }
+
+        if let Some((session_id, resume_command)) = codex_run.resume_command() {
+            info!(
+                issue = %issue.html_url,
+                pr = %pr.html_url,
+                branch = %branch,
+                codex_session_id = %session_id,
+                codex_resume = %resume_command,
+                "opened pull request for issue"
+            );
+        } else {
+            info!(
+                issue = %issue.html_url,
+                pr = %pr.html_url,
+                branch = %branch,
+                "opened pull request for issue"
             );
         }
         Ok(HandleOutcome::Responded)
@@ -476,6 +664,10 @@ enum SkipReason {
     SelfAuthoredPr,
     AutoReviewDisabled,
     AlreadyHandledPr,
+    SelfAuthoredIssue,
+    AlreadyHandledIssue,
+    ExistingIssuePr,
+    IssueWithoutChanges,
     TaskLimitReached,
 }
 
@@ -491,6 +683,9 @@ mod tests {
         notifications: Arc<StdMutex<Vec<Notification>>>,
         mention: Arc<StdMutex<FakeMentionResult>>,
         pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
+        issues: Arc<StdMutex<Vec<Issue>>>,
+        existing_issue_pr: Arc<StdMutex<Option<PullRequest>>>,
+        created_pull_requests: Arc<StdMutex<Vec<String>>>,
         posts: Arc<StdMutex<Vec<String>>>,
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
@@ -500,6 +695,8 @@ mod tests {
         handled_mentions: Arc<StdMutex<HashSet<String>>>,
         started_prs: Arc<StdMutex<Vec<String>>>,
         handled_prs: Arc<StdMutex<HashSet<String>>>,
+        started_issues: Arc<StdMutex<Vec<String>>>,
+        handled_issues: Arc<StdMutex<HashSet<String>>>,
     }
 
     #[async_trait]
@@ -528,6 +725,15 @@ mod tests {
             Ok(self.pull_requests.lock().unwrap().clone())
         }
 
+        async fn recent_labeled_issues(
+            &self,
+            _repo: &RepoSlug,
+            _label: &str,
+            _since: SystemTime,
+        ) -> Result<Vec<Issue>> {
+            Ok(self.issues.lock().unwrap().clone())
+        }
+
         async fn post_pr_comment(&self, _pr: &PullRequest, body: &str) -> Result<()> {
             self.events.lock().unwrap().push("post".to_string());
             if let Some(message) = self.post_error.lock().unwrap().take() {
@@ -535,6 +741,46 @@ mod tests {
             }
             self.posts.lock().unwrap().push(body.to_string());
             Ok(())
+        }
+
+        async fn post_issue_comment(&self, _issue: &Issue, body: &str) -> Result<()> {
+            self.events.lock().unwrap().push("post_issue".to_string());
+            if let Some(message) = self.post_error.lock().unwrap().take() {
+                return Err(anyhow!(message));
+            }
+            self.posts.lock().unwrap().push(body.to_string());
+            Ok(())
+        }
+
+        async fn open_pull_request_for_branch(
+            &self,
+            _issue: &Issue,
+            _branch: &str,
+        ) -> Result<Option<PullRequest>> {
+            Ok(self.existing_issue_pr.lock().unwrap().clone())
+        }
+
+        async fn create_pull_request(
+            &self,
+            issue: &Issue,
+            branch: &str,
+            _title: &str,
+            _body: &str,
+        ) -> Result<PullRequest> {
+            self.events.lock().unwrap().push("create_pr".to_string());
+            self.created_pull_requests
+                .lock()
+                .unwrap()
+                .push(branch.to_string());
+            Ok(PullRequest {
+                owner: issue.owner.clone(),
+                repo: issue.repo.clone(),
+                number: 7,
+                author: "maid-bot".to_string(),
+                api_url: "https://api.github.com/repos/o/r/pulls/7".to_string(),
+                html_url: "https://github.com/o/r/pull/7".to_string(),
+                clone_url: issue.clone_url.clone(),
+            })
         }
 
         async fn mention_state(
@@ -598,6 +844,43 @@ mod tests {
             Ok(())
         }
 
+        async fn issue_state(&self, issue: &Issue, _bot_login: &str) -> Result<ReviewState> {
+            if self
+                .handled_issues
+                .lock()
+                .unwrap()
+                .contains(&issue.html_url)
+            {
+                Ok(ReviewState::Handled)
+            } else {
+                Ok(ReviewState::Pending)
+            }
+        }
+
+        async fn mark_issue_started(&self, issue: &Issue) -> Result<()> {
+            self.events.lock().unwrap().push("start_issue".to_string());
+            self.started_issues
+                .lock()
+                .unwrap()
+                .push(issue.html_url.clone());
+            Ok(())
+        }
+
+        async fn mark_issue_handled(&self, issue: &Issue) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push("handled_issue".to_string());
+            if let Some(message) = self.handled_error.lock().unwrap().take() {
+                return Err(anyhow!(message));
+            }
+            self.handled_issues
+                .lock()
+                .unwrap()
+                .insert(issue.html_url.clone());
+            Ok(())
+        }
+
         async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
             self.events.lock().unwrap().push("mark".to_string());
             self.marks.lock().unwrap().push(notification.id.clone());
@@ -613,13 +896,38 @@ mod tests {
     }
 
     #[async_trait]
-    impl RepoPreparer for FakeRepos {
-        async fn prepare(&self, pr: &PullRequest) -> Result<PathBuf> {
+    impl RepoWorkspace for FakeRepos {
+        async fn prepare_pr_review(&self, pr: &PullRequest) -> Result<PathBuf> {
             self.calls.lock().unwrap().push(pr.repo_key());
             if let Some(message) = self.error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
             Ok(self.checkout.clone())
+        }
+
+        async fn prepare_issue_branch(&self, issue: &Issue, branch: &str) -> Result<PathBuf> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:{branch}", issue.repo_key()));
+            if let Some(message) = self.error.lock().unwrap().take() {
+                return Err(anyhow!(message));
+            }
+            Ok(self.checkout.clone())
+        }
+
+        async fn has_changes(&self, _checkout: &Path) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn commit_all(&self, _checkout: &Path, message: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("commit:{message}"));
+            Ok(())
+        }
+
+        async fn push_branch(&self, _checkout: &Path, branch: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("push:{branch}"));
+            Ok(())
         }
     }
 
@@ -701,6 +1009,21 @@ mod tests {
         }
     }
 
+    fn issue() -> Issue {
+        Issue {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 3,
+            author: "mayushii".to_string(),
+            title: "Add the thing".to_string(),
+            body: "Please add the missing thing.".to_string(),
+            api_url: "https://api.github.com/repos/o/r/issues/3".to_string(),
+            html_url: "https://github.com/o/r/issues/3".to_string(),
+            clone_url: "https://github.com/o/r.git".to_string(),
+            default_branch: "main".to_string(),
+        }
+    }
+
     fn mention(author: &str, body: &str) -> CommentMention {
         mention_with_comment(author, body, "2")
     }
@@ -724,13 +1047,21 @@ mod tests {
             github,
             repos,
             codex,
-            "maid-bot",
-            ["dionysuzx"],
-            ["dionysuzx"],
-            [RepoSlug {
-                owner: "o".to_string(),
-                repo: "r".to_string(),
-            }],
+            MaidSettings {
+                bot_login: "maid-bot".to_string(),
+                master_accounts: vec!["dionysuzx".to_string()],
+                auto_review_accounts: vec!["dionysuzx".to_string()],
+                auto_review_repos: vec![RepoSlug {
+                    owner: "o".to_string(),
+                    repo: "r".to_string(),
+                }],
+                auto_implement_repos: vec![RepoSlug {
+                    owner: "o".to_string(),
+                    repo: "r".to_string(),
+                }],
+                auto_implement_label: "maid".to_string(),
+                auto_implement_window: Duration::from_secs(30 * 24 * 60 * 60),
+            },
         )
     }
 
@@ -803,7 +1134,7 @@ mod tests {
         assert_eq!(*repos.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, checkout);
-        assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/pull/1");
+        assert_eq!(calls[0].1.subject_url, "https://github.com/o/r/pull/1");
         assert_eq!(
             calls[0].1.origin,
             CodexTaskOrigin::Mention {
@@ -853,13 +1184,97 @@ mod tests {
         assert_eq!(*repos.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, checkout);
-        assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/pull/1");
+        assert_eq!(calls[0].1.subject_url, "https://github.com/o/r/pull/1");
         assert_eq!(
             calls[0].1.origin,
             CodexTaskOrigin::PullRequestOpened {
                 author: "dionysuzx".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn implements_labeled_issue_by_opening_pull_request() {
+        let checkout = PathBuf::from("/tmp/maid-test-checkout");
+        let github = FakeGithub::default();
+        *github.issues.lock().unwrap() = vec![issue()];
+        let repos = FakeRepos {
+            checkout: checkout.clone(),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["start_issue", "create_pr", "post_issue", "handled_issue"]
+        );
+        assert_eq!(
+            *github.created_pull_requests.lock().unwrap(),
+            vec!["maid/issue-3"]
+        );
+        assert_eq!(
+            *github.posts.lock().unwrap(),
+            vec!["Opened pull request: https://github.com/o/r/pull/7"]
+        );
+        assert!(
+            github
+                .handled_issues
+                .lock()
+                .unwrap()
+                .contains("https://github.com/o/r/issues/3")
+        );
+        assert_eq!(
+            *repos.calls.lock().unwrap(),
+            vec![
+                "o/r:maid/issue-3",
+                "commit:Implement issue #3: Add the thing",
+                "push:maid/issue-3"
+            ]
+        );
+        let calls = codex.calls.lock().unwrap();
+        assert_eq!(calls[0].0, checkout);
+        assert_eq!(calls[0].1.subject_url, "https://github.com/o/r/issues/3");
+        assert_eq!(
+            calls[0].1.origin,
+            CodexTaskOrigin::IssueImplementation {
+                title: "Add the thing".to_string(),
+                body: "Please add the missing thing.".to_string(),
+                branch: "maid/issue-3".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_labeled_issue_when_existing_maid_pull_request_is_open() {
+        let github = FakeGithub::default();
+        *github.issues.lock().unwrap() = vec![issue()];
+        *github.existing_issue_pr.lock().unwrap() = Some(pr());
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.skip_breakdown.existing_issue_pr, 1);
+        assert_eq!(*github.events.lock().unwrap(), vec!["handled_issue"]);
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

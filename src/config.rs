@@ -17,6 +17,9 @@ pub struct Config {
     pub master_accounts: Vec<String>,
     pub auto_review_accounts: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
+    pub auto_implement_repos: Vec<RepoSlug>,
+    pub auto_implement_label: String,
+    pub auto_implement_window_days: u64,
     pub cache_dir: PathBuf,
     pub poll_interval: Duration,
     pub task_start_ledger_path: PathBuf,
@@ -47,6 +50,11 @@ impl Config {
             }
         }
         let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
+        let auto_implement_repos =
+            optional_repos(file.auto_implement_repos, "auto_implement_repos")?;
+        let auto_implement_label =
+            non_empty(file.auto_implement_label).unwrap_or_else(|| "maid".to_string());
+        let auto_implement_window_days = file.auto_implement_window_days.unwrap_or(30).max(1);
         let github_token = gh_token_for(&bot_login)?;
         let bind_addr = non_empty(file.bind)
             .unwrap_or_else(|| "127.0.0.1:3000".to_string())
@@ -71,6 +79,9 @@ impl Config {
             master_accounts,
             auto_review_accounts,
             auto_review_repos,
+            auto_implement_repos,
+            auto_implement_label,
+            auto_implement_window_days,
             cache_dir,
             poll_interval: Duration::from_secs(poll_seconds),
             task_start_ledger_path: maid_home.join("task-starts.json"),
@@ -87,6 +98,9 @@ struct ConfigFile {
     master_accounts: Option<Vec<String>>,
     auto_review_accounts: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
+    auto_implement_repos: Option<Vec<String>>,
+    auto_implement_label: Option<String>,
+    auto_implement_window_days: Option<u64>,
     bind: Option<String>,
     cache_dir: Option<String>,
     poll_seconds: Option<u64>,
@@ -230,6 +244,9 @@ bot_login = "maid-bot"
 master_accounts = ["dionysuzx"]
 auto_review_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
+auto_implement_repos = ["dionysuzx/maid"]
+auto_implement_label = "maid"
+auto_implement_window_days = 14
 bind = "127.0.0.1:4000"
 cache_dir = "~/.maid/cache"
 poll_seconds = 30
@@ -252,6 +269,12 @@ github_api_ip = "127.0.0.1"
             config.auto_review_repos,
             Some(vec!["dionysuzx/maid".to_string()])
         );
+        assert_eq!(
+            config.auto_implement_repos,
+            Some(vec!["dionysuzx/maid".to_string()])
+        );
+        assert_eq!(config.auto_implement_label.as_deref(), Some("maid"));
+        assert_eq!(config.auto_implement_window_days, Some(14));
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:4000"));
         assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
         assert_eq!(config.poll_seconds, Some(30));
@@ -268,6 +291,9 @@ github_api_ip = "127.0.0.1"
         assert_eq!(config.master_accounts, None);
         assert_eq!(config.auto_review_accounts, None);
         assert_eq!(config.auto_review_repos, None);
+        assert_eq!(config.auto_implement_repos, None);
+        assert_eq!(config.auto_implement_label, None);
+        assert_eq!(config.auto_implement_window_days, None);
         assert_eq!(config.poll_seconds, None);
         assert_eq!(config.task_limit_per_24h, None);
     }

@@ -1,12 +1,16 @@
 use crate::{
-    domain::{CommentMention, Notification, PullRequest, RepoSlug},
+    domain::{CommentMention, Issue, Notification, PullRequest, RepoSlug},
     maid::{GithubClient, ReviewState},
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{Client, Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::IpAddr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const STARTED_REACTION: &str = "eyes";
 const HANDLED_REACTION: &str = "+1";
@@ -154,12 +158,108 @@ impl GithubClient for GitHubRestClient {
             .collect()
     }
 
+    async fn recent_labeled_issues(
+        &self,
+        repo: &RepoSlug,
+        label: &str,
+        since: SystemTime,
+    ) -> Result<Vec<Issue>> {
+        let repo_details = self.repo_details(repo).await?;
+        let mut url = Url::parse(&format!(
+            "https://api.github.com/repos/{}/{}/issues",
+            repo.owner, repo.repo
+        ))?;
+        let since = github_timestamp(since)?;
+        url.query_pairs_mut()
+            .append_pair("state", "open")
+            .append_pair("labels", label)
+            .append_pair("since", &since)
+            .append_pair("sort", "updated")
+            .append_pair("direction", "desc")
+            .append_pair("per_page", "50");
+
+        let issues = self.get::<Vec<ApiIssueListItem>>(url.as_str()).await?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| issue.pull_request.is_none())
+            .map(|issue| Issue {
+                owner: repo.owner.clone(),
+                repo: repo.repo.clone(),
+                number: issue.number,
+                author: issue.user.login,
+                title: issue.title,
+                body: issue.body.unwrap_or_default(),
+                api_url: issue.url,
+                html_url: issue.html_url,
+                clone_url: repo_details.clone_url.clone(),
+                default_branch: repo_details.default_branch.clone(),
+            })
+            .collect())
+    }
+
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/issues/{}/comments",
             pr.owner, pr.repo, pr.number
         );
         self.post_json(&url, &PostComment { body }).await
+    }
+
+    async fn post_issue_comment(&self, issue: &Issue, body: &str) -> Result<()> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/issues/{}/comments",
+            issue.owner, issue.repo, issue.number
+        );
+        self.post_json(&url, &PostComment { body }).await
+    }
+
+    async fn open_pull_request_for_branch(
+        &self,
+        issue: &Issue,
+        branch: &str,
+    ) -> Result<Option<PullRequest>> {
+        let mut url = Url::parse(&format!(
+            "https://api.github.com/repos/{}/{}/pulls",
+            issue.owner, issue.repo
+        ))?;
+        let head = format!("{}:{branch}", issue.owner);
+        url.query_pairs_mut()
+            .append_pair("state", "open")
+            .append_pair("head", &head)
+            .append_pair("base", &issue.default_branch)
+            .append_pair("per_page", "10");
+        let pull_requests = self.get::<Vec<ApiPullRequest>>(url.as_str()).await?;
+        pull_requests
+            .into_iter()
+            .next()
+            .map(Self::pull_request_from_api)
+            .transpose()
+    }
+
+    async fn create_pull_request(
+        &self,
+        issue: &Issue,
+        branch: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<PullRequest> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/pulls",
+            issue.owner, issue.repo
+        );
+        let pr = self
+            .request::<ApiPullRequest, _>(
+                Method::POST,
+                &url,
+                Some(&CreatePullRequest {
+                    title,
+                    head: branch,
+                    base: &issue.default_branch,
+                    body,
+                }),
+            )
+            .await?;
+        Self::pull_request_from_api(pr)
     }
 
     async fn mention_state(
@@ -204,6 +304,25 @@ impl GithubClient for GitHubRestClient {
         self.add_pr_reaction(pr, HANDLED_REACTION).await
     }
 
+    async fn issue_state(&self, issue: &Issue, bot_login: &str) -> Result<ReviewState> {
+        if self
+            .issue_has_reaction(issue, bot_login, HANDLED_REACTION)
+            .await?
+        {
+            Ok(ReviewState::Handled)
+        } else {
+            Ok(ReviewState::Pending)
+        }
+    }
+
+    async fn mark_issue_started(&self, issue: &Issue) -> Result<()> {
+        self.add_issue_reaction(issue, STARTED_REACTION).await
+    }
+
+    async fn mark_issue_handled(&self, issue: &Issue) -> Result<()> {
+        self.add_issue_reaction(issue, HANDLED_REACTION).await
+    }
+
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
         let url = format!(
             "https://api.github.com/notifications/threads/{}",
@@ -217,6 +336,11 @@ impl GithubClient for GitHubRestClient {
 }
 
 impl GitHubRestClient {
+    async fn repo_details(&self, repo: &RepoSlug) -> Result<ApiRepoDetails> {
+        let url = format!("https://api.github.com/repos/{}/{}", repo.owner, repo.repo);
+        self.get(&url).await
+    }
+
     async fn pull_request_from_url(&self, pr_url: &str) -> Result<PullRequest> {
         let pr = self.get::<ApiPullRequest>(pr_url).await?;
         Self::pull_request_from_api(pr)
@@ -284,6 +408,45 @@ impl GitHubRestClient {
             pr.owner, pr.repo, pr.number
         )
     }
+
+    async fn issue_has_reaction(
+        &self,
+        issue: &Issue,
+        bot_login: &str,
+        content: &str,
+    ) -> Result<bool> {
+        let reactions = self
+            .get::<Vec<ApiReaction>>(&format!("{}?per_page=100", self.issue_reactions_url(issue)))
+            .await?;
+
+        Ok(reactions.into_iter().any(|reaction| {
+            reaction.content == content && reaction.user.login.eq_ignore_ascii_case(bot_login)
+        }))
+    }
+
+    async fn add_issue_reaction(&self, issue: &Issue, content: &str) -> Result<()> {
+        self.post_json(&self.issue_reactions_url(issue), &PostReaction { content })
+            .await
+    }
+
+    fn issue_reactions_url(&self, issue: &Issue) -> String {
+        format!(
+            "https://api.github.com/repos/{}/{}/issues/{}/reactions",
+            issue.owner, issue.repo, issue.number
+        )
+    }
+}
+
+fn github_timestamp(time: SystemTime) -> Result<String> {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .context("GitHub timestamp is before the Unix epoch")?
+        .as_secs();
+    let datetime = OffsetDateTime::from_unix_timestamp(seconds as i64)
+        .context("failed to convert timestamp for GitHub")?;
+    datetime
+        .format(&Rfc3339)
+        .context("failed to format GitHub timestamp")
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,6 +515,23 @@ struct ApiRepo {
     owner: Option<ApiUser>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ApiRepoDetails {
+    clone_url: String,
+    default_branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiIssueListItem {
+    url: String,
+    html_url: String,
+    number: u64,
+    title: String,
+    body: Option<String>,
+    user: ApiUser,
+    pull_request: Option<ApiIssuePullRequest>,
+}
+
 #[derive(Debug, Serialize)]
 struct PostComment<'a> {
     body: &'a str,
@@ -360,4 +540,12 @@ struct PostComment<'a> {
 #[derive(Debug, Serialize)]
 struct PostReaction<'a> {
     content: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct CreatePullRequest<'a> {
+    title: &'a str,
+    head: &'a str,
+    base: &'a str,
+    body: &'a str,
 }
