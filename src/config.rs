@@ -19,6 +19,8 @@ pub struct Config {
     pub auto_review_repos: Vec<RepoSlug>,
     pub cache_dir: PathBuf,
     pub poll_interval: Duration,
+    pub task_start_ledger_path: PathBuf,
+    pub task_limit_per_24h: Option<usize>,
     pub codex_bin: String,
     pub github_api_ip: Option<IpAddr>,
 }
@@ -55,6 +57,7 @@ impl Config {
             .transpose()?
             .unwrap_or_else(|| maid_home.join("cache"));
         let poll_seconds = file.poll_seconds.unwrap_or(20).max(10);
+        let task_limit_per_24h = file.task_limit_per_24h;
         let codex_bin = non_empty(file.codex_bin).unwrap_or_else(|| "codex".to_string());
         let github_api_ip = non_empty(file.github_api_ip)
             .map(|value| value.parse::<IpAddr>())
@@ -70,6 +73,8 @@ impl Config {
             auto_review_repos,
             cache_dir,
             poll_interval: Duration::from_secs(poll_seconds),
+            task_start_ledger_path: maid_home.join("task-starts.json"),
+            task_limit_per_24h,
             codex_bin,
             github_api_ip,
         })
@@ -85,6 +90,7 @@ struct ConfigFile {
     bind: Option<String>,
     cache_dir: Option<String>,
     poll_seconds: Option<u64>,
+    task_limit_per_24h: Option<usize>,
     codex_bin: Option<String>,
     github_api_ip: Option<String>,
 }
@@ -227,6 +233,7 @@ auto_review_repos = ["dionysuzx/maid"]
 bind = "127.0.0.1:4000"
 cache_dir = "~/.maid/cache"
 poll_seconds = 30
+task_limit_per_24h = 5
 codex_bin = "codex-test"
 github_api_ip = "127.0.0.1"
 "#
@@ -248,6 +255,7 @@ github_api_ip = "127.0.0.1"
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:4000"));
         assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
         assert_eq!(config.poll_seconds, Some(30));
+        assert_eq!(config.task_limit_per_24h, Some(5));
         assert_eq!(config.codex_bin.as_deref(), Some("codex-test"));
         assert_eq!(config.github_api_ip.as_deref(), Some("127.0.0.1"));
     }
@@ -261,6 +269,7 @@ github_api_ip = "127.0.0.1"
         assert_eq!(config.auto_review_accounts, None);
         assert_eq!(config.auto_review_repos, None);
         assert_eq!(config.poll_seconds, None);
+        assert_eq!(config.task_limit_per_24h, None);
     }
 
     #[test]

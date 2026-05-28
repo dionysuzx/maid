@@ -1,0 +1,21 @@
+# Required.
+bot_login = "maid-bot"
+master_accounts = ["dionysuzx"]
+
+# Optional. Defaults to master_accounts when omitted.
+auto_review_accounts = ["dionysuzx"]
+
+# Optional. Empty or omitted disables automatic PR-open reviews.
+auto_review_repos = ["dionysuzx/maid"]
+
+# Optional. Defaults shown below.
+bind = "127.0.0.1:3000"
+poll_seconds = 20
+cache_dir = "~/.maid/cache"
+codex_bin = "codex"
+
+# Optional. Omitted by default for no task limit. Set to 0 to pause new starts.
+# task_limit_per_24h = 5
+
+# Optional. Leave omitted unless you need to pin api.github.com.
+# github_api_ip = "127.0.0.1"

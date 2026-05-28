@@ -1,11 +1,13 @@
 use crate::domain::{
     CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug,
 };
+use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tracing::{error, info};
 
@@ -67,6 +69,7 @@ pub struct Maid<G, R, C> {
     master_accounts: HashSet<String>,
     auto_review_accounts: HashSet<String>,
     auto_review_repos: Vec<RepoSlug>,
+    task_starts: Arc<dyn TaskStartRecorder>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -100,7 +103,16 @@ where
             master_accounts: normalized_logins(master_accounts),
             auto_review_accounts: normalized_logins(auto_review_accounts),
             auto_review_repos: auto_review_repos.into_iter().collect(),
+            task_starts: Arc::new(NoTaskLimit),
         }
+    }
+
+    pub fn with_task_start_recorder(
+        mut self,
+        task_starts: impl TaskStartRecorder + 'static,
+    ) -> Self {
+        self.task_starts = Arc::new(task_starts);
+        self
     }
 
     pub async fn run_once(&self) -> Result<PollReport> {
@@ -204,6 +216,16 @@ where
             }
         }
 
+        if !self.can_start_task()? {
+            info!(
+                notification_id = notification.id,
+                pr = %mention.pr.html_url,
+                mention = %mention.html_url,
+                "skipping mention because the 24-hour task limit is reached"
+            );
+            return Ok(HandleOutcome::Skipped);
+        }
+
         self.github.mark_mention_started(&mention).await?;
         info!(
             notification_id = notification.id,
@@ -285,6 +307,15 @@ where
             }
         }
 
+        if !self.can_start_task()? {
+            info!(
+                pr = %pr.html_url,
+                author = %pr.author,
+                "skipping auto-review pull request because the 24-hour task limit is reached"
+            );
+            return Ok(HandleOutcome::Skipped);
+        }
+
         self.github.mark_pr_started(pr).await?;
         info!(
             pr = %pr.html_url,
@@ -326,6 +357,20 @@ where
             );
         }
         Ok(HandleOutcome::Responded)
+    }
+
+    fn can_start_task(&self) -> Result<bool> {
+        match self.task_starts.try_record_started()? {
+            TaskStartDecision::Recorded => Ok(true),
+            TaskStartDecision::AtLimit { limit, window } => {
+                info!(
+                    limit,
+                    window_seconds = window.as_secs(),
+                    "task start limit reached"
+                );
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -518,6 +563,19 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FixedTaskStartRecorder {
+        decision: TaskStartDecision,
+        calls: Arc<StdMutex<usize>>,
+    }
+
+    impl TaskStartRecorder for FixedTaskStartRecorder {
+        fn try_record_started(&self) -> Result<TaskStartDecision> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self.decision)
+        }
+    }
+
     fn notification(id: &str) -> Notification {
         notification_with_comment(id, "2")
     }
@@ -591,6 +649,16 @@ mod tests {
                 repo: "r".to_string(),
             }],
         )
+    }
+
+    fn at_limit_recorder() -> FixedTaskStartRecorder {
+        FixedTaskStartRecorder {
+            decision: TaskStartDecision::AtLimit {
+                limit: 1,
+                window: std::time::Duration::from_secs(24 * 60 * 60),
+            },
+            calls: Arc::new(StdMutex::new(0)),
+        }
     }
 
     #[test]
@@ -709,6 +777,62 @@ mod tests {
                 author: "dionysuzx".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn leaves_eligible_mention_pending_when_task_limit_is_reached() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let task_starts = at_limit_recorder();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .with_task_start_recorder(task_starts.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(*task_starts.calls.lock().unwrap(), 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert!(github.marks.lock().unwrap().is_empty());
+        assert!(github.events.lock().unwrap().is_empty());
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn leaves_auto_review_pr_pending_when_task_limit_is_reached() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let repos = FakeRepos {
+            checkout: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let task_starts = at_limit_recorder();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .with_task_start_recorder(task_starts.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(*task_starts.calls.lock().unwrap(), 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert!(github.marks.lock().unwrap().is_empty());
+        assert!(github.events.lock().unwrap().is_empty());
+        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

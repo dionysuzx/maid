@@ -1,7 +1,8 @@
 use anyhow::Result;
 use axum::{Router, routing::get};
 use maid::{
-    codex::CodexCli, config::Config, github::GitHubRestClient, maid::Maid, repo_cache::GitRepoCache,
+    codex::CodexCli, config::Config, github::GitHubRestClient, maid::Maid,
+    repo_cache::GitRepoCache, task_limit::FileTaskStartRecorder,
 };
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -23,7 +24,11 @@ async fn main() -> Result<()> {
         config.master_accounts.clone(),
         config.auto_review_accounts.clone(),
         config.auto_review_repos.clone(),
-    );
+    )
+    .with_task_start_recorder(FileTaskStartRecorder::new(
+        config.task_limit_per_24h,
+        config.task_start_ledger_path.clone(),
+    ));
 
     let app = Router::new().route("/healthz", get(|| async { "ok" }));
     let listener = TcpListener::bind(config.bind_addr).await?;
@@ -47,7 +52,9 @@ async fn main() -> Result<()> {
     info!(
         addr = %config.bind_addr,
         cache_dir = %config.cache_dir.display(),
+        task_start_ledger = %config.task_start_ledger_path.display(),
         poll_seconds = config.poll_interval.as_secs(),
+        task_limit_per_24h = ?config.task_limit_per_24h,
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),

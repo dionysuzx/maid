@@ -31,12 +31,13 @@ init:
         printf '%s\n' '# Fill in the GitHub bot account login and master accounts before starting Maid.'
         printf '%s\n' 'bot_login = ""'
         printf '%s\n' 'master_accounts = ["dionysuzx"]'
-        printf '%s\n' 'auto_review_accounts = ["dionysuzx"]'
-        printf '%s\n' 'auto_review_repos = ["dionysuzx/maid"]'
     } >"$config_file"
 
     echo "created $config_file"
-    echo "edit bot_login, master_accounts, auto_review_accounts, and auto_review_repos, then run: just start"
+    echo "edit bot_login and master_accounts, then run: just start"
+    echo
+    echo "optional config reference:"
+    cat "{{ justfile_directory() }}/config.example.toml"
 
 start:
     #!/usr/bin/env bash
