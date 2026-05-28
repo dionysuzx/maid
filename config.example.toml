@@ -1,12 +1,12 @@
 # Required.
 bot_login = "maid-bot"
-master_accounts = ["dionysuzx"]
+master_accounts = ["your-name"]
 
 # Optional. Defaults to master_accounts when omitted.
-auto_review_accounts = ["dionysuzx"]
+auto_review_accounts = ["your-name"]
 
 # Optional. Empty or omitted disables automatic PR-open reviews.
-auto_review_repos = ["dionysuzx/maid"]
+auto_review_repos = ["your-name/maid"]
 
 # Optional. Defaults shown below.
 poll_seconds = 20
