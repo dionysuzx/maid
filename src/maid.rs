@@ -104,6 +104,7 @@ pub struct SkipBreakdown {
     pub self_authored_pr: usize,
     pub auto_review_disabled: usize,
     pub already_handled_pr: usize,
+    pub task_limit_reached: usize,
 }
 
 impl SkipBreakdown {
@@ -119,6 +120,7 @@ impl SkipBreakdown {
             SkipReason::SelfAuthoredPr => self.self_authored_pr += 1,
             SkipReason::AutoReviewDisabled => self.auto_review_disabled += 1,
             SkipReason::AlreadyHandledPr => self.already_handled_pr += 1,
+            SkipReason::TaskLimitReached => self.task_limit_reached += 1,
         }
     }
 }
@@ -288,7 +290,7 @@ where
                 mention = %mention.html_url,
                 "skipping mention because the 24-hour task limit is reached"
             );
-            return Ok(HandleOutcome::Skipped);
+            return Ok(HandleOutcome::Skipped(SkipReason::TaskLimitReached));
         }
 
         self.github.mark_mention_started(&mention).await?;
@@ -379,7 +381,7 @@ where
                 author = %pr.author,
                 "skipping auto-review pull request because the 24-hour task limit is reached"
             );
-            return Ok(HandleOutcome::Skipped);
+            return Ok(HandleOutcome::Skipped(SkipReason::TaskLimitReached));
         }
 
         self.github.mark_pr_started(pr).await?;
@@ -474,6 +476,7 @@ enum SkipReason {
     SelfAuthoredPr,
     AutoReviewDisabled,
     AlreadyHandledPr,
+    TaskLimitReached,
 }
 
 #[cfg(test)]
