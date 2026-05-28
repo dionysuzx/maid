@@ -5,7 +5,7 @@ use maid::{
 };
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -31,13 +31,46 @@ async fn main() -> Result<()> {
     let poller = tokio::spawn(async move {
         loop {
             match maid.run_once().await {
-                Ok(report) => info!(
-                    seen = report.seen,
-                    skipped = report.skipped,
-                    responded = report.responded,
-                    failed = report.failed,
-                    "poll complete"
-                ),
+                Ok(report) => {
+                    let skip_breakdown = &report.skip_breakdown;
+                    if report.has_actionable_result() {
+                        info!(
+                            seen = report.seen,
+                            responded = report.responded,
+                            failed = report.failed,
+                            skipped = report.skipped,
+                            skip_duplicate_notification = skip_breakdown.duplicate_notification,
+                            skip_non_pr_notification = skip_breakdown.non_pr_notification,
+                            skip_missing_mention = skip_breakdown.missing_mention,
+                            skip_self_authored_mention = skip_breakdown.self_authored_mention,
+                            skip_non_master_mention = skip_breakdown.non_master_mention,
+                            skip_no_bot_request = skip_breakdown.no_bot_request,
+                            skip_already_handled_mention = skip_breakdown.already_handled_mention,
+                            skip_self_authored_pr = skip_breakdown.self_authored_pr,
+                            skip_auto_review_disabled = skip_breakdown.auto_review_disabled,
+                            skip_already_handled_pr = skip_breakdown.already_handled_pr,
+                            next_poll_seconds = poll_interval.as_secs(),
+                            "poll completed with actionable result"
+                        );
+                    } else {
+                        debug!(
+                            seen = report.seen,
+                            skipped = report.skipped,
+                            skip_duplicate_notification = skip_breakdown.duplicate_notification,
+                            skip_non_pr_notification = skip_breakdown.non_pr_notification,
+                            skip_missing_mention = skip_breakdown.missing_mention,
+                            skip_self_authored_mention = skip_breakdown.self_authored_mention,
+                            skip_non_master_mention = skip_breakdown.non_master_mention,
+                            skip_no_bot_request = skip_breakdown.no_bot_request,
+                            skip_already_handled_mention = skip_breakdown.already_handled_mention,
+                            skip_self_authored_pr = skip_breakdown.self_authored_pr,
+                            skip_auto_review_disabled = skip_breakdown.auto_review_disabled,
+                            skip_already_handled_pr = skip_breakdown.already_handled_pr,
+                            next_poll_seconds = poll_interval.as_secs(),
+                            "poll completed without actionable work"
+                        );
+                    }
+                }
                 Err(err) => error!(error = ?err, "poll failed"),
             }
             tokio::time::sleep(poll_interval).await;
