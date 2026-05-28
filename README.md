@@ -1,62 +1,66 @@
 # Maid
 
-![Maid banner](assets/maid-banner.png)
+![Maid banner](assets/maid-banner-v2.jpg)
 
-Maid is a small Rust + Axum server that polls GitHub as a bot account. When a
-pull request comment mentions that bot, when a configured master account has an
-open pull request in an allowlisted repository, or when an allowlisted
-repository has a labeled issue ready for implementation, Maid checks out the
-repository in its own cache, runs local `codex`, and publishes the result back
-to GitHub.
+Maid is a small Rust + Axum bot runner for GitHub work. It polls GitHub as a bot
+account, checks out eligible repositories into a local cache, runs `codex` from
+that checkout, and publishes Codex's final answer back to GitHub.
 
-Maid uses polling, not webhooks. It expects `git`, `gh`, and `codex` to be on
-`PATH`.
-Maid marks work in progress with an `eyes` reaction and completed work with a
-`+1` reaction. Mention requests use reactions on the mention comment; automatic
-PR-open reviews use reactions on the PR description; automatic issue
-implementation uses reactions on the issue.
+Maid handles three workflows:
+
+- Mention requests: an allowed master account mentions the bot in a PR comment.
+- Automatic reviews: an allowed master account opens a PR in an allowlisted repo.
+- Issue implementation: an allowed master account opens a labeled issue in an
+  allowlisted repo.
+
+It uses polling, not webhooks. It expects `git`, `gh`, and `codex` on `PATH`.
+In-progress work gets an `eyes` reaction; completed work gets a `+1` reaction.
+Mention requests use reactions on the mention comment; automatic PR-open reviews
+use reactions on the PR description; automatic issue implementation uses
+reactions on the issue.
 
 ## Quick Start
+
+Run setup as the GitHub bot account; Maid reads that account's token from `gh`.
 
 ```sh
 git clone https://github.com/dionysuzx/maid.git
 cd maid
 just init     # create ~/.maid/config.toml
+just config   # fill in bot_login and master_accounts
+gh auth login
+gh auth status --hostname github.com
 just start    # start Maid in the background
 just logs     # follow ~/.maid/maid.log
 ```
 
-Fill in `bot_login` and `master_accounts` in `~/.maid/config.toml` before
-starting. Maid only responds to mentions authored by one of the configured
-master accounts. `auto_review_accounts` controls which master accounts can get
-automatic reviews in allowlisted repositories; if omitted, it defaults to
-`master_accounts`. `auto_review_repos` lists the repositories to poll for open
-PRs. Set either option to `[]` to disable automatic PR-open reviews.
-`auto_implement_repos` lists repositories where Maid should poll open issues
-with `auto_implement_label` and create implementation PRs. It is disabled when
-omitted or empty. `auto_implement_accounts` controls which master accounts can
-author issues that trigger automatic implementation; if omitted, it defaults to
-`master_accounts`. This keeps labeled issues from untrusted authors out of the
-write-capable Codex path. `auto_implement_window_days` bounds issue polling to
-recently updated issues and defaults to 30 days.
-`task_limit_per_24h` caps how many mention, automatic review, and issue
-implementation tasks Maid will start in a rolling 24-hour window. Omit it for no
-limit; set it to `0` to pause new task starts without marking eligible work
-handled. Maid stores that rolling task-start ledger at `~/.maid/task-starts.json`
-by default.
+## Configuration
 
-Maid asks `gh` for the bot account's token, so the bot account must be logged in
-locally:
+Runtime config lives at `~/.maid/config.toml`. The required fields are
+`bot_login` and `master_accounts`.
 
-```sh
-gh auth login
-gh auth status --hostname github.com
-```
+- `auto_review_accounts`: master accounts eligible for automatic PR reviews;
+  defaults to `master_accounts`.
+- `auto_review_repos`: repositories to poll for automatic PR reviews; empty or
+  omitted means mention-only mode.
+- `auto_implement_accounts`: master accounts eligible for automatic issue
+  implementation; defaults to `master_accounts`.
+- `auto_implement_repos`: repositories to poll for labeled issue implementation;
+  empty or omitted disables issue implementation.
+- `auto_implement_label`: issue label that triggers implementation; defaults to
+  `maid`.
+- `auto_implement_window_days`: recently updated issue polling window; defaults
+  to 30 days.
+- `task_limit_per_24h`: optional rolling 24-hour cap across mention, automatic
+  review, and issue implementation tasks. Omit it for no limit; set it to `0` to
+  pause new task starts.
 
-For automatic issue implementation, the configured publishing identity needs
-repository write access so Maid can push deterministic branches like
-`maid/issue-123` and open pull requests. Maid performs the commit, push, and PR
-creation itself; Codex only edits the checkout and returns the PR body.
+`auto_implement_accounts` keeps labeled issues from untrusted authors out of the
+write-capable Codex path. For automatic issue implementation, the configured
+publishing identity needs repository write access so Maid can push deterministic
+branches like `maid/issue-123` and open pull requests. Maid performs the commit,
+push, and PR creation itself; Codex only edits the checkout and returns the PR
+body.
 
 If issue implementation PRs should be opened by another GitHub account, configure
 `implementation_actor`. Maid still polls, comments, and marks work as the bot,
@@ -85,15 +89,15 @@ git config --global commit.gpgsign
 ssh -T git@github.com
 ```
 
-`just start` runs Maid in the background. Runtime state lives in `~/.maid`,
-including `~/.maid/maid.log`, `~/.maid/maid.pid`, and the default repo cache.
-Use `just status` to check it, `just stop` to stop it, `just config` to edit
-the config in Vim, `just restart` to stop and start it again, and `just update`
-to pull the latest `main`, edit the config, and start it again.
+See [config.example.toml](config.example.toml) for every option.
 
-See [config.example.toml](config.example.toml) for all config options and example values.
+## Operations
 
-Development:
+Runtime state lives in `~/.maid`: config, logs, PID, repo cache, and the
+task-start ledger. Use `just status`, `just stop`, `just restart`, or
+`just update` to manage the background process.
+
+## Development
 
 ```sh
 just dev
