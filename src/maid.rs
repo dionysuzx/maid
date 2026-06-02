@@ -56,11 +56,7 @@ impl CodexRun {
             return self.response.clone();
         };
 
-        format!(
-            "{}\n\n{}",
-            self.response,
-            metadata.footer(self.session_id.as_deref())
-        )
+        format!("{}\n\n{}", self.response, metadata.footer())
     }
 
     pub fn resume_command(&self) -> Option<(&str, String)> {
@@ -75,22 +71,26 @@ impl CodexRun {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexRunMetadata {
-    pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
+    pub model: String,
+    pub reasoning_effort: String,
     pub prompt: String,
 }
 
 impl CodexRunMetadata {
-    fn footer(&self, session_id: Option<&str>) -> String {
-        let model = self.model.as_deref().unwrap_or("Codex default");
-        let reasoning_effort = self.reasoning_effort.as_deref().unwrap_or("Codex default");
-        let session = session_id.unwrap_or("unknown");
+    fn footer(&self) -> String {
+        let model = &self.model;
+        let reasoning_effort = &self.reasoning_effort;
         let prompt = fenced_code_block("text", &self.prompt);
 
         format!(
             "\
 ---
-<sub>Codex run: model `{model}`, reasoning effort `{reasoning_effort}`, session `{session}`.</sub>
+**Codex run**
+
+| Setting | Value |
+| --- | --- |
+| Model | `{model}` |
+| Reasoning effort | `{reasoning_effort}` |
 
 <details>
 <summary>Input prompt</summary>
@@ -736,8 +736,8 @@ mod tests {
             response: "done".to_string(),
             session_id: Some("session-1".to_string()),
             metadata: Some(CodexRunMetadata {
-                model: Some("gpt-test".to_string()),
-                reasoning_effort: Some("high".to_string()),
+                model: "gpt-test".to_string(),
+                reasoning_effort: "high".to_string(),
                 prompt: "please include ``` safely".to_string(),
             }),
         };
@@ -745,9 +745,10 @@ mod tests {
         let body = run.comment_body();
 
         assert!(body.starts_with("done\n\n---"));
-        assert!(body.contains("model `gpt-test`"));
-        assert!(body.contains("reasoning effort `high`"));
-        assert!(body.contains("session `session-1`"));
+        assert!(body.contains("**Codex run**"));
+        assert!(body.contains("| Model | `gpt-test` |"));
+        assert!(body.contains("| Reasoning effort | `high` |"));
+        assert!(!body.contains("session-1"));
         assert!(body.contains("<summary>Input prompt</summary>"));
         assert!(body.contains("please include ``` safely"));
         assert!(body.contains("````text"));

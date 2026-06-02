@@ -25,7 +25,8 @@ just start
 ## Configuration
 
 Runtime config lives at `~/.maid/config.toml`. The required fields are
-`bot_login` and `master_accounts`.
+`bot_login`, `master_accounts`, `codex_model`, and
+`codex_reasoning_effort`. The `[codex_prompts]` section is also required.
 
 - `auto_review_accounts`: master accounts eligible for automatic PR reviews;
   defaults to `master_accounts`.
@@ -33,16 +34,15 @@ Runtime config lives at `~/.maid/config.toml`. The required fields are
   omitted means mention-only mode.
 - `task_limit_per_24h`: optional rolling 24-hour cap. Omit it for no limit; set
   it to `0` to pause new task starts.
-- `codex_model` and `codex_reasoning_effort`: optional Codex invocation
-  overrides. When omitted, Codex uses its own config defaults.
+- `codex_model` and `codex_reasoning_effort`: required Codex invocation
+  settings. Posted comment footers report these values.
 - `[codex_prompts]`: required prompt templates for the internal Codex run.
   These are the full prompts Maid sends after placeholder interpolation.
   Mention templates support `{{mention_url}}`, `{{pr_url}}`, `{{raw_body}}`,
   and `{{cleaned_text}}`. Automatic review templates support `{{pr_url}}`
   and `{{author}}`.
 
-Posted comments include a small Codex metadata footer with the configured
-model, reasoning effort, session id, and the input prompt collapsed behind a
-details block.
+Posted comments include a Codex metadata footer with the configured model,
+reasoning effort, and the input prompt collapsed behind a details block.
 
 See [config.example.toml](config.example.toml) for every option.

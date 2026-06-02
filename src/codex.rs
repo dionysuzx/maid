@@ -14,33 +14,33 @@ use tracing::info;
 #[derive(Clone, Debug)]
 pub struct CodexCli {
     bin: String,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
+    model: String,
+    reasoning_effort: String,
     prompts: CodexPromptTemplates,
 }
 
 impl CodexCli {
-    pub fn new(bin: impl Into<String>, prompts: CodexPromptTemplates) -> Self {
+    pub fn new(
+        bin: impl Into<String>,
+        model: impl Into<String>,
+        reasoning_effort: impl Into<String>,
+        prompts: CodexPromptTemplates,
+    ) -> Self {
         Self {
             bin: bin.into(),
-            model: None,
-            reasoning_effort: None,
+            model: model.into(),
+            reasoning_effort: reasoning_effort.into(),
             prompts,
         }
     }
 
     pub fn with_options(
         bin: impl Into<String>,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
+        model: impl Into<String>,
+        reasoning_effort: impl Into<String>,
         prompts: CodexPromptTemplates,
     ) -> Self {
-        Self {
-            bin: bin.into(),
-            model,
-            reasoning_effort,
-            prompts,
-        }
+        Self::new(bin, model, reasoning_effort, prompts)
     }
 }
 
@@ -54,15 +54,11 @@ impl CodexRunner for CodexCli {
 
         let mut command = Command::new(&self.bin);
         command.arg("--ask-for-approval").arg("never");
-        if let Some(model) = &self.model {
-            command.arg("--model").arg(model);
-        }
-        if let Some(reasoning_effort) = &self.reasoning_effort {
-            command.arg("--config").arg(codex_config_string(
-                "model_reasoning_effort",
-                reasoning_effort,
-            ));
-        }
+        command.arg("--model").arg(&self.model);
+        command.arg("--config").arg(codex_config_string(
+            "model_reasoning_effort",
+            &self.reasoning_effort,
+        ));
         let mut child = command
             .arg("exec")
             .arg("--color")
