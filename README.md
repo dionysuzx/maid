@@ -58,8 +58,9 @@ Runtime config lives at `~/.maid/config.toml`. The required fields are
 - `[codex_prompts]`: required prompt templates for the internal Codex run.
   Mention templates support `{{mention_url}}`, `{{pr_url}}`, `{{raw_body}}`,
   and `{{cleaned_text}}`. Automatic review templates support `{{pr_url}}` and
-  `{{author}}`. Issue implementation templates support `{{issue_url}}`,
-  `{{branch}}`, `{{title}}`, and `{{body}}`.
+  `{{author}}`. Issue implementation templates are required when
+  `auto_implement_repos` is configured and support `{{issue_url}}`, `{{branch}}`,
+  `{{title}}`, and `{{body}}`.
 
 Posted comments include a small Codex metadata footer with the configured model,
 reasoning effort, session id, and the input prompt collapsed behind a details

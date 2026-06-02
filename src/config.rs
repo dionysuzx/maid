@@ -108,8 +108,11 @@ impl Config {
         let codex_bin = non_empty(file.codex_bin).unwrap_or_else(|| "codex".to_string());
         let codex_model = non_empty(file.codex_model);
         let codex_reasoning_effort = non_empty(file.codex_reasoning_effort);
-        let codex_prompts = required_codex_prompts(file.codex_prompts)
-            .with_context(|| format!("codex_prompts is required in {}", config_path.display()))?;
+        let codex_prompts =
+            required_codex_prompts(file.codex_prompts, !auto_implement_repos.is_empty())
+                .with_context(|| {
+                    format!("codex_prompts is required in {}", config_path.display())
+                })?;
         let github_api_ip = non_empty(file.github_api_ip)
             .map(|value| value.parse::<IpAddr>())
             .transpose()
@@ -319,24 +322,29 @@ fn optional_repos(value: Option<Vec<String>>, key: &str) -> Result<Vec<RepoSlug>
     Ok(repos)
 }
 
-fn required_codex_prompts(value: Option<CodexPromptsFile>) -> Result<CodexPromptTemplates> {
+fn required_codex_prompts(
+    value: Option<CodexPromptsFile>,
+    require_issue_implementation: bool,
+) -> Result<CodexPromptTemplates> {
     let Some(prompts) = value else {
-        bail!(
-            "codex_prompts must include mention, pull_request_opened, and issue_implementation templates"
-        );
+        bail!("codex_prompts must include mention and pull_request_opened templates");
     };
 
     let mention = non_empty(prompts.mention)
         .ok_or_else(|| anyhow!("codex_prompts.mention must not be empty"))?;
     let pull_request_opened = non_empty(prompts.pull_request_opened)
         .ok_or_else(|| anyhow!("codex_prompts.pull_request_opened must not be empty"))?;
-    let issue_implementation = non_empty(prompts.issue_implementation)
-        .ok_or_else(|| anyhow!("codex_prompts.issue_implementation must not be empty"))?;
+    let issue_implementation = non_empty(prompts.issue_implementation);
+    if require_issue_implementation && issue_implementation.is_none() {
+        bail!(
+            "codex_prompts.issue_implementation must not be empty when auto_implement_repos is configured"
+        );
+    }
 
     Ok(CodexPromptTemplates {
         mention,
         pull_request_opened,
-        issue_implementation,
+        issue_implementation: issue_implementation.unwrap_or_default(),
     })
 }
 
@@ -522,36 +530,76 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
 
     #[test]
     fn requires_codex_prompt_templates() {
-        assert!(required_codex_prompts(None).is_err());
+        assert!(required_codex_prompts(None, false).is_err());
         assert!(
-            required_codex_prompts(Some(CodexPromptsFile {
-                mention: Some("mention".to_string()),
-                pull_request_opened: None,
-                issue_implementation: Some("implement".to_string()),
-            }))
+            required_codex_prompts(
+                Some(CodexPromptsFile {
+                    mention: Some("mention".to_string()),
+                    pull_request_opened: None,
+                    issue_implementation: Some("implement".to_string()),
+                }),
+                false
+            )
             .is_err()
         );
         assert!(
-            required_codex_prompts(Some(CodexPromptsFile {
-                mention: Some(" ".to_string()),
-                pull_request_opened: Some("review".to_string()),
-                issue_implementation: Some("implement".to_string()),
-            }))
+            required_codex_prompts(
+                Some(CodexPromptsFile {
+                    mention: Some(" ".to_string()),
+                    pull_request_opened: Some("review".to_string()),
+                    issue_implementation: Some("implement".to_string()),
+                }),
+                false
+            )
             .is_err()
         );
 
         assert_eq!(
-            required_codex_prompts(Some(CodexPromptsFile {
-                mention: Some("mention".to_string()),
-                pull_request_opened: Some("review".to_string()),
-                issue_implementation: Some("implement".to_string()),
-            }))
+            required_codex_prompts(
+                Some(CodexPromptsFile {
+                    mention: Some("mention".to_string()),
+                    pull_request_opened: Some("review".to_string()),
+                    issue_implementation: Some("implement".to_string()),
+                }),
+                true
+            )
             .unwrap(),
             CodexPromptTemplates {
                 mention: "mention".to_string(),
                 pull_request_opened: "review".to_string(),
                 issue_implementation: "implement".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn issue_implementation_prompt_is_only_required_when_issue_implementation_is_enabled() {
+        assert_eq!(
+            required_codex_prompts(
+                Some(CodexPromptsFile {
+                    mention: Some("mention".to_string()),
+                    pull_request_opened: Some("review".to_string()),
+                    issue_implementation: None,
+                }),
+                false
+            )
+            .unwrap(),
+            CodexPromptTemplates {
+                mention: "mention".to_string(),
+                pull_request_opened: "review".to_string(),
+                issue_implementation: String::new(),
+            }
+        );
+        assert!(
+            required_codex_prompts(
+                Some(CodexPromptsFile {
+                    mention: Some("mention".to_string()),
+                    pull_request_opened: Some("review".to_string()),
+                    issue_implementation: None,
+                }),
+                true
+            )
+            .is_err()
         );
     }
 
