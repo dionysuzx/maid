@@ -6,15 +6,15 @@ master_accounts = ["your-name"]
 auto_review_accounts = ["your-name"]
 
 # Optional. Empty or omitted disables automatic PR-open reviews.
-auto_review_repos = ["your-name/maid"]
+auto_review_repos = []
 
 # Optional. Empty or omitted disables automatic issue implementation.
 # Maid polls open issues in these repositories that have auto_implement_label.
 # auto_implement_accounts defaults to master_accounts when omitted.
-auto_implement_accounts = ["your-name"]
-auto_implement_repos = ["your-name/maid"]
-auto_implement_label = "maid"
-auto_implement_window_days = 30
+# auto_implement_accounts = ["your-name"]
+# auto_implement_repos = ["your-name/maid"]
+# auto_implement_label = "maid"
+# auto_implement_window_days = 30
 
 # Optional. Defaults shown below.
 poll_seconds = 20
@@ -34,19 +34,19 @@ codex_reasoning_effort = "high"
 # Optional. Defaults to the bot account and bot-token git/commit behavior.
 # Use host modes when the machine's git config, SSH credentials, and signing
 # setup should author, sign, and push issue implementation PRs.
-[implementation_actor]
-login = "your-name"
-git_auth = "host"
-commit_identity = "host"
+# [implementation_actor]
+# login = "your-name"
+# git_auth = "host"
+# commit_identity = "host"
 
 # Optional. Checked only when commit_identity = "host".
 # Maid reads the effective git config from the prepared checkout before running
 # Codex and only verifies fields configured here.
-[implementation_actor.expected_git_identity]
-name = "Your Name"
-email = "your-name@users.noreply.github.com"
-gpgsign = true
-gpg_format = "ssh"
+# [implementation_actor.expected_git_identity]
+# name = "Your Name"
+# email = "your-name@users.noreply.github.com"
+# gpgsign = true
+# gpg_format = "ssh"
 
 # Required. These templates are the full prompts Maid sends to Codex.
 # Supported mention placeholders:
