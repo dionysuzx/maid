@@ -10,8 +10,9 @@ auto_review_repos = ["your-name/maid"]
 
 # Optional. Defaults shown below.
 poll_seconds = 20
-cache_dir = "~/.maid/cache"
+git_dir = "~/.maid/git"
 codex_bin = "codex"
+max_concurrent_requests = 1
 
 # Required. These values are passed to Codex.
 codex_model = "gpt-5.5"
@@ -35,7 +36,7 @@ codex_reasoning_effort = "high"
 mention = """
 You are responding to a GitHub pull request mention.
 
-Inspect the checkout in your current working directory and answer the request.
+Inspect the worktree in your current working directory and answer the request.
 Return only the GitHub comment body to post. Do not include tool logs or wrappers.
 
 Mention URL:
@@ -53,7 +54,7 @@ Cleaned request text:
 pull_request_opened = """
 You are responding automatically to a GitHub pull request opened by a trusted account.
 
-Inspect the checkout in your current working directory and review the pull request.
+Inspect the worktree in your current working directory and review the pull request.
 Return only the GitHub comment body to post. Do not include tool logs or wrappers.
 
 Pull request URL:

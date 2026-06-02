@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info};
 
 #[async_trait]
@@ -34,13 +35,44 @@ pub enum ReviewState {
 }
 
 #[async_trait]
-pub trait RepoPreparer: Send + Sync {
-    async fn prepare(&self, pr: &PullRequest) -> Result<PathBuf>;
+pub trait Worktrees: Send + Sync {
+    async fn prepare(&self, pr: &PullRequest, task: &CodexTask) -> Result<PreparedWorktree>;
+    async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()>;
 }
 
 #[async_trait]
 pub trait CodexRunner: Send + Sync {
-    async fn run(&self, checkout: &Path, task: &CodexTask) -> Result<CodexRun>;
+    async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedWorktree {
+    path: PathBuf,
+    repo: Option<PathBuf>,
+}
+
+impl PreparedWorktree {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            repo: None,
+        }
+    }
+
+    pub fn git_worktree(repo: impl Into<PathBuf>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            repo: Some(repo.into()),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn repo(&self) -> Option<&Path> {
+        self.repo.as_deref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,7 +95,7 @@ impl CodexRun {
 #[derive(Clone)]
 pub struct Maid<G, R, C> {
     github: G,
-    repos: R,
+    worktrees: R,
     codex: C,
     bot_login: String,
     master_accounts: HashSet<String>,
@@ -76,19 +108,21 @@ pub struct Maid<G, R, C> {
 pub struct PollReport {
     pub seen: usize,
     pub skipped: usize,
+    pub started: usize,
     pub responded: usize,
     pub failed: usize,
+    pub in_flight: usize,
 }
 
 impl<G, R, C> Maid<G, R, C>
 where
     G: GithubClient,
-    R: RepoPreparer,
+    R: Worktrees,
     C: CodexRunner,
 {
     pub fn new(
         github: G,
-        repos: R,
+        worktrees: R,
         codex: C,
         bot_login: impl Into<String>,
         master_accounts: impl IntoIterator<Item = impl Into<String>>,
@@ -97,7 +131,7 @@ where
     ) -> Self {
         Self {
             github,
-            repos,
+            worktrees,
             codex,
             bot_login: bot_login.into(),
             master_accounts: normalized_logins(master_accounts),
@@ -115,6 +149,13 @@ where
         self
     }
 
+    pub fn into_concurrent(self, max_concurrent_requests: usize) -> ConcurrentMaid<G, R, C> {
+        ConcurrentMaid {
+            maid: self,
+            work: WorkQueue::new(max_concurrent_requests),
+        }
+    }
+
     pub async fn run_once(&self) -> Result<PollReport> {
         let notifications = self.github.notifications().await?;
         let mut report = PollReport {
@@ -130,9 +171,30 @@ where
                 continue;
             }
 
-            match self.handle_notification(&notification).await {
-                Ok(HandleOutcome::Responded) => report.responded += 1,
-                Ok(HandleOutcome::Skipped) => report.skipped += 1,
+            match self.task_for_notification(&notification).await {
+                Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
+                    Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
+                        Ok(()) => report.responded += 1,
+                        Err(err) => {
+                            report.failed += 1;
+                            error!(
+                                notification_id = notification.id,
+                                error = ?err,
+                                "failed to handle notification"
+                            );
+                        }
+                    },
+                    Ok(TaskStartOutcome::Skipped) => report.skipped += 1,
+                    Err(err) => {
+                        report.failed += 1;
+                        error!(
+                            notification_id = notification.id,
+                            error = ?err,
+                            "failed to start notification task"
+                        );
+                    }
+                },
+                Ok(TaskAssessment::Skipped) => report.skipped += 1,
                 Err(err) => {
                     report.failed += 1;
                     error!(
@@ -149,9 +211,30 @@ where
             report.seen += pull_requests.len();
 
             for pr in pull_requests {
-                match self.handle_auto_review_pr(&pr).await {
-                    Ok(HandleOutcome::Responded) => report.responded += 1,
-                    Ok(HandleOutcome::Skipped) => report.skipped += 1,
+                match self.task_for_auto_review_pr(&pr).await {
+                    Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
+                        Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
+                            Ok(()) => report.responded += 1,
+                            Err(err) => {
+                                report.failed += 1;
+                                error!(
+                                    pr = %pr.html_url,
+                                    error = ?err,
+                                    "failed to handle auto-review pull request"
+                                );
+                            }
+                        },
+                        Ok(TaskStartOutcome::Skipped) => report.skipped += 1,
+                        Err(err) => {
+                            report.failed += 1;
+                            error!(
+                                pr = %pr.html_url,
+                                error = ?err,
+                                "failed to start auto-review pull request task"
+                            );
+                        }
+                    },
+                    Ok(TaskAssessment::Skipped) => report.skipped += 1,
                     Err(err) => {
                         report.failed += 1;
                         error!(
@@ -167,22 +250,22 @@ where
         Ok(report)
     }
 
-    async fn handle_notification(&self, notification: &Notification) -> Result<HandleOutcome> {
+    async fn task_for_notification(&self, notification: &Notification) -> Result<TaskAssessment> {
         if notification.is_pr_mention_candidate() {
-            return self.handle_mention(notification).await;
+            return self.task_for_mention(notification).await;
         }
 
         self.github.mark_notification_handled(notification).await?;
-        Ok(HandleOutcome::Skipped)
+        Ok(TaskAssessment::Skipped)
     }
 
-    async fn handle_mention(&self, notification: &Notification) -> Result<HandleOutcome> {
+    async fn task_for_mention(&self, notification: &Notification) -> Result<TaskAssessment> {
         let Some(mention) = self.github.mention_for(notification).await? else {
-            return Ok(HandleOutcome::Skipped);
+            return Ok(TaskAssessment::Skipped);
         };
 
         if mention.author.eq_ignore_ascii_case(&self.bot_login) {
-            return Ok(HandleOutcome::Skipped);
+            return Ok(TaskAssessment::Skipped);
         }
 
         if !self
@@ -196,11 +279,11 @@ where
                 "skipping mention from non-master account"
             );
             self.github.mark_notification_handled(notification).await?;
-            return Ok(HandleOutcome::Skipped);
+            return Ok(TaskAssessment::Skipped);
         }
 
         let Some(request) = MentionRequest::parse(&mention.body, &self.bot_login)? else {
-            return Ok(HandleOutcome::Skipped);
+            return Ok(TaskAssessment::Skipped);
         };
 
         match self.github.mention_state(&mention, &self.bot_login).await? {
@@ -212,18 +295,8 @@ where
                     "skipping already handled mention"
                 );
                 self.github.mark_notification_handled(notification).await?;
-                return Ok(HandleOutcome::Skipped);
+                return Ok(TaskAssessment::Skipped);
             }
-        }
-
-        if !self.can_start_task()? {
-            info!(
-                notification_id = notification.id,
-                pr = %mention.pr.html_url,
-                mention = %mention.html_url,
-                "skipping mention because the 24-hour task limit is reached"
-            );
-            return Ok(HandleOutcome::Skipped);
         }
 
         let task = CodexTask {
@@ -231,55 +304,16 @@ where
             origin: mention_task_origin(&mention, request, &self.bot_login),
         };
 
-        self.github.mark_mention_started(&mention).await?;
-        info!(
-            notification_id = notification.id,
-            pr = %mention.pr.html_url,
-            mention = %mention.html_url,
-            task_kind = task.task_kind(),
-            "started handling pull request mention"
-        );
-
-        let checkout = self.repos.prepare(&mention.pr).await?;
-        let codex_run = self.codex.run(&checkout, &task).await?;
-
-        self.github
-            .post_pr_comment(&mention.pr, &codex_run.response)
-            .await?;
-        if let Err(err) = self.github.mark_mention_handled(&mention).await {
-            error!(
-                notification_id = notification.id,
-                pr = %mention.pr.html_url,
-                mention = %mention.html_url,
-                error = ?err,
-                "failed to mark mention handled after posting response"
-            );
-        }
-        self.github.mark_notification_handled(notification).await?;
-
-        if let Some((session_id, resume_command)) = codex_run.resume_command() {
-            info!(
-                notification_id = notification.id,
-                pr = %mention.pr.html_url,
-                mention = %mention.html_url,
-                codex_session_id = %session_id,
-                codex_resume = %resume_command,
-                "responded to mention"
-            );
-        } else {
-            info!(
-                notification_id = notification.id,
-                pr = %mention.pr.html_url,
-                mention = %mention.html_url,
-                "responded to mention"
-            );
-        }
-        Ok(HandleOutcome::Responded)
+        Ok(TaskAssessment::Ready(Box::new(TaskIntent::Mention {
+            notification: notification.clone(),
+            mention: Box::new(mention),
+            task,
+        })))
     }
 
-    async fn handle_auto_review_pr(&self, pr: &PullRequest) -> Result<HandleOutcome> {
+    async fn task_for_auto_review_pr(&self, pr: &PullRequest) -> Result<TaskAssessment> {
         if pr.author.eq_ignore_ascii_case(&self.bot_login) {
-            return Ok(HandleOutcome::Skipped);
+            return Ok(TaskAssessment::Skipped);
         }
 
         if !self
@@ -291,7 +325,7 @@ where
                 author = %pr.author,
                 "skipping pull request from account without auto review"
             );
-            return Ok(HandleOutcome::Skipped);
+            return Ok(TaskAssessment::Skipped);
         }
 
         match self.github.pr_state(pr, &self.bot_login).await? {
@@ -301,26 +335,131 @@ where
                     pr = %pr.html_url,
                     "skipping already handled auto-review pull request"
                 );
-                return Ok(HandleOutcome::Skipped);
+                return Ok(TaskAssessment::Skipped);
             }
         }
 
-        if !self.can_start_task()? {
-            info!(
-                pr = %pr.html_url,
-                author = %pr.author,
-                "skipping auto-review pull request because the 24-hour task limit is reached"
-            );
-            return Ok(HandleOutcome::Skipped);
-        }
-
-        self.github.mark_pr_started(pr).await?;
         let task = CodexTask {
             pr_url: pr.html_url.clone(),
             origin: CodexTaskOrigin::PullRequestOpened {
                 author: pr.author.clone(),
             },
         };
+        Ok(TaskAssessment::Ready(Box::new(
+            TaskIntent::AutoReviewPullRequest {
+                pr: pr.clone(),
+                task,
+            },
+        )))
+    }
+
+    async fn start_task(&self, intent: Box<TaskIntent>) -> Result<TaskStartOutcome> {
+        if !self.can_start_task()? {
+            intent.log_task_limit_reached();
+            return Ok(TaskStartOutcome::Skipped);
+        }
+
+        match *intent {
+            TaskIntent::Mention {
+                notification,
+                mention,
+                task,
+            } => self.start_mention_task(notification, mention, task).await,
+            TaskIntent::AutoReviewPullRequest { pr, task } => {
+                self.start_auto_review_task(pr, task).await
+            }
+        }
+    }
+
+    async fn start_mention_task(
+        &self,
+        notification: Notification,
+        mention: Box<CommentMention>,
+        task: CodexTask,
+    ) -> Result<TaskStartOutcome> {
+        self.github.mark_mention_started(&mention).await?;
+        info!(
+            notification_id = notification.id,
+            pr = %mention.pr.html_url,
+            mention = %mention.html_url,
+            task_kind = task.task_kind(),
+            "started handling pull request mention"
+        );
+
+        Ok(TaskStartOutcome::Started(Box::new(StartedTask::Mention {
+            notification,
+            mention,
+            task,
+        })))
+    }
+
+    async fn finish_task(&self, task: Box<StartedTask>) -> Result<()> {
+        match *task {
+            StartedTask::Mention {
+                notification,
+                mention,
+                task,
+            } => self.finish_mention_task(notification, mention, task).await,
+            StartedTask::AutoReviewPullRequest { pr, task } => {
+                self.finish_auto_review_task(pr, task).await
+            }
+        }
+    }
+
+    async fn finish_mention_task(
+        &self,
+        notification: Notification,
+        mention: Box<CommentMention>,
+        task: CodexTask,
+    ) -> Result<()> {
+        let worktree = self.worktrees.prepare(&mention.pr, &task).await?;
+        let result = async {
+            let codex_run = self.codex.run(worktree.path(), &task).await?;
+
+            self.github
+                .post_pr_comment(&mention.pr, &codex_run.response)
+                .await?;
+            if let Err(err) = self.github.mark_mention_handled(&mention).await {
+                error!(
+                    notification_id = notification.id,
+                    pr = %mention.pr.html_url,
+                    mention = %mention.html_url,
+                    error = ?err,
+                    "failed to mark mention handled after posting response"
+                );
+            }
+            self.github.mark_notification_handled(&notification).await?;
+
+            if let Some((session_id, resume_command)) = codex_run.resume_command() {
+                info!(
+                    notification_id = notification.id,
+                    pr = %mention.pr.html_url,
+                    mention = %mention.html_url,
+                    codex_session_id = %session_id,
+                    codex_resume = %resume_command,
+                    "responded to mention"
+                );
+            } else {
+                info!(
+                    notification_id = notification.id,
+                    pr = %mention.pr.html_url,
+                    mention = %mention.html_url,
+                    "responded to mention"
+                );
+            }
+            Ok(())
+        }
+        .await;
+
+        self.cleanup_worktree(worktree, result).await
+    }
+
+    async fn start_auto_review_task(
+        &self,
+        pr: PullRequest,
+        task: CodexTask,
+    ) -> Result<TaskStartOutcome> {
+        self.github.mark_pr_started(&pr).await?;
         info!(
             pr = %pr.html_url,
             author = %pr.author,
@@ -328,34 +467,67 @@ where
             "started handling auto-review pull request"
         );
 
-        let checkout = self.repos.prepare(pr).await?;
-        let codex_run = self.codex.run(&checkout, &task).await?;
+        Ok(TaskStartOutcome::Started(Box::new(
+            StartedTask::AutoReviewPullRequest { pr, task },
+        )))
+    }
 
-        self.github.post_pr_comment(pr, &codex_run.response).await?;
-        if let Err(err) = self.github.mark_pr_handled(pr).await {
-            error!(
-                pr = %pr.html_url,
-                error = ?err,
-                "failed to mark auto-review pull request handled after posting response"
-            );
-        }
+    async fn finish_auto_review_task(&self, pr: PullRequest, task: CodexTask) -> Result<()> {
+        let worktree = self.worktrees.prepare(&pr, &task).await?;
+        let result = async {
+            let codex_run = self.codex.run(worktree.path(), &task).await?;
 
-        if let Some((session_id, resume_command)) = codex_run.resume_command() {
-            info!(
-                pr = %pr.html_url,
-                author = %pr.author,
-                codex_session_id = %session_id,
-                codex_resume = %resume_command,
-                "responded to auto-review pull request"
-            );
-        } else {
-            info!(
-                pr = %pr.html_url,
-                author = %pr.author,
-                "responded to auto-review pull request"
-            );
+            self.github
+                .post_pr_comment(&pr, &codex_run.response)
+                .await?;
+            if let Err(err) = self.github.mark_pr_handled(&pr).await {
+                error!(
+                    pr = %pr.html_url,
+                    error = ?err,
+                    "failed to mark auto-review pull request handled after posting response"
+                );
+            }
+
+            if let Some((session_id, resume_command)) = codex_run.resume_command() {
+                info!(
+                    pr = %pr.html_url,
+                    author = %pr.author,
+                    codex_session_id = %session_id,
+                    codex_resume = %resume_command,
+                    "responded to auto-review pull request"
+                );
+            } else {
+                info!(
+                    pr = %pr.html_url,
+                    author = %pr.author,
+                    "responded to auto-review pull request"
+                );
+            }
+            Ok(())
         }
-        Ok(HandleOutcome::Responded)
+        .await;
+
+        self.cleanup_worktree(worktree, result).await
+    }
+
+    async fn cleanup_worktree(
+        &self,
+        worktree: PreparedWorktree,
+        task_result: Result<()>,
+    ) -> Result<()> {
+        let cleanup_result = self.worktrees.cleanup(worktree).await;
+        match (task_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(err)) => Err(err),
+            (Err(err), Ok(())) => Err(err),
+            (Err(err), Err(cleanup_err)) => {
+                error!(
+                    error = ?cleanup_err,
+                    "failed to clean up worktree after task failure"
+                );
+                Err(err)
+            }
+        }
     }
 
     fn can_start_task(&self) -> Result<bool> {
@@ -369,6 +541,244 @@ where
                 );
                 Ok(false)
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConcurrentMaid<G, R, C> {
+    maid: Maid<G, R, C>,
+    work: WorkQueue,
+}
+
+impl<G, R, C> ConcurrentMaid<G, R, C>
+where
+    G: GithubClient + Clone + 'static,
+    R: Worktrees + Clone + 'static,
+    C: CodexRunner + Clone + 'static,
+{
+    pub async fn run_once(&self) -> Result<PollReport> {
+        let notifications = self.maid.github.notifications().await?;
+        let mut report = PollReport {
+            seen: notifications.len(),
+            ..PollReport::default()
+        };
+        let mut seen_this_poll = HashSet::new();
+
+        for notification in notifications {
+            let work_key = work_key(&notification);
+            if !seen_this_poll.insert(work_key) {
+                report.skipped += 1;
+                continue;
+            }
+
+            match self.maid.task_for_notification(&notification).await {
+                Ok(TaskAssessment::Ready(intent)) => {
+                    self.start_or_defer(intent, &mut report).await;
+                }
+                Ok(TaskAssessment::Skipped) => report.skipped += 1,
+                Err(err) => {
+                    report.failed += 1;
+                    error!(
+                        notification_id = notification.id,
+                        error = ?err,
+                        "failed to handle notification"
+                    );
+                }
+            }
+        }
+
+        for repo in &self.maid.auto_review_repos {
+            let pull_requests = self.maid.github.open_pull_requests(repo).await?;
+            report.seen += pull_requests.len();
+
+            for pr in pull_requests {
+                match self.maid.task_for_auto_review_pr(&pr).await {
+                    Ok(TaskAssessment::Ready(intent)) => {
+                        self.start_or_defer(intent, &mut report).await;
+                    }
+                    Ok(TaskAssessment::Skipped) => report.skipped += 1,
+                    Err(err) => {
+                        report.failed += 1;
+                        error!(
+                            pr = %pr.html_url,
+                            error = ?err,
+                            "failed to handle auto-review pull request"
+                        );
+                    }
+                }
+            }
+        }
+
+        report.in_flight = self.work.in_flight();
+        Ok(report)
+    }
+
+    async fn start_or_defer(&self, intent: Box<TaskIntent>, report: &mut PollReport) {
+        let task_key = intent.task_key();
+        let Some(reservation) = self.work.try_reserve(task_key) else {
+            report.skipped += 1;
+            return;
+        };
+
+        match self.maid.start_task(intent).await {
+            Ok(TaskStartOutcome::Started(task)) => {
+                report.started += 1;
+                let maid = self.maid.clone();
+                tokio::spawn(async move {
+                    let _reservation = reservation;
+                    if let Err(err) = maid.finish_task(task.clone()).await {
+                        task.log_failure(&err);
+                    }
+                });
+            }
+            Ok(TaskStartOutcome::Skipped) => report.skipped += 1,
+            Err(err) => {
+                report.failed += 1;
+                error!(error = ?err, "failed to start task");
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WorkQueue {
+    slots: Arc<Semaphore>,
+    running: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl WorkQueue {
+    fn new(max_concurrent_requests: usize) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(max_concurrent_requests.max(1))),
+            running: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        }
+    }
+
+    fn try_reserve(&self, key: String) -> Option<WorkReservation> {
+        let permit = self.slots.clone().try_acquire_owned().ok()?;
+        let mut running = self.running.lock().expect("work queue lock is poisoned");
+        if !running.insert(key.clone()) {
+            return None;
+        }
+
+        Some(WorkReservation {
+            key,
+            running: self.running.clone(),
+            _permit: permit,
+        })
+    }
+
+    fn in_flight(&self) -> usize {
+        self.running
+            .lock()
+            .expect("work queue lock is poisoned")
+            .len()
+    }
+}
+
+struct WorkReservation {
+    key: String,
+    running: Arc<std::sync::Mutex<HashSet<String>>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for WorkReservation {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .expect("work queue lock is poisoned")
+            .remove(&self.key);
+    }
+}
+
+#[derive(Clone, Debug)]
+enum TaskAssessment {
+    Ready(Box<TaskIntent>),
+    Skipped,
+}
+
+#[derive(Clone, Debug)]
+enum TaskStartOutcome {
+    Started(Box<StartedTask>),
+    Skipped,
+}
+
+#[derive(Clone, Debug)]
+enum TaskIntent {
+    Mention {
+        notification: Notification,
+        mention: Box<CommentMention>,
+        task: CodexTask,
+    },
+    AutoReviewPullRequest {
+        pr: PullRequest,
+        task: CodexTask,
+    },
+}
+
+impl TaskIntent {
+    fn task_key(&self) -> String {
+        match self {
+            Self::Mention { task, .. } | Self::AutoReviewPullRequest { task, .. } => {
+                format!("task:{}", task.trigger_url())
+            }
+        }
+    }
+
+    fn log_task_limit_reached(&self) {
+        match self {
+            Self::Mention {
+                notification,
+                mention,
+                ..
+            } => info!(
+                notification_id = notification.id,
+                pr = %mention.pr.html_url,
+                mention = %mention.html_url,
+                "skipping mention because the 24-hour task limit is reached"
+            ),
+            Self::AutoReviewPullRequest { pr, .. } => info!(
+                pr = %pr.html_url,
+                author = %pr.author,
+                "skipping auto-review pull request because the 24-hour task limit is reached"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum StartedTask {
+    Mention {
+        notification: Notification,
+        mention: Box<CommentMention>,
+        task: CodexTask,
+    },
+    AutoReviewPullRequest {
+        pr: PullRequest,
+        task: CodexTask,
+    },
+}
+
+impl StartedTask {
+    fn log_failure(&self, err: &anyhow::Error) {
+        match self {
+            Self::Mention {
+                notification,
+                mention,
+                ..
+            } => error!(
+                notification_id = notification.id,
+                pr = %mention.pr.html_url,
+                mention = %mention.html_url,
+                error = ?err,
+                "failed to handle notification task"
+            ),
+            Self::AutoReviewPullRequest { pr, .. } => error!(
+                pr = %pr.html_url,
+                error = ?err,
+                "failed to handle auto-review pull request task"
+            ),
         }
     }
 }
@@ -411,17 +821,13 @@ fn mention_task_origin(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HandleOutcome {
-    Responded,
-    Skipped,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::{Result, anyhow};
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+    use tokio::sync::{Barrier, Notify};
 
     type FakeMentionResult = Option<Result<Option<CommentMention>, String>>;
     #[derive(Clone, Default)]
@@ -544,20 +950,24 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeRepos {
-        checkout: PathBuf,
+    struct FakeWorktrees {
+        worktree: PathBuf,
         calls: Arc<StdMutex<Vec<String>>>,
         error: Arc<StdMutex<Option<String>>>,
     }
 
     #[async_trait]
-    impl RepoPreparer for FakeRepos {
-        async fn prepare(&self, pr: &PullRequest) -> Result<PathBuf> {
+    impl Worktrees for FakeWorktrees {
+        async fn prepare(&self, pr: &PullRequest, _task: &CodexTask) -> Result<PreparedWorktree> {
             self.calls.lock().unwrap().push(pr.repo_key());
             if let Some(message) = self.error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
-            Ok(self.checkout.clone())
+            Ok(PreparedWorktree::new(self.worktree.clone()))
+        }
+
+        async fn cleanup(&self, _worktree: PreparedWorktree) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -569,14 +979,47 @@ mod tests {
 
     #[async_trait]
     impl CodexRunner for FakeCodex {
-        async fn run(&self, checkout: &Path, task: &CodexTask) -> Result<CodexRun> {
+        async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((checkout.to_path_buf(), task.clone()));
+                .push((worktree.to_path_buf(), task.clone()));
             if let Some(message) = self.error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
+            Ok(CodexRun {
+                response: "codex response".to_string(),
+                session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingCodex {
+        calls: Arc<StdMutex<Vec<(PathBuf, CodexTask)>>>,
+        entered: Arc<Barrier>,
+        release: Arc<Notify>,
+    }
+
+    impl BlockingCodex {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                entered: Arc::new(Barrier::new(2)),
+                release: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CodexRunner for BlockingCodex {
+        async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((worktree.to_path_buf(), task.clone()));
+            self.entered.wait().await;
+            self.release.notified().await;
             Ok(CodexRun {
                 response: "codex response".to_string(),
                 session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
@@ -628,13 +1071,21 @@ mod tests {
     }
 
     fn pr_with_author(author: &str) -> PullRequest {
+        pr_with_author_and_number(author, 1)
+    }
+
+    fn pr_with_number(number: u64) -> PullRequest {
+        pr_with_author_and_number("dionysuzx", number)
+    }
+
+    fn pr_with_author_and_number(author: &str, number: u64) -> PullRequest {
         PullRequest {
             owner: "o".to_string(),
             repo: "r".to_string(),
-            number: 1,
+            number,
             author: author.to_string(),
-            api_url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
-            html_url: "https://github.com/o/r/pull/1".to_string(),
+            api_url: format!("https://api.github.com/repos/o/r/pulls/{number}"),
+            html_url: format!("https://github.com/o/r/pull/{number}"),
             clone_url: "https://github.com/o/r.git".to_string(),
         }
     }
@@ -653,14 +1104,17 @@ mod tests {
         }
     }
 
-    fn maid(
+    fn maid<C>(
         github: FakeGithub,
-        repos: FakeRepos,
-        codex: FakeCodex,
-    ) -> Maid<FakeGithub, FakeRepos, FakeCodex> {
+        worktrees: FakeWorktrees,
+        codex: C,
+    ) -> Maid<FakeGithub, FakeWorktrees, C>
+    where
+        C: CodexRunner,
+    {
         Maid::new(
             github,
-            repos,
+            worktrees,
             codex,
             "maid-bot",
             ["dionysuzx"],
@@ -682,6 +1136,16 @@ mod tests {
         }
     }
 
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("condition was not met before timeout");
+    }
+
     #[test]
     fn builds_codex_resume_command_from_session_id() {
         let run = CodexRun {
@@ -699,23 +1163,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task_keys_allow_distinct_mentions_on_the_same_pull_request() {
+        let first_mention = mention_with_comment("dionysuzx", "@maid-bot first", "2");
+        let second_mention = mention_with_comment("dionysuzx", "@maid-bot second", "3");
+        let first = TaskIntent::Mention {
+            notification: notification_with_comment("n1", "2"),
+            task: CodexTask {
+                pr_url: first_mention.pr.html_url.clone(),
+                origin: CodexTaskOrigin::Mention {
+                    mention_url: first_mention.html_url.clone(),
+                    raw_body: first_mention.body.clone(),
+                    cleaned_text: "first".to_string(),
+                },
+            },
+            mention: Box::new(first_mention),
+        };
+        let second = TaskIntent::Mention {
+            notification: notification_with_comment("n1", "3"),
+            task: CodexTask {
+                pr_url: second_mention.pr.html_url.clone(),
+                origin: CodexTaskOrigin::Mention {
+                    mention_url: second_mention.html_url.clone(),
+                    raw_body: second_mention.body.clone(),
+                    cleaned_text: "second".to_string(),
+                },
+            },
+            mention: Box::new(second_mention),
+        };
+
+        assert_ne!(first.task_key(), second.task_key());
+    }
+
     #[tokio::test]
     async fn responds_then_marks_notification_handled() {
-        let checkout = PathBuf::from("/tmp/maid-test-checkout");
+        let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention(
             "dionysuzx",
             "@maid-bot please review this PR",
         ))));
-        let repos = FakeRepos {
-            checkout: checkout.clone(),
+        let worktrees = FakeWorktrees {
+            worktree: worktree.clone(),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -738,9 +1234,9 @@ mod tests {
                 .unwrap()
                 .contains("https://api.github.com/repos/o/r/issues/comments/2")
         );
-        assert_eq!(*repos.calls.lock().unwrap(), vec!["o/r"]);
+        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
-        assert_eq!(calls[0].0, checkout);
+        assert_eq!(calls[0].0, worktree);
         assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/pull/1");
         assert_eq!(
             calls[0].1.origin,
@@ -754,21 +1250,21 @@ mod tests {
 
     #[tokio::test]
     async fn trusted_operate_mention_uses_operator_task_origin() {
-        let checkout = PathBuf::from("/tmp/maid-test-checkout");
+        let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention(
             "dionysuzx",
             "@maid-bot /operate implement and push",
         ))));
-        let repos = FakeRepos {
-            checkout: checkout.clone(),
+        let worktrees = FakeWorktrees {
+            worktree: worktree.clone(),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -776,7 +1272,7 @@ mod tests {
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
         let calls = codex.calls.lock().unwrap();
-        assert_eq!(calls[0].0, checkout);
+        assert_eq!(calls[0].0, worktree);
         assert_eq!(
             calls[0].1.origin,
             CodexTaskOrigin::OperatorMention {
@@ -800,17 +1296,17 @@ mod tests {
 
     #[tokio::test]
     async fn responds_to_opened_pr_from_auto_review_account() {
-        let checkout = PathBuf::from("/tmp/maid-test-checkout");
+        let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
-        let repos = FakeRepos {
-            checkout: checkout.clone(),
+        let worktrees = FakeWorktrees {
+            worktree: worktree.clone(),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -834,9 +1330,9 @@ mod tests {
                 .unwrap()
                 .contains("https://github.com/o/r/pull/1")
         );
-        assert_eq!(*repos.calls.lock().unwrap(), vec!["o/r"]);
+        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
-        assert_eq!(calls[0].0, checkout);
+        assert_eq!(calls[0].0, worktree);
         assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/pull/1");
         assert_eq!(
             calls[0].1.origin,
@@ -847,19 +1343,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_run_returns_after_starting_work() {
+        let worktree = PathBuf::from("/tmp/maid-test-worktree");
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let worktrees = FakeWorktrees {
+            worktree,
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = BlockingCodex::new();
+        let entered = codex.entered.clone();
+        let release = codex.release.clone();
+        let maid = maid(github.clone(), worktrees, codex).into_concurrent(1);
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.started, 1);
+        assert_eq!(report.responded, 0);
+        assert_eq!(report.in_flight, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+
+        entered.wait().await;
+        assert!(
+            github.posts.lock().unwrap().is_empty(),
+            "Codex is still running, so the response should not be posted yet"
+        );
+
+        release.notify_waiters();
+        wait_until(|| github.posts.lock().unwrap().len() == 1).await;
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_run_respects_max_concurrent_requests() {
+        let worktree = PathBuf::from("/tmp/maid-test-worktree");
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr_with_number(1), pr_with_number(2)];
+        let worktrees = FakeWorktrees {
+            worktree,
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = BlockingCodex::new();
+        let entered = codex.entered.clone();
+        let release = codex.release.clone();
+        let maid = maid(github.clone(), worktrees, codex.clone()).into_concurrent(1);
+
+        let first_report = maid.run_once().await.unwrap();
+
+        assert_eq!(first_report.seen, 2);
+        assert_eq!(first_report.started, 1);
+        assert_eq!(first_report.skipped, 1);
+        assert_eq!(first_report.in_flight, 1);
+        entered.wait().await;
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+
+        release.notify_waiters();
+        wait_until(|| github.handled_prs.lock().unwrap().len() == 1).await;
+
+        let second_report = maid.run_once().await.unwrap();
+
+        assert_eq!(second_report.started, 1);
+        assert_eq!(second_report.skipped, 1);
+        entered.wait().await;
+        release.notify_waiters();
+        wait_until(|| github.handled_prs.lock().unwrap().len() == 2).await;
+    }
+
+    #[tokio::test]
     async fn leaves_eligible_mention_pending_when_task_limit_is_reached() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/unused"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
         let task_starts = at_limit_recorder();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .with_task_start_recorder(task_starts.clone())
             .run_once()
             .await
@@ -870,7 +1436,7 @@ mod tests {
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
         assert!(github.events.lock().unwrap().is_empty());
-        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -878,15 +1444,15 @@ mod tests {
     async fn leaves_auto_review_pr_pending_when_task_limit_is_reached() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/unused"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
         let task_starts = at_limit_recorder();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .with_task_start_recorder(task_starts.clone())
             .run_once()
             .await
@@ -898,7 +1464,7 @@ mod tests {
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
         assert!(github.events.lock().unwrap().is_empty());
-        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -906,14 +1472,14 @@ mod tests {
     async fn skips_opened_pr_from_account_without_auto_review() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr_with_author("mayushii")];
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/unused"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -922,7 +1488,7 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
-        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -935,14 +1501,14 @@ mod tests {
             .lock()
             .unwrap()
             .insert("https://github.com/o/r/pull/1".to_string());
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/unused"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -952,7 +1518,7 @@ mod tests {
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
         assert!(github.events.lock().unwrap().is_empty());
-        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -960,14 +1526,14 @@ mod tests {
     async fn ignores_self_authored_opened_prs() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr_with_author("maid-bot")];
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/unused"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -976,7 +1542,7 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
-        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -985,14 +1551,14 @@ mod tests {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("maid-bot", "@maid-bot review"))));
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/unused"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -1000,7 +1566,7 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
-        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -1008,14 +1574,14 @@ mod tests {
     async fn marks_irrelevant_unread_notifications_handled() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![irrelevant_notification("n1")];
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/unused"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -1023,7 +1589,7 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -1033,14 +1599,14 @@ mod tests {
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() =
             Some(Ok(Some(mention("not-trusted", "@maid-bot review"))));
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/unused"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -1048,7 +1614,7 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
         assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
-        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -1057,14 +1623,17 @@ mod tests {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("Dionysuzx", "@maid-bot review"))));
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/checkout"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos, codex).run_once().await.unwrap();
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
 
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
@@ -1075,13 +1644,13 @@ mod tests {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1"), notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/checkout"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
-        let maid = maid(github.clone(), repos, codex);
+        let maid = maid(github.clone(), worktrees, codex);
 
         let first_report = maid.run_once().await.unwrap();
         let second_report = maid.run_once().await.unwrap();
@@ -1103,13 +1672,13 @@ mod tests {
             "@maid-bot first",
             "2",
         ))));
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/checkout"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
-        let maid = maid(github.clone(), repos, codex);
+        let maid = maid(github.clone(), worktrees, codex);
 
         let first_report = maid.run_once().await.unwrap();
 
@@ -1138,14 +1707,14 @@ mod tests {
             .lock()
             .unwrap()
             .insert("https://api.github.com/repos/o/r/issues/comments/2".to_string());
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/checkout"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -1153,7 +1722,7 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
         assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
-        assert!(repos.calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -1162,14 +1731,14 @@ mod tests {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/checkout"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(Some("clone failed".to_string()))),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos, codex.clone())
+        let report = maid(github.clone(), worktrees, codex.clone())
             .run_once()
             .await
             .unwrap();
@@ -1185,15 +1754,18 @@ mod tests {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/checkout"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
         *codex.error.lock().unwrap() = Some("codex failed".to_string());
 
-        let report = maid(github.clone(), repos, codex).run_once().await.unwrap();
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
 
         assert_eq!(report.failed, 1);
         assert!(github.posts.lock().unwrap().is_empty());
@@ -1206,14 +1778,17 @@ mod tests {
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
         *github.post_error.lock().unwrap() = Some("post failed".to_string());
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/checkout"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos, codex).run_once().await.unwrap();
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
 
         assert_eq!(report.failed, 1);
         assert!(github.marks.lock().unwrap().is_empty());
@@ -1226,14 +1801,17 @@ mod tests {
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
         *github.handled_error.lock().unwrap() = Some("reaction failed".to_string());
-        let repos = FakeRepos {
-            checkout: PathBuf::from("/tmp/checkout"),
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), repos, codex).run_once().await.unwrap();
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
 
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
