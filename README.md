@@ -25,7 +25,8 @@ just start
 ## Configuration
 
 Runtime config lives at `~/.maid/config.toml`. The required fields are
-`bot_login` and `master_accounts`.
+`bot_login`, `master_accounts`, `codex_model`, and
+`codex_reasoning_effort`. The `[codex_prompts]` section is also required.
 
 - `auto_review_accounts`: master accounts eligible for automatic PR reviews;
   defaults to `master_accounts`.
