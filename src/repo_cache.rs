@@ -87,9 +87,10 @@ impl RepoPreparer for GitRepoCache {
         self.run_git(Some(&checkout), &["fetch", "--prune", "origin", &pr_head])
             .await
             .with_context(|| format!("failed to fetch PR {}", pr.html_url))?;
+        let branch = format!("maid/pr-{}", pr.number);
         self.run_git(
             Some(&checkout),
-            &["switch", "--detach", "--force", "FETCH_HEAD"],
+            &["switch", "--discard-changes", "-C", &branch, "FETCH_HEAD"],
         )
         .await?;
         self.run_git(Some(&checkout), &["clean", "-fdx"]).await?;

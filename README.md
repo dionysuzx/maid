@@ -5,12 +5,18 @@ bot account, checks out eligible PRs into a local cache, runs `codex`, and posts
 Codex's final answer as a normal PR comment.
 
 Maid responds when an allowed master account mentions the bot in a PR comment.
-Automatic reviews can be enabled for allowlisted repos.
+Automatic reviews can be enabled for allowlisted repos. Trusted master mentions
+can also start an operator request with `/operate`, which lets Codex use local
+tools such as `git` and `gh` to make changes, commit, push, or open pull
+requests when the request calls for it. Maid still posts Codex's final status
+back to the pull request.
 
 ## Prerequisites
 
 - A GitHub bot account authenticated with `gh`; Maid uses that account's token.
 - Rust/Cargo, `git`, `gh`, `codex`, `just`, and `nvim` on `PATH`.
+- For `/operate`, the Maid machine's `gh` auth and git config must be able to
+  commit, push, and open pull requests non-interactively.
 
 ## Quick Start
 
@@ -20,6 +26,14 @@ cd maid
 just init
 just config
 just start
+```
+
+For `/operate`, verify the publishing setup before starting Maid:
+
+```sh
+gh auth status --hostname github.com
+git config --global user.name
+git config --global user.email
 ```
 
 ## Configuration
@@ -40,6 +54,8 @@ Runtime config lives at `~/.maid/config.toml`. The required fields are
   These are the full prompts Maid sends after placeholder interpolation.
   Mention templates support `{{mention_url}}`, `{{pr_url}}`, `{{raw_body}}`,
   and `{{cleaned_text}}`. Automatic review templates support `{{pr_url}}`
-  and `{{author}}`.
+  and `{{author}}`. Operator templates support `{{bot_login}}`,
+  `{{trigger_author}}`, `{{mention_url}}`, `{{pr_url}}`, `{{raw_body}}`,
+  `{{request_text}}`, and `{{operator_trigger}}`.
 
 See [config.example.toml](config.example.toml) for every option.

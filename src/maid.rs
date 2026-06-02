@@ -237,11 +237,7 @@ where
         let checkout = self.repos.prepare(&mention.pr).await?;
         let task = CodexTask {
             pr_url: mention.pr.html_url.clone(),
-            origin: CodexTaskOrigin::Mention {
-                mention_url: mention.html_url.clone(),
-                raw_body: request.raw_body,
-                cleaned_text: request.cleaned_text,
-            },
+            origin: mention_task_origin(&mention, request, &self.bot_login),
         };
         let codex_run = self.codex.run(&checkout, &task).await?;
 
@@ -388,6 +384,28 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
         .map(|login| login.into().trim().to_ascii_lowercase())
         .filter(|login| !login.is_empty())
         .collect()
+}
+
+fn mention_task_origin(
+    mention: &CommentMention,
+    request: MentionRequest,
+    bot_login: &str,
+) -> CodexTaskOrigin {
+    if let Some(operator_text) = request.operator_text() {
+        return CodexTaskOrigin::OperatorMention {
+            mention_url: mention.html_url.clone(),
+            raw_body: request.raw_body,
+            request_text: operator_text,
+            trigger_author: mention.author.clone(),
+            bot_login: bot_login.to_string(),
+        };
+    }
+
+    CodexTaskOrigin::Mention {
+        mention_url: mention.html_url.clone(),
+        raw_body: request.raw_body,
+        cleaned_text: request.cleaned_text,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -728,6 +746,52 @@ mod tests {
                 raw_body: "@maid-bot please review this PR".to_string(),
                 cleaned_text: "please review this PR".to_string(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_operate_mention_uses_operator_task_origin() {
+        let checkout = PathBuf::from("/tmp/maid-test-checkout");
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention(
+            "dionysuzx",
+            "@maid-bot /operate implement and push",
+        ))));
+        let repos = FakeRepos {
+            checkout: checkout.clone(),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), repos.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        let calls = codex.calls.lock().unwrap();
+        assert_eq!(calls[0].0, checkout);
+        assert_eq!(
+            calls[0].1.origin,
+            CodexTaskOrigin::OperatorMention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot /operate implement and push".to_string(),
+                request_text: "implement and push".to_string(),
+                trigger_author: "dionysuzx".to_string(),
+                bot_login: "maid-bot".to_string(),
+            }
+        );
+        let templates = crate::domain::CodexPromptTemplates {
+            mention: String::new(),
+            pull_request_opened: String::new(),
+            operator_mention: "operate {{request_text}} for {{trigger_author}}".to_string(),
+        };
+        assert_eq!(
+            calls[0].1.prompt(&templates).unwrap(),
+            "operate implement and push for dionysuzx"
         );
     }
 
