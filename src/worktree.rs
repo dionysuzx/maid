@@ -5,7 +5,6 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
-use fs2::FileExt;
 use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
@@ -93,7 +92,7 @@ impl GitWorktrees {
                 .write(true)
                 .open(&lock_path)
                 .with_context(|| format!("failed to open {}", lock_path.display()))?;
-            file.lock_exclusive()
+            file.lock()
                 .with_context(|| format!("failed to lock {}", lock_path.display()))?;
             Ok(RepoLock { _file: file })
         })
