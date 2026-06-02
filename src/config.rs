@@ -26,8 +26,8 @@ pub struct Config {
     pub task_start_ledger_path: PathBuf,
     pub task_limit_per_24h: Option<usize>,
     pub codex_bin: String,
-    pub codex_model: Option<String>,
-    pub codex_reasoning_effort: Option<String>,
+    pub codex_model: String,
+    pub codex_reasoning_effort: String,
     pub codex_prompts: CodexPromptTemplates,
     pub github_api_ip: Option<IpAddr>,
 }
@@ -96,9 +96,6 @@ impl Config {
         let auto_implement_label =
             non_empty(file.auto_implement_label).unwrap_or_else(|| "maid".to_string());
         let auto_implement_window_days = file.auto_implement_window_days.unwrap_or(30).max(1);
-        let github_token = gh_token_for(&bot_login)?;
-        let implementation_actor =
-            implementation_actor(file.implementation_actor, &bot_login, &github_token)?;
         let cache_dir = non_empty(file.cache_dir)
             .map(|path| expand_home(&path))
             .transpose()?
@@ -106,8 +103,17 @@ impl Config {
         let poll_seconds = file.poll_seconds.unwrap_or(20).max(10);
         let task_limit_per_24h = file.task_limit_per_24h;
         let codex_bin = non_empty(file.codex_bin).unwrap_or_else(|| "codex".to_string());
-        let codex_model = non_empty(file.codex_model);
-        let codex_reasoning_effort = non_empty(file.codex_reasoning_effort);
+        let codex_model = required_string(file.codex_model, "codex_model")
+            .with_context(|| format!("codex_model is required in {}", config_path.display()))?;
+        let codex_reasoning_effort =
+            required_string(file.codex_reasoning_effort, "codex_reasoning_effort").with_context(
+                || {
+                    format!(
+                        "codex_reasoning_effort is required in {}",
+                        config_path.display()
+                    )
+                },
+            )?;
         let codex_prompts =
             required_codex_prompts(file.codex_prompts, !auto_implement_repos.is_empty())
                 .with_context(|| {
@@ -117,6 +123,9 @@ impl Config {
             .map(|value| value.parse::<IpAddr>())
             .transpose()
             .context("github_api_ip must be an IPv4 or IPv6 address")?;
+        let github_token = gh_token_for(&bot_login)?;
+        let implementation_actor =
+            implementation_actor(file.implementation_actor, &bot_login, &github_token)?;
 
         Ok(Self {
             github_token,
@@ -286,6 +295,10 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn required_string(value: Option<String>, key: &str) -> Result<String> {
+    non_empty(value).ok_or_else(|| anyhow!("{key} must not be empty"))
 }
 
 fn required_logins(value: Option<Vec<String>>, key: &str) -> Result<Vec<String>> {
@@ -650,6 +663,16 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
             Some("maid-bot")
         );
         assert_eq!(non_empty(Some("  ".to_string())), None);
+    }
+
+    #[test]
+    fn requires_non_empty_strings() {
+        assert_eq!(
+            required_string(Some("  gpt-test  ".to_string()), "codex_model").unwrap(),
+            "gpt-test"
+        );
+        assert!(required_string(None, "codex_model").is_err());
+        assert!(required_string(Some("  ".to_string()), "codex_model").is_err());
     }
 
     #[test]
