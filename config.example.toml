@@ -13,8 +13,52 @@ poll_seconds = 20
 cache_dir = "~/.maid/cache"
 codex_bin = "codex"
 
+# Optional. Omit these to let Codex use its own config defaults.
+codex_model = "gpt-5.5"
+codex_reasoning_effort = "high"
+
 # Optional. Omitted by default for no task limit. Set to 0 to pause new starts.
 # task_limit_per_24h = 5
 
 # Optional. Leave omitted unless you need to pin api.github.com.
 # github_api_ip = "127.0.0.1"
+
+# Required. These templates are the full prompts Maid sends to Codex.
+# Supported mention placeholders:
+# {{mention_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
+# Supported pull_request_opened placeholders:
+# {{pr_url}}, {{author}}
+[codex_prompts]
+mention = """
+You are responding to a GitHub pull request mention.
+
+Inspect the checkout in your current working directory and answer the request.
+Return only the GitHub comment body to post. Do not include tool logs or wrappers.
+
+Mention URL:
+{{mention_url}}
+
+Pull request URL:
+{{pr_url}}
+
+Raw mention body:
+{{raw_body}}
+
+Cleaned request text:
+{{cleaned_text}}
+"""
+pull_request_opened = """
+You are responding automatically to a GitHub pull request opened by a trusted account.
+
+Inspect the checkout in your current working directory and review the pull request.
+Return only the GitHub comment body to post. Do not include tool logs or wrappers.
+
+Pull request URL:
+{{pr_url}}
+
+Opened by:
+{{author}}
+
+Review request:
+please review
+"""
