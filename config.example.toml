@@ -13,7 +13,7 @@ poll_seconds = 20
 cache_dir = "~/.maid/cache"
 codex_bin = "codex"
 
-# Required. These values are passed to Codex and shown in posted footers.
+# Required. These values are passed to Codex.
 codex_model = "gpt-5.5"
 codex_reasoning_effort = "high"
 
