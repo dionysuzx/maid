@@ -175,6 +175,10 @@ impl CodexTask {
             CodexTaskOrigin::PullRequestOpened { .. } => &self.pr_url,
         }
     }
+
+    pub fn task_kind(&self) -> &'static str {
+        self.origin.task_kind()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +198,16 @@ pub enum CodexTaskOrigin {
     PullRequestOpened {
         author: String,
     },
+}
+
+impl CodexTaskOrigin {
+    pub fn task_kind(&self) -> &'static str {
+        match self {
+            Self::Mention { .. } => "mention",
+            Self::OperatorMention { .. } => "operator_mention",
+            Self::PullRequestOpened { .. } => "pull_request_opened",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -420,6 +434,37 @@ mod tests {
         assert_eq!(
             task.prompt(&templates).unwrap(),
             "maid-bot|dionysuzx|https://github.com/o/r/pull/1#issuecomment-2|https://github.com/o/r/pull/1|@maid-bot /operate ship it|ship it"
+        );
+    }
+
+    #[test]
+    fn reports_task_kind_for_logging() {
+        assert_eq!(
+            CodexTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot review".to_string(),
+                cleaned_text: "review".to_string(),
+            }
+            .task_kind(),
+            "mention"
+        );
+        assert_eq!(
+            CodexTaskOrigin::OperatorMention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot /operate ship it".to_string(),
+                request_text: "ship it".to_string(),
+                trigger_author: "dionysuzx".to_string(),
+                bot_login: "maid-bot".to_string(),
+            }
+            .task_kind(),
+            "operator_mention"
+        );
+        assert_eq!(
+            CodexTaskOrigin::PullRequestOpened {
+                author: "dionysuzx".to_string(),
+            }
+            .task_kind(),
+            "pull_request_opened"
         );
     }
 
