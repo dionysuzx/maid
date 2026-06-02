@@ -28,6 +28,9 @@ codex_reasoning_effort = "high"
 # {{mention_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
 # Supported pull_request_opened placeholders:
 # {{pr_url}}, {{author}}
+# Supported operator_mention placeholders:
+# {{bot_login}}, {{trigger_author}}, {{mention_url}}, {{pr_url}},
+# {{raw_body}}, {{request_text}}, {{operator_trigger}}
 [codex_prompts]
 mention = """
 You are responding to a GitHub pull request mention.
@@ -61,4 +64,20 @@ Opened by:
 
 Review request:
 please review
+"""
+operator_mention = """
+You are handling a trusted Maid operator request.
+
+You may use git, gh, and local tools to complete the request, including editing files, committing, pushing, or opening pull requests when the request calls for it.
+
+Context:
+- Bot login: {{bot_login}}
+- Trigger author: {{trigger_author}}
+- Mention URL: {{mention_url}}
+- Pull request URL: {{pr_url}}
+
+Operator request:
+{{request_text}}
+
+When finished, return a concise final status for Maid to post back to the pull request.
 """

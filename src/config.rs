@@ -114,6 +114,7 @@ struct ConfigFile {
 struct CodexPromptsFile {
     mention: Option<String>,
     pull_request_opened: Option<String>,
+    operator_mention: Option<String>,
 }
 
 impl ConfigFile {
@@ -185,17 +186,22 @@ fn optional_repos(value: Option<Vec<String>>, key: &str) -> Result<Vec<RepoSlug>
 
 fn required_codex_prompts(value: Option<CodexPromptsFile>) -> Result<CodexPromptTemplates> {
     let Some(prompts) = value else {
-        bail!("codex_prompts must include mention and pull_request_opened templates");
+        bail!(
+            "codex_prompts must include mention, pull_request_opened, and operator_mention templates"
+        );
     };
 
     let mention = non_empty(prompts.mention)
         .ok_or_else(|| anyhow!("codex_prompts.mention must not be empty"))?;
     let pull_request_opened = non_empty(prompts.pull_request_opened)
         .ok_or_else(|| anyhow!("codex_prompts.pull_request_opened must not be empty"))?;
+    let operator_mention = non_empty(prompts.operator_mention)
+        .ok_or_else(|| anyhow!("codex_prompts.operator_mention must not be empty"))?;
 
     Ok(CodexPromptTemplates {
         mention,
         pull_request_opened,
+        operator_mention,
     })
 }
 
@@ -282,6 +288,7 @@ github_api_ip = "127.0.0.1"
 [codex_prompts]
 mention = "mention {{{{cleaned_text}}}}"
 pull_request_opened = "review {{{{pr_url}}}}"
+operator_mention = "operator {{{{request_text}}}}"
 "#
         )
         .unwrap();
@@ -313,6 +320,10 @@ pull_request_opened = "review {{{{pr_url}}}}"
             codex_prompts.pull_request_opened.as_deref(),
             Some("review {{pr_url}}")
         );
+        assert_eq!(
+            codex_prompts.operator_mention.as_deref(),
+            Some("operator {{request_text}}")
+        );
         assert_eq!(config.github_api_ip.as_deref(), Some("127.0.0.1"));
     }
 
@@ -336,6 +347,7 @@ pull_request_opened = "review {{{{pr_url}}}}"
             required_codex_prompts(Some(CodexPromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: None,
+                operator_mention: Some("operate".to_string()),
             }))
             .is_err()
         );
@@ -343,6 +355,15 @@ pull_request_opened = "review {{{{pr_url}}}}"
             required_codex_prompts(Some(CodexPromptsFile {
                 mention: Some(" ".to_string()),
                 pull_request_opened: Some("review".to_string()),
+                operator_mention: Some("operate".to_string()),
+            }))
+            .is_err()
+        );
+        assert!(
+            required_codex_prompts(Some(CodexPromptsFile {
+                mention: Some("mention".to_string()),
+                pull_request_opened: Some("review".to_string()),
+                operator_mention: Some(" ".to_string()),
             }))
             .is_err()
         );
@@ -351,11 +372,13 @@ pull_request_opened = "review {{{{pr_url}}}}"
             required_codex_prompts(Some(CodexPromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: Some("review".to_string()),
+                operator_mention: Some("operate".to_string()),
             }))
             .unwrap(),
             CodexPromptTemplates {
                 mention: "mention".to_string(),
                 pull_request_opened: "review".to_string(),
+                operator_mention: "operate".to_string(),
             }
         );
     }
