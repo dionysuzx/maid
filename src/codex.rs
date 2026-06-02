@@ -168,6 +168,7 @@ impl CodexJsonEvents {
                 info!(
                     pr = %task.pr_url,
                     trigger = %task.trigger_url(),
+                    task_kind = task.task_kind(),
                     checkout = %checkout.display(),
                     codex_session_id = %session_id,
                     "codex session started"

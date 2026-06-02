@@ -226,19 +226,21 @@ where
             return Ok(HandleOutcome::Skipped);
         }
 
+        let task = CodexTask {
+            pr_url: mention.pr.html_url.clone(),
+            origin: mention_task_origin(&mention, request, &self.bot_login),
+        };
+
         self.github.mark_mention_started(&mention).await?;
         info!(
             notification_id = notification.id,
             pr = %mention.pr.html_url,
             mention = %mention.html_url,
-            "started handling mention"
+            task_kind = task.task_kind(),
+            "started handling pull request mention"
         );
 
         let checkout = self.repos.prepare(&mention.pr).await?;
-        let task = CodexTask {
-            pr_url: mention.pr.html_url.clone(),
-            origin: mention_task_origin(&mention, request, &self.bot_login),
-        };
         let codex_run = self.codex.run(&checkout, &task).await?;
 
         self.github
@@ -313,19 +315,20 @@ where
         }
 
         self.github.mark_pr_started(pr).await?;
-        info!(
-            pr = %pr.html_url,
-            author = %pr.author,
-            "started handling auto-review pull request"
-        );
-
-        let checkout = self.repos.prepare(pr).await?;
         let task = CodexTask {
             pr_url: pr.html_url.clone(),
             origin: CodexTaskOrigin::PullRequestOpened {
                 author: pr.author.clone(),
             },
         };
+        info!(
+            pr = %pr.html_url,
+            author = %pr.author,
+            task_kind = task.task_kind(),
+            "started handling auto-review pull request"
+        );
+
+        let checkout = self.repos.prepare(pr).await?;
         let codex_run = self.codex.run(&checkout, &task).await?;
 
         self.github.post_pr_comment(pr, &codex_run.response).await?;
