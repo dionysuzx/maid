@@ -56,7 +56,12 @@ async fn main() -> Result<()> {
         )
         .with_issue_publish_mode(issue_git_auth, issue_commit_identity)
         .with_expected_git_identity(expected_git_identity),
-        CodexCli::new(config.codex_bin.clone()),
+        CodexCli::with_options(
+            config.codex_bin.clone(),
+            config.codex_model.clone(),
+            config.codex_reasoning_effort.clone(),
+            config.codex_prompts.clone(),
+        ),
         MaidSettings {
             bot_login: config.bot_login.clone(),
             master_accounts: config.master_accounts.clone(),

@@ -36,7 +36,7 @@ just start
 ## Configuration
 
 Runtime config lives at `~/.maid/config.toml`. The required fields are
-`bot_login` and `master_accounts`.
+`bot_login`, `master_accounts`, and `[codex_prompts]`.
 
 - `auto_review_accounts`: master accounts eligible for automatic PR reviews;
   defaults to `master_accounts`.
@@ -53,6 +53,17 @@ Runtime config lives at `~/.maid/config.toml`. The required fields are
 - `task_limit_per_24h`: optional rolling 24-hour cap across mention, automatic
   review, and issue implementation tasks. Omit it for no limit; set it to `0` to
   pause new task starts.
+- `codex_model` and `codex_reasoning_effort`: optional Codex invocation
+  overrides. When omitted, Codex uses its own config defaults.
+- `[codex_prompts]`: required prompt templates for the internal Codex run.
+  Mention templates support `{{mention_url}}`, `{{pr_url}}`, `{{raw_body}}`,
+  and `{{cleaned_text}}`. Automatic review templates support `{{pr_url}}` and
+  `{{author}}`. Issue implementation templates support `{{issue_url}}`,
+  `{{branch}}`, `{{title}}`, and `{{body}}`.
+
+Posted comments include a small Codex metadata footer with the configured model,
+reasoning effort, session id, and the input prompt collapsed behind a details
+block.
 
 `auto_implement_accounts` keeps labeled issues from untrusted authors out of the
 write-capable Codex path. For automatic issue implementation, the configured

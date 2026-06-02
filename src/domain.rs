@@ -157,83 +157,40 @@ pub struct CodexTask {
 }
 
 impl CodexTask {
-    pub fn prompt(&self) -> String {
+    pub fn prompt(&self, templates: &CodexPromptTemplates) -> Result<String> {
         match &self.origin {
             CodexTaskOrigin::Mention {
                 mention_url,
                 raw_body,
                 cleaned_text,
-            } => format!(
-                "\
-You are responding to a GitHub pull request mention.
-
-Inspect the checkout in your current working directory and answer the request.
-Return only the GitHub comment body to post. Do not include tool logs or wrappers.
-
-Mention URL:
-{mention_url}
-
-Pull request URL:
-{subject_url}
-
-Raw mention body:
-{raw_body}
-
-Cleaned request text:
-{cleaned_text}
-",
-                mention_url = mention_url,
-                subject_url = self.subject_url,
-                raw_body = raw_body,
-                cleaned_text = cleaned_text,
+            } => render_template(
+                &templates.mention,
+                &[
+                    ("mention_url", mention_url.as_str()),
+                    ("pr_url", self.subject_url.as_str()),
+                    ("raw_body", raw_body.as_str()),
+                    ("cleaned_text", cleaned_text.as_str()),
+                ],
             ),
-            CodexTaskOrigin::PullRequestOpened { author } => format!(
-                "\
-You are responding automatically to a GitHub pull request opened by a trusted account.
-
-Inspect the checkout in your current working directory and review the pull request.
-Return only the GitHub comment body to post. Do not include tool logs or wrappers.
-
-Pull request URL:
-{subject_url}
-
-Opened by:
-{author}
-
-Review request:
-please review
-",
-                subject_url = self.subject_url,
-                author = author,
+            CodexTaskOrigin::PullRequestOpened { author } => render_template(
+                &templates.pull_request_opened,
+                &[
+                    ("pr_url", self.subject_url.as_str()),
+                    ("author", author.as_str()),
+                ],
             ),
             CodexTaskOrigin::IssueImplementation {
                 title,
                 body,
                 branch,
-            } => format!(
-                "\
-You are implementing a GitHub issue from a trusted label trigger.
-
-Inspect the checkout in your current working directory, make the smallest code change that correctly implements the issue, and run the relevant checks when practical.
-Leave your changes in the working tree. Do not commit, push, create branches, or open pull requests.
-Return only a concise pull request body describing what changed and what you checked. Do not include tool logs or wrappers.
-
-Issue URL:
-{subject_url}
-
-Branch Maid will publish:
-{branch}
-
-Issue title:
-{title}
-
-Issue body:
-{body}
-",
-                subject_url = self.subject_url,
-                branch = branch,
-                title = title,
-                body = body,
+            } => render_template(
+                &templates.issue_implementation,
+                &[
+                    ("issue_url", self.subject_url.as_str()),
+                    ("branch", branch.as_str()),
+                    ("title", title.as_str()),
+                    ("body", body.as_str()),
+                ],
             ),
         }
     }
@@ -262,6 +219,36 @@ pub enum CodexTaskOrigin {
         body: String,
         branch: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexPromptTemplates {
+    pub mention: String,
+    pub pull_request_opened: String,
+    pub issue_implementation: String,
+}
+
+fn render_template(template: &str, values: &[(&str, &str)]) -> Result<String> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(start) = rest.find("{{") {
+        rendered.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            return Err(anyhow!("Codex prompt template has an unclosed placeholder"));
+        };
+
+        let name = after_open[..end].trim();
+        let Some((_, value)) = values.iter().find(|(key, _)| *key == name) else {
+            return Err(anyhow!("unknown Codex prompt template placeholder: {name}"));
+        };
+        rendered.push_str(value);
+        rest = &after_open[end + 2..];
+    }
+
+    rendered.push_str(rest);
+    Ok(rendered)
 }
 
 pub fn validate_repo_name_part(value: &str, label: &str) -> Result<()> {
@@ -347,7 +334,7 @@ mod tests {
             },
         };
 
-        let prompt = task.prompt();
+        let prompt = task.prompt(&test_prompts()).unwrap();
         assert!(prompt.contains("Mention URL:\nhttps://github.com/o/r/pull/1#issuecomment-2"));
         assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Raw mention body:\n@maid-bot review"));
@@ -363,11 +350,67 @@ mod tests {
             },
         };
 
-        let prompt = task.prompt();
-        assert!(prompt.contains("automatically to a GitHub pull request"));
+        let prompt = task.prompt(&test_prompts()).unwrap();
         assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Opened by:\ndionysuzx"));
         assert!(prompt.contains("Review request:\nplease review"));
+    }
+
+    #[test]
+    fn renders_configured_codex_prompt_templates() {
+        let task = CodexTask {
+            subject_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: CodexTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot review".to_string(),
+                cleaned_text: "review".to_string(),
+            },
+        };
+        let templates = CodexPromptTemplates {
+            mention: "PR={{ pr_url }} REQUEST={{cleaned_text}}".to_string(),
+            pull_request_opened: String::new(),
+            issue_implementation: String::new(),
+        };
+
+        assert_eq!(
+            task.prompt(&templates).unwrap(),
+            "PR=https://github.com/o/r/pull/1 REQUEST=review"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_codex_prompt_placeholders() {
+        let task = CodexTask {
+            subject_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: CodexTaskOrigin::PullRequestOpened {
+                author: "dionysuzx".to_string(),
+            },
+        };
+        let templates = CodexPromptTemplates {
+            mention: String::new(),
+            pull_request_opened: "{{missing}}".to_string(),
+            issue_implementation: String::new(),
+        };
+
+        assert!(task.prompt(&templates).is_err());
+    }
+
+    #[test]
+    fn builds_codex_prompt_for_issue_implementation() {
+        let task = CodexTask {
+            subject_url: "https://github.com/o/r/issues/3".to_string(),
+            origin: CodexTaskOrigin::IssueImplementation {
+                title: "Add the thing".to_string(),
+                body: "Please add the missing thing.".to_string(),
+                branch: "maid/issue-3".to_string(),
+            },
+        };
+
+        let prompt = task.prompt(&test_prompts()).unwrap();
+        assert!(prompt.contains("Issue URL:\nhttps://github.com/o/r/issues/3"));
+        assert!(prompt.contains("Branch Maid will publish:\nmaid/issue-3"));
+        assert!(prompt.contains("Issue title:\nAdd the thing"));
+        assert!(prompt.contains("Issue body:\nPlease add the missing thing."));
     }
 
     #[test]
@@ -383,5 +426,49 @@ mod tests {
         assert!(RepoSlug::parse("dionysuzx").is_err());
         assert!(RepoSlug::parse("dionysuzx/maid/extra").is_err());
         assert!(RepoSlug::parse("../maid").is_err());
+    }
+
+    fn test_prompts() -> CodexPromptTemplates {
+        CodexPromptTemplates {
+            mention: "\
+Mention URL:
+{{mention_url}}
+
+Pull request URL:
+{{pr_url}}
+
+Raw mention body:
+{{raw_body}}
+
+Cleaned request text:
+{{cleaned_text}}
+"
+            .to_string(),
+            pull_request_opened: "\
+Pull request URL:
+{{pr_url}}
+
+Opened by:
+{{author}}
+
+Review request:
+please review
+"
+            .to_string(),
+            issue_implementation: "\
+Issue URL:
+{{issue_url}}
+
+Branch Maid will publish:
+{{branch}}
+
+Issue title:
+{{title}}
+
+Issue body:
+{{body}}
+"
+            .to_string(),
+        }
     }
 }
