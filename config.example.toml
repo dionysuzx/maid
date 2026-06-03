@@ -9,10 +9,13 @@ auto_review_accounts = ["your-name"]
 auto_review_repos = ["your-name/maid"]
 
 # Optional. Defaults shown below.
-poll_seconds = 20
 git_dir = "~/.maid/git"
 codex_bin = "codex"
 max_concurrent_requests = 1
+
+# Optional. This is the one global GitHub REST request-rate knob. Every GitHub
+# API call Maid makes is paced through this budget, including concurrent tasks.
+github_api_requests_per_hour = 1200
 
 # Required. These values are passed to Codex.
 codex_model = "gpt-5.5"

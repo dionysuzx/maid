@@ -15,7 +15,11 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let maid = Maid::new(
-        GitHubRestClient::with_api_ip(config.github_token.clone(), config.github_api_ip),
+        GitHubRestClient::with_options(
+            config.github_token.clone(),
+            config.github_api_ip,
+            config.github_api_requests_per_hour,
+        ),
         GitWorktrees::new(config.git_dir.clone(), config.github_token.clone()),
         CodexCli::with_options(
             config.codex_bin.clone(),
@@ -34,7 +38,6 @@ async fn main() -> Result<()> {
     ))
     .into_concurrent(config.max_concurrent_requests);
 
-    let poll_interval = config.poll_interval;
     let task_limit_per_24h = config
         .task_limit_per_24h
         .map_or_else(|| "none".to_string(), |limit| limit.to_string());
@@ -52,14 +55,13 @@ async fn main() -> Result<()> {
                 ),
                 Err(err) => error!(error = ?err, "poll failed"),
             }
-            tokio::time::sleep(poll_interval).await;
         }
     });
 
     info!(
         git_dir = %config.git_dir.display(),
         task_start_ledger = %config.task_start_ledger_path.display(),
-        poll_seconds = config.poll_interval.as_secs(),
+        github_api_requests_per_hour = config.github_api_requests_per_hour.requests_per_hour(),
         task_limit_per_24h = %task_limit_per_24h,
         max_concurrent_requests = config.max_concurrent_requests,
         master_accounts = config.master_accounts.len(),

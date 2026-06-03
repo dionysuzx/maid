@@ -1,4 +1,7 @@
-use crate::domain::{CodexPromptTemplates, RepoSlug};
+use crate::{
+    domain::{CodexPromptTemplates, RepoSlug},
+    github::{DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, GitHubApiRequestRate},
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::{
@@ -6,7 +9,6 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,10 +19,10 @@ pub struct Config {
     pub auto_review_accounts: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
     pub git_dir: PathBuf,
-    pub poll_interval: Duration,
     pub task_start_ledger_path: PathBuf,
     pub task_limit_per_24h: Option<usize>,
     pub max_concurrent_requests: usize,
+    pub github_api_requests_per_hour: GitHubApiRequestRate,
     pub codex_bin: String,
     pub codex_model: String,
     pub codex_reasoning_effort: String,
@@ -54,12 +56,15 @@ impl Config {
             .map(|path| expand_home(&path))
             .transpose()?
             .unwrap_or_else(|| maid_home.join("git"));
-        let poll_seconds = file.poll_seconds.unwrap_or(20).max(10);
         let task_limit_per_24h = file.task_limit_per_24h;
         let max_concurrent_requests = file.max_concurrent_requests.unwrap_or(1);
         if max_concurrent_requests == 0 {
             bail!("max_concurrent_requests must be at least 1");
         }
+        let github_api_requests_per_hour = GitHubApiRequestRate::per_hour(
+            file.github_api_requests_per_hour
+                .unwrap_or(DEFAULT_GITHUB_API_REQUESTS_PER_HOUR),
+        )?;
         let codex_bin = non_empty(file.codex_bin).unwrap_or_else(|| "codex".to_string());
         let codex_model = required_string(file.codex_model, "codex_model")
             .with_context(|| format!("codex_model is required in {}", config_path.display()))?;
@@ -87,10 +92,10 @@ impl Config {
             auto_review_accounts,
             auto_review_repos,
             git_dir,
-            poll_interval: Duration::from_secs(poll_seconds),
             task_start_ledger_path: maid_home.join("task-starts.json"),
             task_limit_per_24h,
             max_concurrent_requests,
+            github_api_requests_per_hour,
             codex_bin,
             codex_model,
             codex_reasoning_effort,
@@ -107,9 +112,9 @@ struct ConfigFile {
     auto_review_accounts: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
     git_dir: Option<String>,
-    poll_seconds: Option<u64>,
     task_limit_per_24h: Option<usize>,
     max_concurrent_requests: Option<usize>,
+    github_api_requests_per_hour: Option<u32>,
     codex_bin: Option<String>,
     codex_model: Option<String>,
     codex_reasoning_effort: Option<String>,
@@ -285,9 +290,9 @@ master_accounts = ["dionysuzx"]
 auto_review_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
 git_dir = "~/.maid/git"
-poll_seconds = 30
 task_limit_per_24h = 5
 max_concurrent_requests = 3
+github_api_requests_per_hour = 1200
 codex_bin = "codex-test"
 codex_model = "gpt-test"
 codex_reasoning_effort = "high"
@@ -314,9 +319,9 @@ operator_mention = "operator {{{{request_text}}}}"
             Some(vec!["dionysuzx/maid".to_string()])
         );
         assert_eq!(config.git_dir.as_deref(), Some("~/.maid/git"));
-        assert_eq!(config.poll_seconds, Some(30));
         assert_eq!(config.task_limit_per_24h, Some(5));
         assert_eq!(config.max_concurrent_requests, Some(3));
+        assert_eq!(config.github_api_requests_per_hour, Some(1200));
         assert_eq!(config.codex_bin.as_deref(), Some("codex-test"));
         assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
         assert_eq!(config.codex_reasoning_effort.as_deref(), Some("high"));
@@ -345,8 +350,8 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.auto_review_accounts, None);
         assert_eq!(config.auto_review_repos, None);
         assert_eq!(config.git_dir, None);
-        assert_eq!(config.poll_seconds, None);
         assert_eq!(config.task_limit_per_24h, None);
+        assert_eq!(config.github_api_requests_per_hour, None);
         assert_eq!(config.codex_prompts, None);
     }
 
