@@ -2,19 +2,60 @@ use crate::{
     domain::{CommentMention, Notification, PullRequest, RepoSlug},
     maid::{GithubClient, ReviewState},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{Client, Method, StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize};
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::Mutex;
+use tracing::warn;
 
 const STARTED_REACTION: &str = "eyes";
 const HANDLED_REACTION: &str = "+1";
+pub const DEFAULT_GITHUB_API_REQUESTS_PER_HOUR: u32 = 1_200;
+const MAX_RATE_LIMIT_RETRIES: usize = 5;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GitHubApiRequestRate {
+    requests_per_hour: u32,
+}
+
+impl GitHubApiRequestRate {
+    pub fn per_hour(requests_per_hour: u32) -> Result<Self> {
+        if requests_per_hour == 0 {
+            bail!("github_api_requests_per_hour must be at least 1");
+        }
+
+        Ok(Self { requests_per_hour })
+    }
+
+    pub fn requests_per_hour(self) -> u32 {
+        self.requests_per_hour
+    }
+
+    fn interval(self) -> Duration {
+        Duration::from_secs_f64(3_600.0 / f64::from(self.requests_per_hour))
+    }
+}
+
+impl Default for GitHubApiRequestRate {
+    fn default() -> Self {
+        Self {
+            requests_per_hour: DEFAULT_GITHUB_API_REQUESTS_PER_HOUR,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct GitHubRestClient {
     client: Client,
     token: String,
+    traffic: GitHubTraffic,
+    notifications: NotificationPolling,
 }
 
 impl GitHubRestClient {
@@ -23,6 +64,14 @@ impl GitHubRestClient {
     }
 
     pub fn with_api_ip(token: impl Into<String>, api_ip: Option<IpAddr>) -> Self {
+        Self::with_options(token, api_ip, GitHubApiRequestRate::default())
+    }
+
+    pub fn with_options(
+        token: impl Into<String>,
+        api_ip: Option<IpAddr>,
+        request_rate: GitHubApiRequestRate,
+    ) -> Self {
         let mut builder = Client::builder().timeout(Duration::from_secs(30));
         if let Some(api_ip) = api_ip {
             builder = builder.resolve("api.github.com", (api_ip, 443).into());
@@ -33,6 +82,8 @@ impl GitHubRestClient {
                 .build()
                 .expect("GitHub HTTP client configuration should be valid"),
             token: token.into(),
+            traffic: GitHubTraffic::new(request_rate),
+            notifications: NotificationPolling::default(),
         }
     }
 
@@ -40,66 +91,127 @@ impl GitHubRestClient {
     where
         T: for<'de> Deserialize<'de>,
     {
-        self.request(Method::GET, url, Option::<&()>::None).await
+        self.request(Method::GET, url, Option::<&()>::None, HeaderMap::new())
+            .await?
+            .into_json()
     }
 
     async fn post_json<T>(&self, url: &str, body: &T) -> Result<()>
     where
         T: Serialize + Sync,
     {
-        let _: serde::de::IgnoredAny = self.request(Method::POST, url, Some(body)).await?;
+        let _: serde::de::IgnoredAny = self
+            .request(Method::POST, url, Some(body), HeaderMap::new())
+            .await?
+            .into_json()?;
         Ok(())
     }
 
-    async fn request<T, B>(&self, method: Method, url: &str, body: Option<&B>) -> Result<T>
+    async fn request<T, B>(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&B>,
+        headers: HeaderMap,
+    ) -> Result<GitHubResponse<T>>
     where
         T: for<'de> Deserialize<'de>,
         B: Serialize + Sync + ?Sized,
     {
         let method_for_error = method.clone();
-        let mut request = self
-            .client
-            .request(method, url)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("User-Agent", "maid");
-        if let Some(body) = body {
-            request = request.json(body);
-        }
+        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+            self.traffic.wait_for_turn().await;
 
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("{method_for_error} {url} failed"))?;
+            let mut request = self
+                .client
+                .request(method.clone(), url)
+                .bearer_auth(&self.token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "maid");
+            for (name, value) in headers.iter() {
+                request = request.header(name, value);
+            }
+            if let Some(body) = body {
+                request = request.json(body);
+            }
 
-        let status = response.status();
-        if status == StatusCode::NO_CONTENT || status == StatusCode::RESET_CONTENT {
-            return serde_json::from_str("null").context("failed to decode empty GitHub response");
-        }
+            let response = request
+                .send()
+                .await
+                .with_context(|| format!("{method_for_error} {url} failed"))?;
 
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let status = response.status();
+            let response_headers = response.headers().clone();
+            if status == StatusCode::NO_CONTENT || status == StatusCode::RESET_CONTENT {
+                let body = serde_json::from_str("null")
+                    .context("failed to decode empty GitHub response")?;
+                return Ok(GitHubResponse::Json {
+                    body,
+                    headers: response_headers,
+                });
+            }
+
+            if status.is_success() {
+                let body = response
+                    .json::<T>()
+                    .await
+                    .with_context(|| format!("invalid JSON from {method_for_error} {url}"))?;
+                return Ok(GitHubResponse::Json {
+                    body,
+                    headers: response_headers,
+                });
+            }
+
+            let response_body = response.text().await.unwrap_or_default();
+            if let Some(backoff) =
+                RateLimitBackoff::from_response(status, &response_headers, &response_body, attempt)
+            {
+                if attempt == MAX_RATE_LIMIT_RETRIES {
+                    return Err(anyhow!(
+                        "{method_for_error} {url} still rate limited after {MAX_RATE_LIMIT_RETRIES} retries: {response_body}"
+                    ));
+                }
+
+                warn!(
+                    method = %method_for_error,
+                    url,
+                    status = %status,
+                    backoff_seconds = backoff.delay.as_secs(),
+                    reason = backoff.reason,
+                    "GitHub rate limit reached; backing off"
+                );
+                self.traffic.back_off(backoff.delay).await;
+                continue;
+            }
+
             return Err(anyhow!(
-                "{method_for_error} {url} returned {status}: {body}"
+                "{method_for_error} {url} returned {status}: {response_body}"
             ));
         }
 
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("invalid JSON from {method_for_error} {url}"))
+        Err(anyhow!(
+            "{method_for_error} {url} still rate limited after {MAX_RATE_LIMIT_RETRIES} retries"
+        ))
     }
 }
 
 #[async_trait]
 impl GithubClient for GitHubRestClient {
     async fn notifications(&self) -> Result<Vec<Notification>> {
-        let notifications = self
-            .get::<Vec<ApiNotification>>(
+        self.notifications.wait_until_allowed().await;
+
+        let response = self
+            .request::<Vec<ApiNotification>, _>(
+                Method::GET,
                 "https://api.github.com/notifications?participating=true&per_page=50",
+                Option::<&()>::None,
+                HeaderMap::new(),
             )
             .await?;
+        self.notifications.record_headers(response.headers()).await;
+
+        let notifications = response.into_json()?;
 
         Ok(notifications
             .into_iter()
@@ -121,6 +233,8 @@ impl GithubClient for GitHubRestClient {
         let comment = self.get::<ApiComment>(comment_url).await?;
         let pr_url = if let Some(pull_request_url) = comment.pull_request_url {
             pull_request_url
+        } else if let Some(subject_url) = notification.subject_url.as_deref() {
+            subject_url.to_string()
         } else if let Some(issue_url) = comment.issue_url {
             let issue = self.get::<ApiIssue>(&issue_url).await?;
             match issue.pull_request {
@@ -210,9 +324,233 @@ impl GithubClient for GitHubRestClient {
             notification.id
         );
         let _: serde::de::IgnoredAny = self
-            .request(Method::PATCH, &url, Option::<&()>::None)
-            .await?;
+            .request(Method::PATCH, &url, Option::<&()>::None, HeaderMap::new())
+            .await?
+            .into_json()?;
         Ok(())
+    }
+}
+
+enum GitHubResponse<T> {
+    Json { body: T, headers: HeaderMap },
+}
+
+impl<T> GitHubResponse<T> {
+    fn headers(&self) -> &HeaderMap {
+        match self {
+            Self::Json { headers, .. } => headers,
+        }
+    }
+
+    fn into_json(self) -> Result<T> {
+        match self {
+            Self::Json { body, .. } => Ok(body),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GitHubTraffic {
+    interval: Duration,
+    next_request_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+    backoff_until: Arc<Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl GitHubTraffic {
+    fn new(rate: GitHubApiRequestRate) -> Self {
+        Self {
+            interval: rate.interval(),
+            next_request_at: Arc::new(Mutex::new(None)),
+            backoff_until: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn wait_for_turn(&self) {
+        loop {
+            let wait = self.backoff_delay().await;
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
+            let wait = self.request_slot_delay().await;
+            if wait.is_zero() {
+                return;
+            }
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    async fn back_off(&self, delay: Duration) {
+        let until = tokio::time::Instant::now() + delay;
+        let mut backoff_until = self.backoff_until.lock().await;
+        if backoff_until.is_none_or(|current| until > current) {
+            *backoff_until = Some(until);
+        }
+    }
+
+    async fn backoff_delay(&self) -> Duration {
+        let mut backoff_until = self.backoff_until.lock().await;
+        let Some(until) = *backoff_until else {
+            return Duration::ZERO;
+        };
+
+        let now = tokio::time::Instant::now();
+        if until <= now {
+            *backoff_until = None;
+            Duration::ZERO
+        } else {
+            until - now
+        }
+    }
+
+    async fn request_slot_delay(&self) -> Duration {
+        let mut next_request_at = self.next_request_at.lock().await;
+        let now = tokio::time::Instant::now();
+        match *next_request_at {
+            Some(next) if next > now => next - now,
+            _ => {
+                *next_request_at = Some(now + self.interval);
+                Duration::ZERO
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct NotificationPolling {
+    state: Arc<Mutex<NotificationPollingState>>,
+}
+
+#[derive(Default)]
+struct NotificationPollingState {
+    next_allowed_at: Option<tokio::time::Instant>,
+}
+
+impl NotificationPolling {
+    async fn wait_until_allowed(&self) {
+        loop {
+            let wait = {
+                let state = self.state.lock().await;
+                let Some(next_allowed_at) = state.next_allowed_at else {
+                    return;
+                };
+                let now = tokio::time::Instant::now();
+                if next_allowed_at <= now {
+                    return;
+                }
+                next_allowed_at - now
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    async fn record_headers(&self, headers: &HeaderMap) {
+        let mut state = self.state.lock().await;
+        if let Some(poll_interval) = header_duration(headers, "x-poll-interval") {
+            state.next_allowed_at = Some(tokio::time::Instant::now() + poll_interval);
+        }
+    }
+}
+
+struct RateLimitBackoff {
+    delay: Duration,
+    reason: &'static str,
+}
+
+impl RateLimitBackoff {
+    fn from_response(
+        status: StatusCode,
+        headers: &HeaderMap,
+        body: &str,
+        attempt: usize,
+    ) -> Option<Self> {
+        if status != StatusCode::FORBIDDEN && status != StatusCode::TOO_MANY_REQUESTS {
+            return None;
+        }
+
+        if let Some(delay) = header_duration(headers, "retry-after") {
+            return Some(Self {
+                delay,
+                reason: "retry-after",
+            });
+        }
+
+        if header_u64(headers, "x-ratelimit-remaining") == Some(0)
+            && let Some(reset_epoch) = header_u64(headers, "x-ratelimit-reset")
+        {
+            return Some(Self {
+                delay: delay_until_epoch(reset_epoch) + Duration::from_secs(1),
+                reason: "primary",
+            });
+        }
+
+        let lower_body = body.to_ascii_lowercase();
+        if lower_body.contains("secondary rate limit") {
+            return Some(Self {
+                delay: secondary_backoff(attempt),
+                reason: "secondary",
+            });
+        }
+
+        if lower_body.contains("rate limit") {
+            return Some(Self {
+                delay: Duration::from_secs(60),
+                reason: "rate-limit",
+            });
+        }
+
+        None
+    }
+}
+
+fn header_duration(headers: &HeaderMap, name: &str) -> Option<Duration> {
+    header_u64(headers, name).map(Duration::from_secs)
+}
+
+fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn delay_until_epoch(epoch_seconds: u64) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Duration::from_secs(epoch_seconds.saturating_sub(now))
+}
+
+fn secondary_backoff(attempt: usize) -> Duration {
+    let multiplier = 1_u64 << attempt.min(4);
+    Duration::from_secs(60 * multiplier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_rate_converts_to_spacing() {
+        let rate = GitHubApiRequestRate::per_hour(1_200).unwrap();
+
+        assert_eq!(rate.requests_per_hour(), 1_200);
+        assert_eq!(rate.interval(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn request_rate_rejects_zero() {
+        assert!(GitHubApiRequestRate::per_hour(0).is_err());
+    }
+
+    #[test]
+    fn secondary_backoff_is_bounded_exponential() {
+        assert_eq!(secondary_backoff(0), Duration::from_secs(60));
+        assert_eq!(secondary_backoff(1), Duration::from_secs(120));
+        assert_eq!(secondary_backoff(4), Duration::from_secs(960));
+        assert_eq!(secondary_backoff(5), Duration::from_secs(960));
     }
 }
 

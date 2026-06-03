@@ -50,6 +50,12 @@ Runtime config lives at `~/.maid/config.toml`. The required fields are
   defaults to `master_accounts`.
 - `auto_review_repos`: repositories to poll for automatic PR reviews; empty or
   omitted means mention-only mode.
+- `github_api_requests_per_hour`: global GitHub REST API request budget.
+  Defaults to `1200`, which is 24% of GitHub's normal 5,000 authenticated
+  requests per hour account limit and paces requests at one call every 3
+  seconds. Every GitHub API call Maid makes goes through this budget, including
+  calls made by concurrent Codex tasks. Maid polls as soon as GitHub permits and
+  stays under this configured API budget.
 - `git_dir`: local directory for bare git repositories and task worktrees.
   Defaults to `~/.maid/git`.
 - `task_limit_per_24h`: optional rolling 24-hour cap. Omit it for no limit; set
