@@ -4,8 +4,14 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    process,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
+
+static NEXT_LEDGER_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PendingHandledMarker {
@@ -183,12 +189,7 @@ impl PendingHandledMarkerLedger {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let temp_path = path.with_file_name(format!(
-            ".{}.tmp",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("maid-pending-handled-markers.json")
-        ));
+        let temp_path = ledger_temp_path(path);
         let contents = serde_json::to_vec_pretty(self).context("failed to encode marker ledger")?;
         fs::write(&temp_path, contents)
             .with_context(|| format!("failed to write {}", temp_path.display()))?;
@@ -201,6 +202,16 @@ impl PendingHandledMarkerLedger {
         })?;
         Ok(())
     }
+}
+
+fn ledger_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("maid-pending-handled-markers.json");
+    let write_id = NEXT_LEDGER_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+
+    path.with_file_name(format!(".{file_name}.{}.{}.tmp", process::id(), write_id))
 }
 
 #[cfg(test)]

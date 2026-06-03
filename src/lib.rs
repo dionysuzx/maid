@@ -1,5 +1,6 @@
 pub mod codex;
 pub mod config;
+pub mod daemon_lock;
 pub mod domain;
 pub mod github;
 pub mod handled_marker;

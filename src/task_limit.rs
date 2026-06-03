@@ -3,11 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    process,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const TASK_LIMIT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+static NEXT_LEDGER_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
 pub trait TaskStartRecorder: Send + Sync {
     fn try_record_started(&self) -> Result<TaskStartDecision>;
@@ -115,12 +120,7 @@ impl TaskStartLedgerFile {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let temp_path = path.with_file_name(format!(
-            ".{}.tmp",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("maid-task-starts.json")
-        ));
+        let temp_path = ledger_temp_path(path);
         let contents = serde_json::to_vec_pretty(self).context("failed to encode task ledger")?;
         fs::write(&temp_path, contents)
             .with_context(|| format!("failed to write {}", temp_path.display()))?;
@@ -133,6 +133,16 @@ impl TaskStartLedgerFile {
         })?;
         Ok(())
     }
+}
+
+fn ledger_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("maid-task-starts.json");
+    let write_id = NEXT_LEDGER_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+
+    path.with_file_name(format!(".{file_name}.{}.{}.tmp", process::id(), write_id))
 }
 
 fn unix_seconds(time: SystemTime) -> Result<u64> {
