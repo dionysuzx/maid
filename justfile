@@ -59,17 +59,26 @@ start:
             pid="${exe#/proc/}"
             pid="${pid%/exe}"
             target="$(readlink "$exe" 2>/dev/null || true)"
-            if [[ "$target" == "{{maid_bin}}" ]]; then
+            cmdline="$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | head -n 1 || true)"
+            if [[ "$target" == "{{maid_bin}}" || "$cmdline" == "{{maid_bin}}" ]]; then
                 printf '%s\n' "$pid"
             fi
         done
+    }
+
+    is_maid_pid() {
+        [[ "$1" =~ ^[0-9]+$ ]] || return 1
+        local target cmdline
+        target="$(readlink "/proc/$1/exe" 2>/dev/null || true)"
+        cmdline="$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 1 || true)"
+        [[ "$target" == "{{maid_bin}}" || "$cmdline" == "{{maid_bin}}" ]]
     }
 
     mkdir -p "{{maid_home}}"
 
     if [[ -f "{{pid_file}}" ]]; then
         pid="$(<"{{pid_file}}")"
-        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        if is_maid_pid "$pid"; then
             echo "maid is already running with pid $pid"
             echo "logs: just logs"
             exit 0
@@ -103,7 +112,7 @@ start:
     fi
 
     daemon_pid="$(<"{{pid_file}}")"
-    if ! [[ "$daemon_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$daemon_pid" 2>/dev/null; then
+    if ! is_maid_pid "$daemon_pid"; then
         rm -f "{{pid_file}}"
         echo "maid wrote an invalid pid; see {{log_file}}"
         exit 1
@@ -140,10 +149,19 @@ status:
             pid="${exe#/proc/}"
             pid="${pid%/exe}"
             target="$(readlink "$exe" 2>/dev/null || true)"
-            if [[ "$target" == "{{maid_bin}}" ]]; then
+            cmdline="$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | head -n 1 || true)"
+            if [[ "$target" == "{{maid_bin}}" || "$cmdline" == "{{maid_bin}}" ]]; then
                 printf '%s\n' "$pid"
             fi
         done
+    }
+
+    is_maid_pid() {
+        [[ "$1" =~ ^[0-9]+$ ]] || return 1
+        local target cmdline
+        target="$(readlink "/proc/$1/exe" 2>/dev/null || true)"
+        cmdline="$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 1 || true)"
+        [[ "$target" == "{{maid_bin}}" || "$cmdline" == "{{maid_bin}}" ]]
     }
 
     if [[ ! -f "{{pid_file}}" ]]; then
@@ -158,7 +176,7 @@ status:
     fi
 
     pid="$(<"{{pid_file}}")"
-    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    if is_maid_pid "$pid"; then
         echo "maid is running with pid $pid"
         exit 0
     fi
@@ -182,10 +200,19 @@ stop:
             pid="${exe#/proc/}"
             pid="${pid%/exe}"
             target="$(readlink "$exe" 2>/dev/null || true)"
-            if [[ "$target" == "{{maid_bin}}" ]]; then
+            cmdline="$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | head -n 1 || true)"
+            if [[ "$target" == "{{maid_bin}}" || "$cmdline" == "{{maid_bin}}" ]]; then
                 printf '%s\n' "$pid"
             fi
         done
+    }
+
+    is_maid_pid() {
+        [[ "$1" =~ ^[0-9]+$ ]] || return 1
+        local target cmdline
+        target="$(readlink "/proc/$1/exe" 2>/dev/null || true)"
+        cmdline="$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 1 || true)"
+        [[ "$target" == "{{maid_bin}}" || "$cmdline" == "{{maid_bin}}" ]]
     }
 
     wait_for_stop() {
@@ -220,7 +247,7 @@ stop:
     fi
 
     pid="$(<"{{pid_file}}")"
-    if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+    if ! is_maid_pid "$pid"; then
         rm -f "{{pid_file}}"
         pids="$(maid_pids)"
         if [[ -z "$pids" ]]; then

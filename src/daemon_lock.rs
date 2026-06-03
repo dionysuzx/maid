@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -36,7 +38,7 @@ impl DaemonLock {
                         .and_then(|pid| pid.trim().parse::<u32>().ok());
 
                     if let Some(existing_pid) = existing_pid
-                        && process_exists(existing_pid)
+                        && process_is_current_executable(existing_pid)
                     {
                         bail!("maid is already running with pid {existing_pid}");
                     }
@@ -67,12 +69,35 @@ impl Drop for DaemonLock {
 }
 
 #[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+fn process_is_current_executable(pid: u32) -> bool {
+    let Ok(current_exe) = fs::read_link("/proc/self/exe") else {
+        return false;
+    };
+    let Ok(process_exe) = fs::read_link(Path::new("/proc").join(pid.to_string()).join("exe"))
+    else {
+        return false;
+    };
+
+    process_exe == current_exe || process_cmdline_matches(pid, &current_exe)
+}
+
+#[cfg(unix)]
+fn process_cmdline_matches(pid: u32, current_exe: &Path) -> bool {
+    let Ok(cmdline) = fs::read(Path::new("/proc").join(pid.to_string()).join("cmdline")) else {
+        return false;
+    };
+    let Some(first_arg) = cmdline.split(|byte| *byte == 0).next() else {
+        return false;
+    };
+    if first_arg.is_empty() {
+        return false;
+    }
+
+    Path::new(std::ffi::OsStr::from_bytes(first_arg)) == current_exe
 }
 
 #[cfg(not(unix))]
-fn process_exists(_pid: u32) -> bool {
+fn process_is_current_executable(_pid: u32) -> bool {
     true
 }
 
@@ -98,6 +123,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("maid.pid");
         fs::write(&path, "999999999").unwrap();
+
+        let _lock = DaemonLock::acquire(&path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().trim(),
+            process::id().to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaces_live_pid_that_is_not_this_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("maid.pid");
+        fs::write(&path, "1").unwrap();
 
         let _lock = DaemonLock::acquire(&path).unwrap();
 
