@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
+use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 use std::{
-    fs,
+    ffi::OsString,
+    fs::{self, OpenOptions},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
     process,
@@ -12,6 +13,7 @@ use std::{
 pub struct DaemonLock {
     path: PathBuf,
     pid: u32,
+    _lock_file: fs::File,
 }
 
 impl DaemonLock {
@@ -23,10 +25,17 @@ impl DaemonLock {
         }
 
         let pid = process::id();
+        let lock_file = open_lock_file(&path)?;
+        lock_daemon_file(&lock_file, &path)?;
+
         loop {
             match create_pid_file(&path, pid) {
                 Ok(true) => {
-                    return Ok(Self { path, pid });
+                    return Ok(Self {
+                        path,
+                        pid,
+                        _lock_file: lock_file,
+                    });
                 }
                 Ok(false) => {
                     let existing_pid = fs::read_to_string(&path)
@@ -61,6 +70,51 @@ impl Drop for DaemonLock {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+fn open_lock_file(pid_path: &Path) -> Result<fs::File> {
+    let lock_path = lock_path_for(pid_path);
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open daemon lock file {}", lock_path.display()))
+}
+
+fn lock_path_for(pid_path: &Path) -> PathBuf {
+    let mut path = OsString::from(pid_path.as_os_str());
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+#[cfg(unix)]
+fn lock_daemon_file(file: &fs::File, pid_path: &Path) -> Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.kind() == ErrorKind::WouldBlock {
+        if let Some(existing_pid) = fs::read_to_string(pid_path)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            && process_is_current_executable(existing_pid)
+        {
+            bail!("maid is already running with pid {existing_pid}");
+        }
+
+        bail!("maid is already starting or running");
+    }
+
+    Err(err).with_context(|| format!("failed to lock {}", lock_path_for(pid_path).display()))
+}
+
+#[cfg(not(unix))]
+fn lock_daemon_file(_file: &fs::File, _pid_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn create_pid_file(path: &Path, pid: u32) -> Result<bool> {
