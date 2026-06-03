@@ -83,5 +83,5 @@ Context:
 Operator request:
 {{request_text}}
 
-When finished, return a concise final status. Do not include tool logs or wrappers.
+When finished, return only a concise final status for the calling process to use. Do not publish that status yourself or include tool logs or wrappers.
 """
