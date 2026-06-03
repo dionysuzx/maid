@@ -4,6 +4,7 @@ maid_home := env_var_or_default("MAID_HOME", env_var("HOME") + "/.maid")
 config_file := maid_home + "/config.toml"
 pid_file := maid_home + "/maid.pid"
 log_file := maid_home + "/maid.log"
+maid_bin := justfile_directory() + "/target/debug/maid"
 
 default:
     just --list
@@ -53,6 +54,17 @@ start:
     #!/usr/bin/env bash
     set -euo pipefail
 
+    maid_pids() {
+        for exe in /proc/[0-9]*/exe; do
+            pid="${exe#/proc/}"
+            pid="${pid%/exe}"
+            target="$(readlink "$exe" 2>/dev/null || true)"
+            if [[ "$target" == "{{maid_bin}}" ]]; then
+                printf '%s\n' "$pid"
+            fi
+        done
+    }
+
     mkdir -p "{{maid_home}}"
 
     if [[ -f "{{pid_file}}" ]]; then
@@ -65,7 +77,7 @@ start:
         rm -f "{{pid_file}}"
     fi
 
-    running_pids="$(pgrep -u "$(id -u)" -f 'target/debug/maid' || true)"
+    running_pids="$(maid_pids)"
     if [[ -n "$running_pids" ]]; then
         echo "maid is already running without {{pid_file}}:"
         echo "$running_pids"
@@ -74,26 +86,26 @@ start:
     fi
 
     cargo build
-    RUST_LOG="${RUST_LOG:-maid=info}" nohup target/debug/maid >>"{{log_file}}" 2>&1 &
-    pid="$!"
+    RUST_LOG="${RUST_LOG:-maid=info}" nohup setsid "{{maid_bin}}" </dev/null >>"{{log_file}}" 2>&1 &
+    launcher_pid="$!"
 
-    sleep 1
-    if ! kill -0 "$pid" 2>/dev/null; then
-        rm -f "{{pid_file}}"
-        echo "maid failed to start; see {{log_file}}"
-        exit 1
-    fi
+    for _ in {1..20}; do
+        if [[ -f "{{pid_file}}" ]]; then
+            break
+        fi
+        sleep 0.1
+    done
 
     if [[ ! -f "{{pid_file}}" ]]; then
-        kill "$pid" 2>/dev/null || true
+        kill "$launcher_pid" 2>/dev/null || true
         echo "maid failed to write {{pid_file}}; see {{log_file}}"
         exit 1
     fi
 
     daemon_pid="$(<"{{pid_file}}")"
-    if [[ "$daemon_pid" != "$pid" ]]; then
-        kill "$pid" 2>/dev/null || true
-        echo "maid wrote unexpected pid $daemon_pid; see {{log_file}}"
+    if ! [[ "$daemon_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$daemon_pid" 2>/dev/null; then
+        rm -f "{{pid_file}}"
+        echo "maid wrote an invalid pid; see {{log_file}}"
         exit 1
     fi
 
@@ -123,8 +135,19 @@ status:
     #!/usr/bin/env bash
     set -euo pipefail
 
+    maid_pids() {
+        for exe in /proc/[0-9]*/exe; do
+            pid="${exe#/proc/}"
+            pid="${pid%/exe}"
+            target="$(readlink "$exe" 2>/dev/null || true)"
+            if [[ "$target" == "{{maid_bin}}" ]]; then
+                printf '%s\n' "$pid"
+            fi
+        done
+    }
+
     if [[ ! -f "{{pid_file}}" ]]; then
-        pids="$(pgrep -u "$(id -u)" -f 'target/debug/maid' || true)"
+        pids="$(maid_pids)"
         if [[ -n "$pids" ]]; then
             echo "maid is running without {{pid_file}}:"
             echo "$pids"
@@ -141,7 +164,7 @@ status:
     fi
 
     rm -f "{{pid_file}}"
-    pids="$(pgrep -u "$(id -u)" -f 'target/debug/maid' || true)"
+    pids="$(maid_pids)"
     if [[ -n "$pids" ]]; then
         echo "maid is running without {{pid_file}}:"
         echo "$pids"
@@ -153,6 +176,17 @@ status:
 stop:
     #!/usr/bin/env bash
     set -euo pipefail
+
+    maid_pids() {
+        for exe in /proc/[0-9]*/exe; do
+            pid="${exe#/proc/}"
+            pid="${pid%/exe}"
+            target="$(readlink "$exe" 2>/dev/null || true)"
+            if [[ "$target" == "{{maid_bin}}" ]]; then
+                printf '%s\n' "$pid"
+            fi
+        done
+    }
 
     wait_for_stop() {
         local pids="$1"
@@ -176,7 +210,7 @@ stop:
     }
 
     if [[ ! -f "{{pid_file}}" ]]; then
-        pids="$(pgrep -u "$(id -u)" -f 'target/debug/maid' || true)"
+        pids="$(maid_pids)"
         if [[ -z "$pids" ]]; then
             echo "maid is not running"
             exit 0
@@ -188,7 +222,7 @@ stop:
     pid="$(<"{{pid_file}}")"
     if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
         rm -f "{{pid_file}}"
-        pids="$(pgrep -u "$(id -u)" -f 'target/debug/maid' || true)"
+        pids="$(maid_pids)"
         if [[ -z "$pids" ]]; then
             echo "maid is not running"
             exit 0
@@ -197,7 +231,7 @@ stop:
         wait_for_stop "$pids"
     fi
 
-    extra_pids="$(pgrep -u "$(id -u)" -f 'target/debug/maid' | grep -v "^$pid$" || true)"
+    extra_pids="$(maid_pids | grep -v "^$pid$" || true)"
     pids="$pid ${extra_pids:-}"
     kill $pids 2>/dev/null || true
     wait_for_stop "$pids"
