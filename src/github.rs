@@ -1,6 +1,6 @@
 use crate::{
-    domain::{CommentMention, Notification, PullRequest, RepoSlug},
-    maid::{GithubClient, ReviewState},
+    domain::{CommentMention, Notification, PullRequest, RepoSlug, ReviewState},
+    maid::GithubClient,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;

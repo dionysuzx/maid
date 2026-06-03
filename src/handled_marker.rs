@@ -1,3 +1,4 @@
+use crate::domain::{CommentMention, PullRequest};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,6 +12,20 @@ use std::{
 pub enum PendingHandledMarker {
     Mention { api_url: String },
     PullRequest { html_url: String },
+}
+
+impl PendingHandledMarker {
+    pub fn for_mention(mention: &CommentMention) -> Self {
+        Self::Mention {
+            api_url: mention.api_url.clone(),
+        }
+    }
+
+    pub fn for_pull_request(pr: &PullRequest) -> Self {
+        Self::PullRequest {
+            html_url: pr.html_url.clone(),
+        }
+    }
 }
 
 pub trait PendingHandledMarkerStore: Send + Sync {

@@ -1,8 +1,16 @@
+use crate::auto_review::{
+    AutoReviewAction, AutoReviewAuthor, AutoReviewObservation, classify_auto_review_author,
+    plan_auto_review,
+};
 use crate::domain::{
-    CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug,
+    CodexTask, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug, ReviewState,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
+};
+use crate::mention_thread::{
+    MentionNotificationPlan, MentionObservation, MentionThread, MentionThreadAction,
+    MentionThreadPlan, MentionThreadRead, choose_mention_thread_read, plan_mention_thread,
 };
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
@@ -34,12 +42,6 @@ pub trait GithubClient: Send + Sync {
     async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()>;
     async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReviewState {
-    Pending,
-    Handled,
 }
 
 #[async_trait]
@@ -358,67 +360,101 @@ where
     }
 
     async fn tasks_for_mentions(&self, notification: &Notification) -> Result<Vec<TaskAssessment>> {
+        let thread = self.load_mention_thread(notification).await?;
+        let plan = plan_mention_thread(thread, &self.bot_login);
+        self.apply_mention_thread_plan(notification, plan).await
+    }
+
+    async fn load_mention_thread(&self, notification: &Notification) -> Result<MentionThread> {
         let mentions = self.mentions_for_notification(notification).await?;
-        let mut assessments = Vec::new();
+        let mut observations = Vec::new();
 
         for mention in mentions {
-            if mention.author.eq_ignore_ascii_case(&self.bot_login) {
-                continue;
+            if let Some(observation) = self.observe_mention(notification, mention).await? {
+                observations.push(observation);
             }
+        }
 
-            if !self
-                .master_accounts
-                .contains(&mention.author.to_ascii_lowercase())
-            {
-                info!(
-                    notification_id = notification.id,
-                    mention = %mention.html_url,
-                    author = %mention.author,
-                    "skipping mention from non-master account"
-                );
-                continue;
-            }
+        Ok(MentionThread::from_observations(observations))
+    }
 
-            let Some(request) = MentionRequest::parse(&mention.body, &self.bot_login)? else {
-                continue;
-            };
+    async fn observe_mention(
+        &self,
+        notification: &Notification,
+        mention: CommentMention,
+    ) -> Result<Option<MentionObservation>> {
+        if mention.author.eq_ignore_ascii_case(&self.bot_login) {
+            return Ok(None);
+        }
 
-            match self.github.mention_state(&mention, &self.bot_login).await? {
-                ReviewState::Pending => {
-                    if self
-                        .retry_pending_mention_marker(notification, &mention)
-                        .await?
-                    {
-                        assessments.push(TaskAssessment::Skipped);
-                        continue;
-                    }
+        if !self
+            .master_accounts
+            .contains(&mention.author.to_ascii_lowercase())
+        {
+            info!(
+                notification_id = notification.id,
+                mention = %mention.html_url,
+                author = %mention.author,
+                "skipping mention from non-master account"
+            );
+            return Ok(None);
+        }
+
+        let Some(request) = MentionRequest::parse(&mention.body, &self.bot_login)? else {
+            return Ok(None);
+        };
+
+        let state = self.github.mention_state(&mention, &self.bot_login).await?;
+        let marker = PendingHandledMarker::for_mention(&mention);
+        let has_pending_marker = self.pending_handled_markers.contains(&marker)?;
+
+        Ok(Some(MentionObservation::new(
+            mention,
+            request,
+            state,
+            has_pending_marker,
+        )))
+    }
+
+    async fn apply_mention_thread_plan(
+        &self,
+        notification: &Notification,
+        plan: MentionThreadPlan,
+    ) -> Result<Vec<TaskAssessment>> {
+        let mut assessments = Vec::new();
+
+        for action in plan.actions {
+            match action {
+                MentionThreadAction::StartTask { mention, task } => {
+                    assessments.push(TaskAssessment::Ready(Box::new(TaskIntent::Mention {
+                        notification: notification.clone(),
+                        mention: Box::new(mention),
+                        task,
+                    })));
                 }
-                ReviewState::Handled => {
-                    self.pending_handled_markers
-                        .remove(&PendingHandledMarker::for_mention(&mention))?;
+                MentionThreadAction::MarkHandled { mention, marker } => {
+                    self.github.mark_mention_handled(&mention).await?;
+                    self.pending_handled_markers.remove(&marker)?;
+                    info!(
+                        notification_id = notification.id,
+                        mention = %mention.html_url,
+                        "marked pending completed mention handled"
+                    );
+                    assessments.push(TaskAssessment::Skipped);
+                }
+                MentionThreadAction::ForgetHandledMarker { mention, marker } => {
+                    self.pending_handled_markers.remove(&marker)?;
                     info!(
                         notification_id = notification.id,
                         mention = %mention.html_url,
                         "skipping already handled mention"
                     );
                     assessments.push(TaskAssessment::Skipped);
-                    continue;
                 }
             }
-
-            let task = CodexTask {
-                pr_url: mention.pr.html_url.clone(),
-                origin: mention_task_origin(&mention, request, &self.bot_login),
-            };
-
-            assessments.push(TaskAssessment::Ready(Box::new(TaskIntent::Mention {
-                notification: notification.clone(),
-                mention: Box::new(mention),
-                task,
-            })));
         }
 
-        if assessments.iter().all(|assessment| assessment.is_skipped()) {
+        if plan.notification == MentionNotificationPlan::MarkRead {
             self.github.mark_notification_handled(notification).await?;
         }
 
@@ -436,22 +472,12 @@ where
             return Ok(Vec::new());
         };
 
-        if latest.author.eq_ignore_ascii_case(&self.bot_login) {
-            return self.scanned_mentions_or_latest(notification, latest).await;
+        match self.choose_mention_thread_read(&latest).await? {
+            MentionThreadRead::LatestOnly => Ok(vec![latest]),
+            MentionThreadRead::RecentComments => {
+                self.scanned_mentions_or_latest(notification, latest).await
+            }
         }
-
-        if self
-            .master_accounts
-            .contains(&latest.author.to_ascii_lowercase())
-            && MentionRequest::parse(&latest.body, &self.bot_login)?.is_some()
-        {
-            return match self.github.mention_state(&latest, &self.bot_login).await? {
-                ReviewState::Pending => self.scanned_mentions_or_latest(notification, latest).await,
-                ReviewState::Handled => Ok(vec![latest]),
-            };
-        }
-
-        self.scanned_mentions_or_latest(notification, latest).await
     }
 
     async fn scanned_mentions_or_latest(
@@ -467,87 +493,101 @@ where
         Ok(mentions)
     }
 
-    async fn task_for_auto_review_pr(&self, pr: &PullRequest) -> Result<TaskAssessment> {
-        if pr.author.eq_ignore_ascii_case(&self.bot_login) {
-            return Ok(TaskAssessment::Skipped);
-        }
-
+    async fn choose_mention_thread_read(
+        &self,
+        latest: &CommentMention,
+    ) -> Result<MentionThreadRead> {
         if !self
-            .auto_review_accounts
-            .contains(&pr.author.to_ascii_lowercase())
+            .master_accounts
+            .contains(&latest.author.to_ascii_lowercase())
         {
-            info!(
-                pr = %pr.html_url,
-                author = %pr.author,
-                "skipping pull request from account without auto review"
-            );
-            return Ok(TaskAssessment::Skipped);
+            return Ok(choose_mention_thread_read(
+                latest,
+                None,
+                None,
+                &self.bot_login,
+            ));
         }
 
-        match self.github.pr_state(pr, &self.bot_login).await? {
-            ReviewState::Pending => {
-                if self.retry_pending_pr_marker(pr).await? {
-                    return Ok(TaskAssessment::Skipped);
-                }
+        let Some(request) = MentionRequest::parse(&latest.body, &self.bot_login)? else {
+            return Ok(choose_mention_thread_read(
+                latest,
+                None,
+                None,
+                &self.bot_login,
+            ));
+        };
+        let state = self.github.mention_state(latest, &self.bot_login).await?;
+
+        Ok(choose_mention_thread_read(
+            latest,
+            Some(&request),
+            Some(state),
+            &self.bot_login,
+        ))
+    }
+
+    async fn task_for_auto_review_pr(&self, pr: &PullRequest) -> Result<TaskAssessment> {
+        let observation = self.observe_auto_review_pr(pr).await?;
+        self.apply_auto_review_action(plan_auto_review(observation))
+            .await
+    }
+
+    async fn observe_auto_review_pr(&self, pr: &PullRequest) -> Result<AutoReviewObservation> {
+        let author = classify_auto_review_author(
+            pr,
+            &self.bot_login,
+            self.auto_review_accounts
+                .contains(&pr.author.to_ascii_lowercase()),
+        );
+        if author != AutoReviewAuthor::Allowed {
+            return Ok(AutoReviewObservation::new(pr.clone(), author, None, false));
+        }
+
+        let state = self.github.pr_state(pr, &self.bot_login).await?;
+        let marker = PendingHandledMarker::for_pull_request(pr);
+        let has_pending_marker = self.pending_handled_markers.contains(&marker)?;
+
+        Ok(AutoReviewObservation::new(
+            pr.clone(),
+            author,
+            Some(state),
+            has_pending_marker,
+        ))
+    }
+
+    async fn apply_auto_review_action(&self, action: AutoReviewAction) -> Result<TaskAssessment> {
+        match action {
+            AutoReviewAction::StartTask { pr, task } => Ok(TaskAssessment::Ready(Box::new(
+                TaskIntent::AutoReviewPullRequest { pr, task },
+            ))),
+            AutoReviewAction::MarkHandled { pr, marker } => {
+                self.github.mark_pr_handled(&pr).await?;
+                self.pending_handled_markers.remove(&marker)?;
+                info!(
+                    pr = %pr.html_url,
+                    "marked pending completed auto-review pull request handled"
+                );
+                Ok(TaskAssessment::Skipped)
             }
-            ReviewState::Handled => {
-                self.pending_handled_markers
-                    .remove(&PendingHandledMarker::for_pull_request(pr))?;
+            AutoReviewAction::ForgetHandledMarker { pr, marker } => {
+                self.pending_handled_markers.remove(&marker)?;
                 info!(
                     pr = %pr.html_url,
                     "skipping already handled auto-review pull request"
                 );
-                return Ok(TaskAssessment::Skipped);
+                Ok(TaskAssessment::Skipped)
+            }
+            AutoReviewAction::SkipSelfAuthored => Ok(TaskAssessment::Skipped),
+            AutoReviewAction::SkipUnauthorized { pr } => {
+                info!(
+                    pr = %pr.html_url,
+                    author = %pr.author,
+                    "skipping pull request from account without auto review"
+                );
+                Ok(TaskAssessment::Skipped)
             }
         }
-
-        let task = CodexTask {
-            pr_url: pr.html_url.clone(),
-            origin: CodexTaskOrigin::PullRequestOpened {
-                author: pr.author.clone(),
-            },
-        };
-        Ok(TaskAssessment::Ready(Box::new(
-            TaskIntent::AutoReviewPullRequest {
-                pr: pr.clone(),
-                task,
-            },
-        )))
-    }
-
-    async fn retry_pending_mention_marker(
-        &self,
-        notification: &Notification,
-        mention: &CommentMention,
-    ) -> Result<bool> {
-        let marker = PendingHandledMarker::for_mention(mention);
-        if !self.pending_handled_markers.contains(&marker)? {
-            return Ok(false);
-        }
-
-        self.github.mark_mention_handled(mention).await?;
-        self.pending_handled_markers.remove(&marker)?;
-        info!(
-            notification_id = notification.id,
-            mention = %mention.html_url,
-            "marked pending completed mention handled"
-        );
-        Ok(true)
-    }
-
-    async fn retry_pending_pr_marker(&self, pr: &PullRequest) -> Result<bool> {
-        let marker = PendingHandledMarker::for_pull_request(pr);
-        if !self.pending_handled_markers.contains(&marker)? {
-            return Ok(false);
-        }
-
-        self.github.mark_pr_handled(pr).await?;
-        self.pending_handled_markers.remove(&marker)?;
-        info!(
-            pr = %pr.html_url,
-            "marked pending completed auto-review pull request handled"
-        );
-        Ok(true)
     }
 
     async fn start_task(&self, intent: Box<TaskIntent>) -> Result<TaskStartOutcome> {
@@ -910,12 +950,6 @@ enum TaskAssessment {
     Skipped,
 }
 
-impl TaskAssessment {
-    fn is_skipped(&self) -> bool {
-        matches!(self, Self::Skipped)
-    }
-}
-
 #[derive(Clone, Debug)]
 enum TaskStartOutcome {
     Started(Box<StartedTask>),
@@ -1001,20 +1035,6 @@ impl StartedTask {
     }
 }
 
-impl PendingHandledMarker {
-    fn for_mention(mention: &CommentMention) -> Self {
-        Self::Mention {
-            api_url: mention.api_url.clone(),
-        }
-    }
-
-    fn for_pull_request(pr: &PullRequest) -> Self {
-        Self::PullRequest {
-            html_url: pr.html_url.clone(),
-        }
-    }
-}
-
 fn work_key(notification: &Notification) -> String {
     notification
         .latest_comment_url
@@ -1038,31 +1058,10 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
         .collect()
 }
 
-fn mention_task_origin(
-    mention: &CommentMention,
-    request: MentionRequest,
-    bot_login: &str,
-) -> CodexTaskOrigin {
-    if let Some(operator_text) = request.operator_text() {
-        return CodexTaskOrigin::OperatorMention {
-            mention_url: mention.html_url.clone(),
-            raw_body: request.raw_body,
-            request_text: operator_text,
-            trigger_author: mention.author.clone(),
-            bot_login: bot_login.to_string(),
-        };
-    }
-
-    CodexTaskOrigin::Mention {
-        mention_url: mention.html_url.clone(),
-        raw_body: request.raw_body,
-        cleaned_text: request.cleaned_text,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::CodexTaskOrigin;
     use anyhow::{Result, anyhow};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
