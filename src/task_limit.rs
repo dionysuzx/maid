@@ -3,16 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const TASK_LIMIT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
-static NEXT_LEDGER_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
 pub trait TaskStartRecorder: Send + Sync {
     fn try_record_started(&self) -> Result<TaskStartDecision>;
@@ -115,34 +110,27 @@ impl TaskStartLedgerFile {
     }
 
     fn write(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
 
-        let temp_path = ledger_temp_path(path);
-        let contents = serde_json::to_vec_pretty(self).context("failed to encode task ledger")?;
-        fs::write(&temp_path, contents)
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        fs::rename(&temp_path, path).with_context(|| {
-            format!(
-                "failed to replace {} with {}",
-                path.display(),
-                temp_path.display()
-            )
-        })?;
+        let mut file = tempfile::Builder::new()
+            .prefix(".maid-task-starts.")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!("failed to create temp task ledger in {}", parent.display())
+            })?;
+
+        serde_json::to_writer_pretty(&mut file, self).context("failed to encode task ledger")?;
+        file.as_file()
+            .sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        file.into_temp_path()
+            .persist(path)
+            .map_err(|err| err.error)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
-}
-
-fn ledger_temp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("maid-task-starts.json");
-    let write_id = NEXT_LEDGER_WRITE_ID.fetch_add(1, Ordering::Relaxed);
-
-    path.with_file_name(format!(".{file_name}.{}.{}.tmp", process::id(), write_id))
 }
 
 fn unix_seconds(time: SystemTime) -> Result<u64> {

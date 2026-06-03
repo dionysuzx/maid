@@ -4,14 +4,8 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    process,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
-
-static NEXT_LEDGER_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PendingHandledMarker {
@@ -184,34 +178,30 @@ impl PendingHandledMarkerLedger {
     }
 
     fn write(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
 
-        let temp_path = ledger_temp_path(path);
-        let contents = serde_json::to_vec_pretty(self).context("failed to encode marker ledger")?;
-        fs::write(&temp_path, contents)
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        fs::rename(&temp_path, path).with_context(|| {
-            format!(
-                "failed to replace {} with {}",
-                path.display(),
-                temp_path.display()
-            )
-        })?;
+        let mut file = tempfile::Builder::new()
+            .prefix(".maid-pending-handled-markers.")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!(
+                    "failed to create temp marker ledger in {}",
+                    parent.display()
+                )
+            })?;
+
+        serde_json::to_writer_pretty(&mut file, self).context("failed to encode marker ledger")?;
+        file.as_file()
+            .sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        file.into_temp_path()
+            .persist(path)
+            .map_err(|err| err.error)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
-}
-
-fn ledger_temp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("maid-pending-handled-markers.json");
-    let write_id = NEXT_LEDGER_WRITE_ID.fetch_add(1, Ordering::Relaxed);
-
-    path.with_file_name(format!(".{file_name}.{}.{}.tmp", process::id(), write_id))
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 #[cfg(unix)]
-use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+use std::os::unix::ffi::OsStrExt;
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
@@ -28,45 +29,24 @@ impl DaemonLock {
         let lock_file = open_lock_file(&path)?;
         lock_daemon_file(&lock_file, &path)?;
 
-        loop {
-            match create_pid_file(&path, pid) {
-                Ok(true) => {
-                    return Ok(Self {
-                        path,
-                        pid,
-                        _lock_file: lock_file,
-                    });
-                }
-                Ok(false) => {
-                    let existing_pid = fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|pid| pid.trim().parse::<u32>().ok());
-
-                    if let Some(existing_pid) = existing_pid
-                        && process_is_current_executable(existing_pid)
-                    {
-                        bail!("maid is already running with pid {existing_pid}");
-                    }
-
-                    fs::remove_file(&path).with_context(|| {
-                        format!("failed to remove stale daemon pid file {}", path.display())
-                    })?;
-                }
-                Err(err) => {
-                    return Err(err);
-                }
-            }
+        if let Some(existing_pid) = read_pid(&path)
+            && process_is_current_executable(existing_pid)
+        {
+            bail!("maid is already running with pid {existing_pid}");
         }
+
+        write_pid_file(&path, pid)?;
+        Ok(Self {
+            path,
+            pid,
+            _lock_file: lock_file,
+        })
     }
 }
 
 impl Drop for DaemonLock {
     fn drop(&mut self) {
-        let current_pid = fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|pid| pid.trim().parse::<u32>().ok());
-
-        if current_pid == Some(self.pid) {
+        if read_pid(&self.path) == Some(self.pid) {
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -89,35 +69,30 @@ fn lock_path_for(pid_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-#[cfg(unix)]
 fn lock_daemon_file(file: &fs::File, pid_path: &Path) -> Result<()> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        return Ok(());
-    }
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            if let Some(existing_pid) = read_pid(pid_path)
+                && process_is_current_executable(existing_pid)
+            {
+                bail!("maid is already running with pid {existing_pid}");
+            }
 
-    let err = std::io::Error::last_os_error();
-    if err.kind() == ErrorKind::WouldBlock {
-        if let Some(existing_pid) = fs::read_to_string(pid_path)
-            .ok()
-            .and_then(|pid| pid.trim().parse::<u32>().ok())
-            && process_is_current_executable(existing_pid)
-        {
-            bail!("maid is already running with pid {existing_pid}");
+            bail!("maid is already starting or running");
         }
-
-        bail!("maid is already starting or running");
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to lock {}", lock_path_for(pid_path).display())),
     }
-
-    Err(err).with_context(|| format!("failed to lock {}", lock_path_for(pid_path).display()))
 }
 
-#[cfg(not(unix))]
-fn lock_daemon_file(_file: &fs::File, _pid_path: &Path) -> Result<()> {
-    Ok(())
+fn read_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
 }
 
-fn create_pid_file(path: &Path, pid: u32) -> Result<bool> {
+fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut file = tempfile::Builder::new()
         .prefix(".maid.pid.")
@@ -129,9 +104,8 @@ fn create_pid_file(path: &Path, pid: u32) -> Result<bool> {
         .sync_all()
         .with_context(|| format!("failed to sync {}", path.display()))?;
 
-    match file.into_temp_path().persist_noclobber(path) {
-        Ok(()) => Ok(true),
-        Err(err) if err.error.kind() == ErrorKind::AlreadyExists => Ok(false),
+    match file.into_temp_path().persist(path) {
+        Ok(()) => Ok(()),
         Err(err) => Err(err.error).with_context(|| format!("failed to create {}", path.display())),
     }
 }
@@ -178,20 +152,20 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("maid.pid");
 
-        assert!(create_pid_file(&path, 12345).unwrap());
+        write_pid_file(&path, 12345).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap().trim(), "12345");
     }
 
     #[test]
-    fn does_not_replace_existing_pid_file_when_publishing() {
+    fn replaces_existing_pid_file_when_publishing() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("maid.pid");
         fs::write(&path, "existing").unwrap();
 
-        assert!(!create_pid_file(&path, 12345).unwrap());
+        write_pid_file(&path, 12345).unwrap();
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "existing");
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "12345");
     }
 
     #[test]
