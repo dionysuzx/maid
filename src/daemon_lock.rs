@@ -1,11 +1,10 @@
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::{
     ffi::OsString,
-    fs::{self, OpenOptions},
-    io::{ErrorKind, Write},
+    fs::{self, OpenOptions, TryLockError},
+    io::Write,
     path::{Path, PathBuf},
     process,
 };
@@ -70,9 +69,9 @@ fn lock_path_for(pid_path: &Path) -> PathBuf {
 }
 
 fn lock_daemon_file(file: &fs::File, pid_path: &Path) -> Result<()> {
-    match file.try_lock_exclusive() {
+    match file.try_lock() {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+        Err(TryLockError::WouldBlock) => {
             if let Some(existing_pid) = read_pid(pid_path)
                 && process_is_current_executable(existing_pid)
             {
@@ -81,7 +80,7 @@ fn lock_daemon_file(file: &fs::File, pid_path: &Path) -> Result<()> {
 
             bail!("maid is already starting or running");
         }
-        Err(err) => Err(err)
+        Err(TryLockError::Error(err)) => Err(err)
             .with_context(|| format!("failed to lock {}", lock_path_for(pid_path).display())),
     }
 }
