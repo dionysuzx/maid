@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     process,
 };
@@ -24,15 +24,11 @@ impl DaemonLock {
 
         let pid = process::id();
         loop {
-            match OpenOptions::new().create_new(true).write(true).open(&path) {
-                Ok(mut file) => {
-                    writeln!(file, "{pid}")
-                        .with_context(|| format!("failed to write {}", path.display()))?;
-                    file.sync_all()
-                        .with_context(|| format!("failed to sync {}", path.display()))?;
+            match create_pid_file(&path, pid) {
+                Ok(true) => {
                     return Ok(Self { path, pid });
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(false) => {
                     let existing_pid = fs::read_to_string(&path)
                         .ok()
                         .and_then(|pid| pid.trim().parse::<u32>().ok());
@@ -48,8 +44,7 @@ impl DaemonLock {
                     })?;
                 }
                 Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("failed to create {}", path.display()));
+                    return Err(err);
                 }
             }
         }
@@ -65,6 +60,25 @@ impl Drop for DaemonLock {
         if current_pid == Some(self.pid) {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+fn create_pid_file(path: &Path, pid: u32) -> Result<bool> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::Builder::new()
+        .prefix(".maid.pid.")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create temp pid file in {}", parent.display()))?;
+
+    writeln!(file, "{pid}").with_context(|| format!("failed to write {}", path.display()))?;
+    file.as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))?;
+
+    match file.into_temp_path().persist_noclobber(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err.error).with_context(|| format!("failed to create {}", path.display())),
     }
 }
 
@@ -104,6 +118,27 @@ fn process_is_current_executable(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publishes_complete_pid_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("maid.pid");
+
+        assert!(create_pid_file(&path, 12345).unwrap());
+
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "12345");
+    }
+
+    #[test]
+    fn does_not_replace_existing_pid_file_when_publishing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("maid.pid");
+        fs::write(&path, "existing").unwrap();
+
+        assert!(!create_pid_file(&path, 12345).unwrap());
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "existing");
+    }
 
     #[test]
     fn prevents_two_instances_with_the_same_pid_file() {
