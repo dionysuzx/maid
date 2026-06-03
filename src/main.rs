@@ -4,11 +4,11 @@ use maid::{
     config::{Config, ImplementationCommitIdentity, ImplementationGitAuth},
     github::GitHubRestClient,
     maid::{Maid, MaidSettings},
-    repo_cache::{
-        ExpectedGitIdentity as ExpectedRepoGitIdentity, GitRepoCache, IssueCommitIdentity,
+    task_limit::FileTaskStartRecorder,
+    worktree::{
+        ExpectedGitIdentity as ExpectedWorktreeGitIdentity, GitWorktrees, IssueCommitIdentity,
         IssueGitAuth,
     },
-    task_limit::FileTaskStartRecorder,
 };
 use std::time::Duration;
 use tracing::{error, info};
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
         .implementation_actor
         .expected_git_identity
         .clone()
-        .map(|identity| ExpectedRepoGitIdentity {
+        .map(|identity| ExpectedWorktreeGitIdentity {
             name: identity.name,
             email: identity.email,
             gpgsign: identity.gpgsign,
@@ -49,8 +49,8 @@ async fn main() -> Result<()> {
     let maid = Maid::new(
         bot_github,
         implementation_github,
-        GitRepoCache::new(
-            config.cache_dir.clone(),
+        GitWorktrees::new(
+            config.git_dir.clone(),
             config.github_token.clone(),
             config.bot_login.clone(),
         )
@@ -78,7 +78,8 @@ async fn main() -> Result<()> {
     .with_task_start_recorder(FileTaskStartRecorder::new(
         config.task_limit_per_24h,
         config.task_start_ledger_path.clone(),
-    ));
+    ))
+    .into_concurrent(config.max_concurrent_requests);
 
     let poll_interval = config.poll_interval;
     let task_limit_per_24h = config
@@ -90,8 +91,10 @@ async fn main() -> Result<()> {
                 Ok(report) => info!(
                     seen = report.seen,
                     skipped = report.skipped,
+                    started = report.started,
                     responded = report.responded,
                     failed = report.failed,
+                    in_flight = report.in_flight,
                     "poll complete"
                 ),
                 Err(err) => error!(error = ?err, "poll failed"),
@@ -101,10 +104,11 @@ async fn main() -> Result<()> {
     });
 
     info!(
-        cache_dir = %config.cache_dir.display(),
+        git_dir = %config.git_dir.display(),
         task_start_ledger = %config.task_start_ledger_path.display(),
         poll_seconds = config.poll_interval.as_secs(),
         task_limit_per_24h = %task_limit_per_24h,
+        max_concurrent_requests = config.max_concurrent_requests,
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),
@@ -112,9 +116,6 @@ async fn main() -> Result<()> {
         auto_implement_repos = config.auto_implement_repos.len(),
         auto_implement_label = %config.auto_implement_label,
         auto_implement_window_days = config.auto_implement_window_days,
-        implementation_actor = %config.implementation_actor.login,
-        implementation_git_auth = ?config.implementation_actor.git_auth,
-        implementation_commit_identity = ?config.implementation_actor.commit_identity,
         "maid started"
     );
 

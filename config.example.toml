@@ -18,10 +18,11 @@ auto_review_repos = []
 
 # Optional. Defaults shown below.
 poll_seconds = 20
-cache_dir = "~/.maid/cache"
+git_dir = "~/.maid/git"
 codex_bin = "codex"
+max_concurrent_requests = 1
 
-# Required. These values are passed to Codex and shown in posted footers.
+# Required. These values are passed to Codex.
 codex_model = "gpt-5.5"
 codex_reasoning_effort = "high"
 
@@ -40,7 +41,7 @@ codex_reasoning_effort = "high"
 # commit_identity = "host"
 
 # Optional. Checked only when commit_identity = "host".
-# Maid reads the effective git config from the prepared checkout before running
+# Maid reads the effective git config from the prepared worktree before running
 # Codex and only verifies fields configured here.
 # [implementation_actor.expected_git_identity]
 # name = "Your Name"
@@ -53,13 +54,16 @@ codex_reasoning_effort = "high"
 # {{mention_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
 # Supported pull_request_opened placeholders:
 # {{pr_url}}, {{author}}
+# Supported operator_mention placeholders:
+# {{bot_login}}, {{trigger_author}}, {{mention_url}}, {{pr_url}},
+# {{raw_body}}, {{request_text}}, {{operator_trigger}}
 # Supported issue_implementation placeholders:
 # {{issue_url}}, {{branch}}, {{title}}, {{body}}
 [codex_prompts]
 mention = """
 You are responding to a GitHub pull request mention.
 
-Inspect the checkout in your current working directory and answer the request.
+Inspect the worktree in your current working directory and answer the request.
 Return only the GitHub comment body to post. Do not include tool logs or wrappers.
 
 Mention URL:
@@ -77,7 +81,7 @@ Cleaned request text:
 pull_request_opened = """
 You are responding automatically to a GitHub pull request opened by a trusted account.
 
-Inspect the checkout in your current working directory and review the pull request.
+Inspect the worktree in your current working directory and review the pull request.
 Return only the GitHub comment body to post. Do not include tool logs or wrappers.
 
 Pull request URL:
@@ -89,10 +93,26 @@ Opened by:
 Review request:
 please review
 """
+operator_mention = """
+You are handling a trusted Maid operator request.
+
+You may use git, gh, and local tools to complete the request, including editing files, committing, pushing, or opening pull requests when the request calls for it.
+
+Context:
+- Bot login: {{bot_login}}
+- Trigger author: {{trigger_author}}
+- Mention URL: {{mention_url}}
+- Pull request URL: {{pr_url}}
+
+Operator request:
+{{request_text}}
+
+When finished, return a concise final status for Maid to post back to the pull request.
+"""
 issue_implementation = """
 You are implementing a GitHub issue from a trusted label trigger.
 
-Inspect the checkout in your current working directory, make the smallest code change that correctly implements the issue, and run the relevant checks when practical.
+Inspect the worktree in your current working directory, make the smallest code change that correctly implements the issue, and run the relevant checks when practical.
 Leave your changes in the working tree. Do not commit, push, create branches, or open pull requests.
 Return only a concise pull request body describing what changed and what you checked. Do not include tool logs or wrappers.
 

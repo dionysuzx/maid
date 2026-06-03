@@ -21,10 +21,11 @@ pub struct Config {
     pub auto_implement_repos: Vec<RepoSlug>,
     pub auto_implement_label: String,
     pub auto_implement_window_days: u64,
-    pub cache_dir: PathBuf,
+    pub git_dir: PathBuf,
     pub poll_interval: Duration,
     pub task_start_ledger_path: PathBuf,
     pub task_limit_per_24h: Option<usize>,
+    pub max_concurrent_requests: usize,
     pub codex_bin: String,
     pub codex_model: String,
     pub codex_reasoning_effort: String,
@@ -96,12 +97,16 @@ impl Config {
         let auto_implement_label =
             non_empty(file.auto_implement_label).unwrap_or_else(|| "maid".to_string());
         let auto_implement_window_days = file.auto_implement_window_days.unwrap_or(30).max(1);
-        let cache_dir = non_empty(file.cache_dir)
+        let git_dir = non_empty(file.git_dir)
             .map(|path| expand_home(&path))
             .transpose()?
-            .unwrap_or_else(|| maid_home.join("cache"));
+            .unwrap_or_else(|| maid_home.join("git"));
         let poll_seconds = file.poll_seconds.unwrap_or(20).max(10);
         let task_limit_per_24h = file.task_limit_per_24h;
+        let max_concurrent_requests = file.max_concurrent_requests.unwrap_or(1);
+        if max_concurrent_requests == 0 {
+            bail!("max_concurrent_requests must be at least 1");
+        }
         let codex_bin = non_empty(file.codex_bin).unwrap_or_else(|| "codex".to_string());
         let codex_model = required_string(file.codex_model, "codex_model")
             .with_context(|| format!("codex_model is required in {}", config_path.display()))?;
@@ -138,10 +143,11 @@ impl Config {
             auto_implement_repos,
             auto_implement_label,
             auto_implement_window_days,
-            cache_dir,
+            git_dir,
             poll_interval: Duration::from_secs(poll_seconds),
             task_start_ledger_path: maid_home.join("task-starts.json"),
             task_limit_per_24h,
+            max_concurrent_requests,
             codex_bin,
             codex_model,
             codex_reasoning_effort,
@@ -162,14 +168,23 @@ struct ConfigFile {
     auto_implement_label: Option<String>,
     auto_implement_window_days: Option<u64>,
     implementation_actor: Option<ImplementationActorFile>,
-    cache_dir: Option<String>,
+    git_dir: Option<String>,
     poll_seconds: Option<u64>,
     task_limit_per_24h: Option<usize>,
+    max_concurrent_requests: Option<usize>,
     codex_bin: Option<String>,
     codex_model: Option<String>,
     codex_reasoning_effort: Option<String>,
     codex_prompts: Option<CodexPromptsFile>,
     github_api_ip: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+struct CodexPromptsFile {
+    mention: Option<String>,
+    pull_request_opened: Option<String>,
+    operator_mention: Option<String>,
+    issue_implementation: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -186,13 +201,6 @@ struct ExpectedGitIdentityFile {
     email: Option<String>,
     gpgsign: Option<bool>,
     gpg_format: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
-struct CodexPromptsFile {
-    mention: Option<String>,
-    pull_request_opened: Option<String>,
-    issue_implementation: Option<String>,
 }
 
 impl ConfigFile {
@@ -340,13 +348,17 @@ fn required_codex_prompts(
     require_issue_implementation: bool,
 ) -> Result<CodexPromptTemplates> {
     let Some(prompts) = value else {
-        bail!("codex_prompts must include mention and pull_request_opened templates");
+        bail!(
+            "codex_prompts must include mention, pull_request_opened, and operator_mention templates"
+        );
     };
 
     let mention = non_empty(prompts.mention)
         .ok_or_else(|| anyhow!("codex_prompts.mention must not be empty"))?;
     let pull_request_opened = non_empty(prompts.pull_request_opened)
         .ok_or_else(|| anyhow!("codex_prompts.pull_request_opened must not be empty"))?;
+    let operator_mention = non_empty(prompts.operator_mention)
+        .ok_or_else(|| anyhow!("codex_prompts.operator_mention must not be empty"))?;
     let issue_implementation = non_empty(prompts.issue_implementation);
     if require_issue_implementation && issue_implementation.is_none() {
         bail!(
@@ -357,6 +369,7 @@ fn required_codex_prompts(
     Ok(CodexPromptTemplates {
         mention,
         pull_request_opened,
+        operator_mention,
         issue_implementation: issue_implementation.unwrap_or_default(),
     })
 }
@@ -437,9 +450,10 @@ auto_implement_accounts = ["dionysuzx"]
 auto_implement_repos = ["dionysuzx/maid"]
 auto_implement_label = "maid"
 auto_implement_window_days = 14
-cache_dir = "~/.maid/cache"
+git_dir = "~/.maid/git"
 poll_seconds = 30
 task_limit_per_24h = 5
+max_concurrent_requests = 3
 codex_bin = "codex-test"
 codex_model = "gpt-test"
 codex_reasoning_effort = "high"
@@ -459,6 +473,7 @@ gpg_format = "ssh"
 [codex_prompts]
 mention = "mention {{{{cleaned_text}}}}"
 pull_request_opened = "review {{{{pr_url}}}}"
+operator_mention = "operator {{{{request_text}}}}"
 issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
 "#
         )
@@ -501,9 +516,10 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
         );
         assert_eq!(expected_git_identity.gpgsign, Some(true));
         assert_eq!(expected_git_identity.gpg_format.as_deref(), Some("ssh"));
-        assert_eq!(config.cache_dir.as_deref(), Some("~/.maid/cache"));
+        assert_eq!(config.git_dir.as_deref(), Some("~/.maid/git"));
         assert_eq!(config.poll_seconds, Some(30));
         assert_eq!(config.task_limit_per_24h, Some(5));
+        assert_eq!(config.max_concurrent_requests, Some(3));
         assert_eq!(config.codex_bin.as_deref(), Some("codex-test"));
         assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
         assert_eq!(config.codex_reasoning_effort.as_deref(), Some("high"));
@@ -515,6 +531,10 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
         assert_eq!(
             codex_prompts.pull_request_opened.as_deref(),
             Some("review {{pr_url}}")
+        );
+        assert_eq!(
+            codex_prompts.operator_mention.as_deref(),
+            Some("operator {{request_text}}")
         );
         assert_eq!(
             codex_prompts.issue_implementation.as_deref(),
@@ -536,6 +556,7 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
         assert_eq!(config.auto_implement_label, None);
         assert_eq!(config.auto_implement_window_days, None);
         assert!(config.implementation_actor.is_none());
+        assert_eq!(config.git_dir, None);
         assert_eq!(config.poll_seconds, None);
         assert_eq!(config.task_limit_per_24h, None);
         assert_eq!(config.codex_prompts, None);
@@ -549,6 +570,7 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
                 Some(CodexPromptsFile {
                     mention: Some("mention".to_string()),
                     pull_request_opened: None,
+                    operator_mention: Some("operate".to_string()),
                     issue_implementation: Some("implement".to_string()),
                 }),
                 false
@@ -560,6 +582,19 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
                 Some(CodexPromptsFile {
                     mention: Some(" ".to_string()),
                     pull_request_opened: Some("review".to_string()),
+                    operator_mention: Some("operate".to_string()),
+                    issue_implementation: Some("implement".to_string()),
+                }),
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            required_codex_prompts(
+                Some(CodexPromptsFile {
+                    mention: Some("mention".to_string()),
+                    pull_request_opened: Some("review".to_string()),
+                    operator_mention: Some(" ".to_string()),
                     issue_implementation: Some("implement".to_string()),
                 }),
                 false
@@ -572,6 +607,7 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
                 Some(CodexPromptsFile {
                     mention: Some("mention".to_string()),
                     pull_request_opened: Some("review".to_string()),
+                    operator_mention: Some("operate".to_string()),
                     issue_implementation: Some("implement".to_string()),
                 }),
                 true
@@ -580,6 +616,7 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
             CodexPromptTemplates {
                 mention: "mention".to_string(),
                 pull_request_opened: "review".to_string(),
+                operator_mention: "operate".to_string(),
                 issue_implementation: "implement".to_string(),
             }
         );
@@ -592,6 +629,7 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
                 Some(CodexPromptsFile {
                     mention: Some("mention".to_string()),
                     pull_request_opened: Some("review".to_string()),
+                    operator_mention: Some("operate".to_string()),
                     issue_implementation: None,
                 }),
                 false
@@ -600,6 +638,7 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
             CodexPromptTemplates {
                 mention: "mention".to_string(),
                 pull_request_opened: "review".to_string(),
+                operator_mention: "operate".to_string(),
                 issue_implementation: String::new(),
             }
         );
@@ -608,6 +647,7 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
                 Some(CodexPromptsFile {
                     mention: Some("mention".to_string()),
                     pull_request_opened: Some("review".to_string()),
+                    operator_mention: Some("operate".to_string()),
                     issue_implementation: None,
                 }),
                 true
@@ -745,7 +785,7 @@ issue_implementation = "implement {{{{issue_url}}}} on {{{{branch}}}}"
         let home = dirs::home_dir().unwrap();
 
         assert_eq!(expand_home("~").unwrap(), home);
-        assert_eq!(expand_home("~/cache").unwrap(), home.join("cache"));
+        assert_eq!(expand_home("~/git").unwrap(), home.join("git"));
         assert_eq!(
             expand_home("/tmp/maid").unwrap(),
             PathBuf::from("/tmp/maid")

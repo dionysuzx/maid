@@ -46,7 +46,7 @@ impl CodexCli {
 
 #[async_trait]
 impl CodexRunner for CodexCli {
-    async fn run(&self, checkout: &Path, task: &CodexTask) -> Result<CodexRun> {
+    async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
         let output_file = NamedTempFile::new().context("failed to create Codex output file")?;
         let output_path = output_file.path().to_path_buf();
 
@@ -70,7 +70,7 @@ impl CodexRunner for CodexCli {
             .arg("--output-last-message")
             .arg(&output_path)
             .arg("-")
-            .current_dir(checkout)
+            .current_dir(worktree)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -101,7 +101,7 @@ impl CodexRunner for CodexCli {
             Ok::<_, std::io::Error>(stderr_bytes)
         });
 
-        let json = CodexJsonEvents::read(stdout, checkout, task).await?;
+        let json = CodexJsonEvents::read(stdout, worktree, task).await?;
         let status = child.wait().await.context("Codex failed to run")?;
         let stderr = stderr_task
             .await
@@ -159,7 +159,7 @@ impl CodexJsonEvents {
 
     async fn read(
         stdout: impl AsyncRead + Unpin,
-        checkout: &Path,
+        worktree: &Path,
         task: &CodexTask,
     ) -> Result<Self> {
         let mut events = Self::default();
@@ -173,7 +173,8 @@ impl CodexJsonEvents {
                 info!(
                     subject = %task.subject_url,
                     trigger = %task.trigger_url(),
-                    checkout = %checkout.display(),
+                    task_kind = task.task_kind(),
+                    worktree = %worktree.display(),
                     codex_session_id = %session_id,
                     "codex session started"
                 );
