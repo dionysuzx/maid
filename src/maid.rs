@@ -727,6 +727,8 @@ where
     C: CodexRunner + Clone + 'static,
 {
     pub async fn run_once(&self) -> Result<PollReport> {
+        self.maid.retry_pending_handled_markers().await?;
+
         let notifications = self.maid.github.notifications().await?;
         let mut report = PollReport {
             seen: notifications.len(),
@@ -2259,6 +2261,46 @@ mod tests {
         let codex = FakeCodex::default();
         let maid =
             maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.started, 0);
+        assert_eq!(*github.posts.lock().unwrap(), Vec::<String>::new());
+        assert_eq!(codex.calls.lock().unwrap().len(), 0);
+        assert!(
+            github
+                .handled_mentions
+                .lock()
+                .unwrap()
+                .contains("https://api.github.com/repos/o/r/issues/comments/2")
+        );
+        assert!(
+            !crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)
+                .contains(&marker)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_run_retries_pending_mention_marker_without_notification() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("pending-handled-markers.json");
+        let marker = PendingHandledMarker::Mention {
+            api_url: "https://api.github.com/repos/o/r/issues/comments/2".to_string(),
+        };
+        let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
+        store.record(&marker).unwrap();
+
+        let github = FakeGithub::default();
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), worktrees, codex.clone())
+            .with_pending_handled_marker_store(store)
+            .into_concurrent(4);
 
         let report = maid.run_once().await.unwrap();
 
