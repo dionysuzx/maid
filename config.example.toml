@@ -73,6 +73,7 @@ operator_mention = """
 You are handling a trusted Maid operator request.
 
 You may use git, gh, and local tools to complete the request, including editing files, committing, pushing, or opening pull requests when the request calls for it.
+Do not post GitHub comments or reactions yourself. Maid will post your final status back to the pull request and mark the triggering comment handled after you finish.
 
 Context:
 - Bot login: {{bot_login}}

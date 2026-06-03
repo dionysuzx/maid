@@ -9,7 +9,8 @@ Automatic reviews can be enabled for allowlisted repos. Trusted master mentions
 can also start an operator request with `/operate`, which lets Codex use local
 tools such as `git` and `gh` to make changes, commit, push, or open pull
 requests when the request calls for it. Maid still posts Codex's final status
-back to the pull request.
+back to the pull request, so the operator prompt should not let Codex publish
+GitHub comments or handled reactions itself.
 
 Maid keeps one bare git repository per GitHub repo and creates an
 isolated git worktree for each task trigger. Concurrent requests on the same PR
