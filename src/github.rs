@@ -1,6 +1,6 @@
 use crate::{
-    domain::{CommentMention, Notification, PullRequest, RepoSlug},
-    maid::{GithubClient, ReviewState},
+    domain::{CommentMention, Notification, PullRequest, RepoSlug, ReviewState},
+    maid::GithubClient,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -256,6 +256,28 @@ impl GithubClient for GitHubRestClient {
         }))
     }
 
+    async fn mentions_for(&self, notification: &Notification) -> Result<Vec<CommentMention>> {
+        let Some(pr_url) = self.pr_url_for_notification(notification).await? else {
+            return Ok(Vec::new());
+        };
+
+        let pr = self.pull_request_from_url(&pr_url).await?;
+        let comments = self.issue_comments_for_pr(&pr).await?;
+
+        let start = comments.len().saturating_sub(20);
+        Ok(comments
+            .into_iter()
+            .skip(start)
+            .map(|comment| CommentMention {
+                author: comment.user.login,
+                body: comment.body,
+                api_url: comment.url,
+                html_url: comment.html_url,
+                pr: pr.clone(),
+            })
+            .collect())
+    }
+
     async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/pulls?state=open&sort=created&direction=desc&per_page=50",
@@ -299,6 +321,11 @@ impl GithubClient for GitHubRestClient {
         self.add_reaction(mention, HANDLED_REACTION).await
     }
 
+    async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()> {
+        self.add_reaction_to_api_url(api_url, HANDLED_REACTION)
+            .await
+    }
+
     async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState> {
         if self
             .pr_has_reaction(pr, bot_login, HANDLED_REACTION)
@@ -316,6 +343,18 @@ impl GithubClient for GitHubRestClient {
 
     async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()> {
         self.add_pr_reaction(pr, HANDLED_REACTION).await
+    }
+
+    async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()> {
+        let (owner, repo, number) = parse_pull_request_html_url(html_url)?;
+        let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/reactions");
+        self.post_json(
+            &url,
+            &PostReaction {
+                content: HANDLED_REACTION,
+            },
+        )
+        .await
     }
 
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
@@ -555,6 +594,44 @@ mod tests {
 }
 
 impl GitHubRestClient {
+    async fn pr_url_for_notification(&self, notification: &Notification) -> Result<Option<String>> {
+        if let Some(subject_url) = notification.subject_url.as_deref() {
+            return Ok(Some(subject_url.to_string()));
+        }
+
+        let Some(comment_url) = notification.latest_comment_url.as_deref() else {
+            return Ok(None);
+        };
+        let comment = self.get::<ApiComment>(comment_url).await?;
+        if let Some(pull_request_url) = comment.pull_request_url {
+            return Ok(Some(pull_request_url));
+        }
+        if let Some(issue_url) = comment.issue_url {
+            let issue = self.get::<ApiIssue>(&issue_url).await?;
+            return Ok(issue.pull_request.map(|pull_request| pull_request.url));
+        }
+
+        Ok(None)
+    }
+
+    async fn issue_comments_for_pr(&self, pr: &PullRequest) -> Result<Vec<ApiComment>> {
+        let mut comments = Vec::new();
+        for page in 1.. {
+            let url = format!(
+                "https://api.github.com/repos/{}/{}/issues/{}/comments?per_page=100&page={}",
+                pr.owner, pr.repo, pr.number, page
+            );
+            let mut page_comments = self.get::<Vec<ApiComment>>(&url).await?;
+            let done = page_comments.len() < 100;
+            comments.append(&mut page_comments);
+            if done {
+                return Ok(comments);
+            }
+        }
+
+        Ok(comments)
+    }
+
     async fn pull_request_from_url(&self, pr_url: &str) -> Result<PullRequest> {
         let pr = self.get::<ApiPullRequest>(pr_url).await?;
         Self::pull_request_from_api(pr)
@@ -592,7 +669,12 @@ impl GitHubRestClient {
     }
 
     async fn add_reaction(&self, mention: &CommentMention, content: &str) -> Result<()> {
-        let url = format!("{}/reactions", mention.api_url);
+        self.add_reaction_to_api_url(&mention.api_url, content)
+            .await
+    }
+
+    async fn add_reaction_to_api_url(&self, api_url: &str, content: &str) -> Result<()> {
+        let url = format!("{api_url}/reactions");
         self.post_json(&url, &PostReaction { content }).await
     }
 
@@ -624,6 +706,35 @@ impl GitHubRestClient {
     }
 }
 
+fn parse_pull_request_html_url(html_url: &str) -> Result<(&str, &str, u64)> {
+    let Some(path) = html_url.strip_prefix("https://github.com/") else {
+        bail!("pull request URL must start with https://github.com/: {html_url}");
+    };
+    let mut parts = path.split('/');
+    let owner = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow!("pull request URL is missing owner: {html_url}"))?;
+    let repo = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow!("pull request URL is missing repo: {html_url}"))?;
+    match parts.next() {
+        Some("pull") => {}
+        _ => bail!("pull request URL must contain /pull/: {html_url}"),
+    }
+    let number = parts
+        .next()
+        .ok_or_else(|| anyhow!("pull request URL is missing number: {html_url}"))?
+        .parse()
+        .with_context(|| format!("pull request URL has invalid number: {html_url}"))?;
+    if parts.next().is_some() {
+        bail!("pull request URL has unexpected path after number: {html_url}");
+    }
+
+    Ok((owner, repo, number))
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiNotification {
     id: String,
@@ -641,6 +752,7 @@ struct ApiNotificationSubject {
 
 #[derive(Debug, Deserialize)]
 struct ApiComment {
+    url: String,
     body: String,
     html_url: String,
     user: ApiUser,

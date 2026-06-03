@@ -83,6 +83,12 @@ pub struct CommentMention {
     pub pr: PullRequest,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewState {
+    Pending,
+    Handled,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MentionRequest {
     pub raw_body: String,

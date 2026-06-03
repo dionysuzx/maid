@@ -1,7 +1,11 @@
+pub mod auto_review;
 pub mod codex;
 pub mod config;
+pub mod daemon_lock;
 pub mod domain;
 pub mod github;
+pub mod handled_marker;
 pub mod maid;
+pub mod mention_thread;
 pub mod task_limit;
 pub mod worktree;

@@ -110,27 +110,25 @@ impl TaskStartLedgerFile {
     }
 
     fn write(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
 
-        let temp_path = path.with_file_name(format!(
-            ".{}.tmp",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("maid-task-starts.json")
-        ));
-        let contents = serde_json::to_vec_pretty(self).context("failed to encode task ledger")?;
-        fs::write(&temp_path, contents)
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        fs::rename(&temp_path, path).with_context(|| {
-            format!(
-                "failed to replace {} with {}",
-                path.display(),
-                temp_path.display()
-            )
-        })?;
+        let mut file = tempfile::Builder::new()
+            .prefix(".maid-task-starts.")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!("failed to create temp task ledger in {}", parent.display())
+            })?;
+
+        serde_json::to_writer_pretty(&mut file, self).context("failed to encode task ledger")?;
+        file.as_file()
+            .sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        file.into_temp_path()
+            .persist(path)
+            .map_err(|err| err.error)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
 }
