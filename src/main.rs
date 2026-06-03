@@ -1,7 +1,7 @@
 use anyhow::Result;
 use maid::{
     codex::CodexCli, config::Config, github::GitHubRestClient, maid::Maid,
-    repo_cache::GitRepoCache, task_limit::FileTaskStartRecorder,
+    task_limit::FileTaskStartRecorder, worktree::GitWorktrees,
 };
 use std::time::Duration;
 use tracing::{error, info};
@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let maid = Maid::new(
         GitHubRestClient::with_api_ip(config.github_token.clone(), config.github_api_ip),
-        GitRepoCache::new(config.cache_dir.clone(), config.github_token.clone()),
+        GitWorktrees::new(config.git_dir.clone(), config.github_token.clone()),
         CodexCli::with_options(
             config.codex_bin.clone(),
             config.codex_model.clone(),
@@ -31,7 +31,8 @@ async fn main() -> Result<()> {
     .with_task_start_recorder(FileTaskStartRecorder::new(
         config.task_limit_per_24h,
         config.task_start_ledger_path.clone(),
-    ));
+    ))
+    .into_concurrent(config.max_concurrent_requests);
 
     let poll_interval = config.poll_interval;
     let task_limit_per_24h = config
@@ -43,8 +44,10 @@ async fn main() -> Result<()> {
                 Ok(report) => info!(
                     seen = report.seen,
                     skipped = report.skipped,
+                    started = report.started,
                     responded = report.responded,
                     failed = report.failed,
+                    in_flight = report.in_flight,
                     "poll complete"
                 ),
                 Err(err) => error!(error = ?err, "poll failed"),
@@ -54,10 +57,11 @@ async fn main() -> Result<()> {
     });
 
     info!(
-        cache_dir = %config.cache_dir.display(),
+        git_dir = %config.git_dir.display(),
         task_start_ledger = %config.task_start_ledger_path.display(),
         poll_seconds = config.poll_interval.as_secs(),
         task_limit_per_24h = %task_limit_per_24h,
+        max_concurrent_requests = config.max_concurrent_requests,
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),

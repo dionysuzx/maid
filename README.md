@@ -1,8 +1,8 @@
 ![Maid banner](assets/maid-banner-v2.jpg)
 
 Maid is a small Rust polling bot for GitHub pull requests. It runs as a GitHub
-bot account, checks out eligible PRs into a local cache, runs `codex`, and posts
-Codex's final answer as a normal PR comment.
+bot account, prepares isolated worktrees for eligible PR tasks, runs `codex`,
+and posts Codex's final answer as a normal PR comment.
 
 Maid responds when an allowed master account mentions the bot in a PR comment.
 Automatic reviews can be enabled for allowlisted repos. Trusted master mentions
@@ -10,6 +10,10 @@ can also start an operator request with `/operate`, which lets Codex use local
 tools such as `git` and `gh` to make changes, commit, push, or open pull
 requests when the request calls for it. Maid still posts Codex's final status
 back to the pull request.
+
+Maid keeps one bare git repository per GitHub repo and creates an
+isolated git worktree for each task trigger. Concurrent requests on the same PR
+therefore run in separate working directories while sharing git objects.
 
 ## Prerequisites
 
@@ -46,8 +50,12 @@ Runtime config lives at `~/.maid/config.toml`. The required fields are
   defaults to `master_accounts`.
 - `auto_review_repos`: repositories to poll for automatic PR reviews; empty or
   omitted means mention-only mode.
+- `git_dir`: local directory for bare git repositories and task worktrees.
+  Defaults to `~/.maid/git`.
 - `task_limit_per_24h`: optional rolling 24-hour cap. Omit it for no limit; set
   it to `0` to pause new task starts.
+- `max_concurrent_requests`: maximum Codex tasks Maid may run at once. Defaults
+  to `1`, which still lets polling continue while a task is running.
 - `codex_model` and `codex_reasoning_effort`: required Codex invocation
   settings.
 - `[codex_prompts]`: required prompt templates for the internal Codex run.
