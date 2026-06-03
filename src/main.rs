@@ -1,7 +1,8 @@
 use anyhow::Result;
 use maid::{
-    codex::CodexCli, config::Config, github::GitHubRestClient, maid::Maid,
-    task_limit::FileTaskStartRecorder, worktree::GitWorktrees,
+    codex::CodexCli, config::Config, github::GitHubRestClient,
+    handled_marker::FilePendingHandledMarkerStore, maid::Maid, task_limit::FileTaskStartRecorder,
+    worktree::GitWorktrees,
 };
 use std::time::Duration;
 use tracing::{error, info};
@@ -36,6 +37,9 @@ async fn main() -> Result<()> {
         config.task_limit_per_24h,
         config.task_start_ledger_path.clone(),
     ))
+    .with_pending_handled_marker_store(FilePendingHandledMarkerStore::new(
+        config.pending_handled_marker_ledger_path.clone(),
+    ))
     .into_concurrent(config.max_concurrent_requests);
 
     let task_limit_per_24h = config
@@ -61,6 +65,7 @@ async fn main() -> Result<()> {
     info!(
         git_dir = %config.git_dir.display(),
         task_start_ledger = %config.task_start_ledger_path.display(),
+        pending_handled_marker_ledger = %config.pending_handled_marker_ledger_path.display(),
         github_api_requests_per_hour = config.github_api_requests_per_hour.requests_per_hour(),
         task_limit_per_24h = %task_limit_per_24h,
         max_concurrent_requests = config.max_concurrent_requests,

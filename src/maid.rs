@@ -1,6 +1,9 @@
 use crate::domain::{
     CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug,
 };
+use crate::handled_marker::{
+    MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
+};
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,6 +19,9 @@ use tracing::{error, info};
 pub trait GithubClient: Send + Sync {
     async fn notifications(&self) -> Result<Vec<Notification>>;
     async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>>;
+    async fn mentions_for(&self, notification: &Notification) -> Result<Vec<CommentMention>> {
+        Ok(self.mention_for(notification).await?.into_iter().collect())
+    }
     async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -102,6 +108,7 @@ pub struct Maid<G, R, C> {
     auto_review_accounts: HashSet<String>,
     auto_review_repos: Vec<RepoSlug>,
     task_starts: Arc<dyn TaskStartRecorder>,
+    pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -138,6 +145,7 @@ where
             auto_review_accounts: normalized_logins(auto_review_accounts),
             auto_review_repos: auto_review_repos.into_iter().collect(),
             task_starts: Arc::new(NoTaskLimit),
+            pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
         }
     }
 
@@ -146,6 +154,14 @@ where
         task_starts: impl TaskStartRecorder + 'static,
     ) -> Self {
         self.task_starts = Arc::new(task_starts);
+        self
+    }
+
+    pub fn with_pending_handled_marker_store(
+        mut self,
+        pending_handled_markers: impl PendingHandledMarkerStore + 'static,
+    ) -> Self {
+        self.pending_handled_markers = Arc::new(pending_handled_markers);
         self
     }
 
@@ -172,29 +188,10 @@ where
             }
 
             match self.task_for_notification(&notification).await {
-                Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
-                    Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
-                        Ok(()) => report.responded += 1,
-                        Err(err) => {
-                            report.failed += 1;
-                            error!(
-                                notification_id = notification.id,
-                                error = ?err,
-                                "failed to handle notification"
-                            );
-                        }
-                    },
-                    Ok(TaskStartOutcome::Skipped) => report.skipped += 1,
-                    Err(err) => {
-                        report.failed += 1;
-                        error!(
-                            notification_id = notification.id,
-                            error = ?err,
-                            "failed to start notification task"
-                        );
-                    }
-                },
-                Ok(TaskAssessment::Skipped) => report.skipped += 1,
+                Ok(assessments) => {
+                    self.handle_assessments(&notification, assessments, &mut report)
+                        .await;
+                }
                 Err(err) => {
                     report.failed += 1;
                     error!(
@@ -250,65 +247,159 @@ where
         Ok(report)
     }
 
-    async fn task_for_notification(&self, notification: &Notification) -> Result<TaskAssessment> {
+    async fn handle_assessments(
+        &self,
+        notification: &Notification,
+        assessments: Vec<TaskAssessment>,
+        report: &mut PollReport,
+    ) {
+        for assessment in assessments {
+            match assessment {
+                TaskAssessment::Ready(intent) => match self.start_task(intent).await {
+                    Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
+                        Ok(()) => report.responded += 1,
+                        Err(err) => {
+                            report.failed += 1;
+                            error!(
+                                notification_id = notification.id,
+                                error = ?err,
+                                "failed to handle notification"
+                            );
+                        }
+                    },
+                    Ok(TaskStartOutcome::Skipped) => report.skipped += 1,
+                    Err(err) => {
+                        report.failed += 1;
+                        error!(
+                            notification_id = notification.id,
+                            error = ?err,
+                            "failed to start notification task"
+                        );
+                    }
+                },
+                TaskAssessment::Skipped => report.skipped += 1,
+            }
+        }
+    }
+
+    async fn task_for_notification(
+        &self,
+        notification: &Notification,
+    ) -> Result<Vec<TaskAssessment>> {
         if notification.is_pr_mention_candidate() {
-            return self.task_for_mention(notification).await;
+            return self.tasks_for_mentions(notification).await;
         }
 
         self.github.mark_notification_handled(notification).await?;
-        Ok(TaskAssessment::Skipped)
+        Ok(vec![TaskAssessment::Skipped])
     }
 
-    async fn task_for_mention(&self, notification: &Notification) -> Result<TaskAssessment> {
-        let Some(mention) = self.github.mention_for(notification).await? else {
-            return Ok(TaskAssessment::Skipped);
-        };
+    async fn tasks_for_mentions(&self, notification: &Notification) -> Result<Vec<TaskAssessment>> {
+        let mentions = self.mentions_for_notification(notification).await?;
+        let mut assessments = Vec::new();
 
-        if mention.author.eq_ignore_ascii_case(&self.bot_login) {
-            return Ok(TaskAssessment::Skipped);
-        }
+        for mention in mentions {
+            if mention.author.eq_ignore_ascii_case(&self.bot_login) {
+                continue;
+            }
 
-        if !self
-            .master_accounts
-            .contains(&mention.author.to_ascii_lowercase())
-        {
-            info!(
-                notification_id = notification.id,
-                mention = %mention.html_url,
-                author = %mention.author,
-                "skipping mention from non-master account"
-            );
-            self.github.mark_notification_handled(notification).await?;
-            return Ok(TaskAssessment::Skipped);
-        }
-
-        let Some(request) = MentionRequest::parse(&mention.body, &self.bot_login)? else {
-            return Ok(TaskAssessment::Skipped);
-        };
-
-        match self.github.mention_state(&mention, &self.bot_login).await? {
-            ReviewState::Pending => {}
-            ReviewState::Handled => {
+            if !self
+                .master_accounts
+                .contains(&mention.author.to_ascii_lowercase())
+            {
                 info!(
                     notification_id = notification.id,
                     mention = %mention.html_url,
-                    "skipping already handled mention"
+                    author = %mention.author,
+                    "skipping mention from non-master account"
                 );
-                self.github.mark_notification_handled(notification).await?;
-                return Ok(TaskAssessment::Skipped);
+                continue;
             }
+
+            let Some(request) = MentionRequest::parse(&mention.body, &self.bot_login)? else {
+                continue;
+            };
+
+            match self.github.mention_state(&mention, &self.bot_login).await? {
+                ReviewState::Pending => {
+                    if self
+                        .retry_pending_mention_marker(notification, &mention)
+                        .await?
+                    {
+                        assessments.push(TaskAssessment::Skipped);
+                        continue;
+                    }
+                }
+                ReviewState::Handled => {
+                    self.pending_handled_markers
+                        .remove(&PendingHandledMarker::for_mention(&mention))?;
+                    info!(
+                        notification_id = notification.id,
+                        mention = %mention.html_url,
+                        "skipping already handled mention"
+                    );
+                    assessments.push(TaskAssessment::Skipped);
+                    continue;
+                }
+            }
+
+            let task = CodexTask {
+                pr_url: mention.pr.html_url.clone(),
+                origin: mention_task_origin(&mention, request, &self.bot_login),
+            };
+
+            assessments.push(TaskAssessment::Ready(Box::new(TaskIntent::Mention {
+                notification: notification.clone(),
+                mention: Box::new(mention),
+                task,
+            })));
         }
 
-        let task = CodexTask {
-            pr_url: mention.pr.html_url.clone(),
-            origin: mention_task_origin(&mention, request, &self.bot_login),
+        if assessments.iter().all(|assessment| assessment.is_skipped()) {
+            self.github.mark_notification_handled(notification).await?;
+        }
+
+        if assessments.is_empty() {
+            return Ok(vec![TaskAssessment::Skipped]);
+        }
+        Ok(assessments)
+    }
+
+    async fn mentions_for_notification(
+        &self,
+        notification: &Notification,
+    ) -> Result<Vec<CommentMention>> {
+        let Some(latest) = self.github.mention_for(notification).await? else {
+            return Ok(Vec::new());
         };
 
-        Ok(TaskAssessment::Ready(Box::new(TaskIntent::Mention {
-            notification: notification.clone(),
-            mention: Box::new(mention),
-            task,
-        })))
+        if latest.author.eq_ignore_ascii_case(&self.bot_login) {
+            return self.scanned_mentions_or_latest(notification, latest).await;
+        }
+
+        if self
+            .master_accounts
+            .contains(&latest.author.to_ascii_lowercase())
+            && MentionRequest::parse(&latest.body, &self.bot_login)?.is_some()
+            && self.github.mention_state(&latest, &self.bot_login).await? == ReviewState::Pending
+        {
+            return self.scanned_mentions_or_latest(notification, latest).await;
+        }
+
+        Ok(vec![latest])
+    }
+
+    async fn scanned_mentions_or_latest(
+        &self,
+        notification: &Notification,
+        latest: CommentMention,
+    ) -> Result<Vec<CommentMention>> {
+        let mentions = self.github.mentions_for(notification).await?;
+        if mentions.is_empty() {
+            return Ok(vec![latest]);
+        }
+
+        Ok(mentions)
     }
 
     async fn task_for_auto_review_pr(&self, pr: &PullRequest) -> Result<TaskAssessment> {
@@ -329,8 +420,14 @@ where
         }
 
         match self.github.pr_state(pr, &self.bot_login).await? {
-            ReviewState::Pending => {}
+            ReviewState::Pending => {
+                if self.retry_pending_pr_marker(pr).await? {
+                    return Ok(TaskAssessment::Skipped);
+                }
+            }
             ReviewState::Handled => {
+                self.pending_handled_markers
+                    .remove(&PendingHandledMarker::for_pull_request(pr))?;
                 info!(
                     pr = %pr.html_url,
                     "skipping already handled auto-review pull request"
@@ -351,6 +448,41 @@ where
                 task,
             },
         )))
+    }
+
+    async fn retry_pending_mention_marker(
+        &self,
+        notification: &Notification,
+        mention: &CommentMention,
+    ) -> Result<bool> {
+        let marker = PendingHandledMarker::for_mention(mention);
+        if !self.pending_handled_markers.contains(&marker)? {
+            return Ok(false);
+        }
+
+        self.github.mark_mention_handled(mention).await?;
+        self.pending_handled_markers.remove(&marker)?;
+        info!(
+            notification_id = notification.id,
+            mention = %mention.html_url,
+            "marked pending completed mention handled"
+        );
+        Ok(true)
+    }
+
+    async fn retry_pending_pr_marker(&self, pr: &PullRequest) -> Result<bool> {
+        let marker = PendingHandledMarker::for_pull_request(pr);
+        if !self.pending_handled_markers.contains(&marker)? {
+            return Ok(false);
+        }
+
+        self.github.mark_pr_handled(pr).await?;
+        self.pending_handled_markers.remove(&marker)?;
+        info!(
+            pr = %pr.html_url,
+            "marked pending completed auto-review pull request handled"
+        );
+        Ok(true)
     }
 
     async fn start_task(&self, intent: Box<TaskIntent>) -> Result<TaskStartOutcome> {
@@ -419,6 +551,8 @@ where
             self.github
                 .post_pr_comment(&mention.pr, &codex_run.response)
                 .await?;
+            let marker = PendingHandledMarker::for_mention(&mention);
+            self.pending_handled_markers.record(&marker)?;
             if let Err(err) = self.github.mark_mention_handled(&mention).await {
                 error!(
                     notification_id = notification.id,
@@ -427,9 +561,9 @@ where
                     error = ?err,
                     "failed to mark mention handled after posting response"
                 );
+            } else {
+                self.pending_handled_markers.remove(&marker)?;
             }
-            self.github.mark_notification_handled(&notification).await?;
-
             if let Some((session_id, resume_command)) = codex_run.resume_command() {
                 info!(
                     notification_id = notification.id,
@@ -480,12 +614,16 @@ where
             self.github
                 .post_pr_comment(&pr, &codex_run.response)
                 .await?;
+            let marker = PendingHandledMarker::for_pull_request(&pr);
+            self.pending_handled_markers.record(&marker)?;
             if let Err(err) = self.github.mark_pr_handled(&pr).await {
                 error!(
                     pr = %pr.html_url,
                     error = ?err,
                     "failed to mark auto-review pull request handled after posting response"
                 );
+            } else {
+                self.pending_handled_markers.remove(&marker)?;
             }
 
             if let Some((session_id, resume_command)) = codex_run.resume_command() {
@@ -573,10 +711,16 @@ where
             }
 
             match self.maid.task_for_notification(&notification).await {
-                Ok(TaskAssessment::Ready(intent)) => {
-                    self.start_or_defer(intent, &mut report).await;
+                Ok(assessments) => {
+                    for assessment in assessments {
+                        match assessment {
+                            TaskAssessment::Ready(intent) => {
+                                self.start_or_defer(intent, &mut report).await;
+                            }
+                            TaskAssessment::Skipped => report.skipped += 1,
+                        }
+                    }
                 }
-                Ok(TaskAssessment::Skipped) => report.skipped += 1,
                 Err(err) => {
                     report.failed += 1;
                     error!(
@@ -698,6 +842,12 @@ enum TaskAssessment {
     Skipped,
 }
 
+impl TaskAssessment {
+    fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum TaskStartOutcome {
     Started(Box<StartedTask>),
@@ -783,6 +933,20 @@ impl StartedTask {
     }
 }
 
+impl PendingHandledMarker {
+    fn for_mention(mention: &CommentMention) -> Self {
+        Self::Mention {
+            api_url: mention.api_url.clone(),
+        }
+    }
+
+    fn for_pull_request(pr: &PullRequest) -> Self {
+        Self::PullRequest {
+            html_url: pr.html_url.clone(),
+        }
+    }
+}
+
 fn work_key(notification: &Notification) -> String {
     notification
         .latest_comment_url
@@ -830,10 +994,12 @@ mod tests {
     use tokio::sync::{Barrier, Notify};
 
     type FakeMentionResult = Option<Result<Option<CommentMention>, String>>;
+    type FakeMentionsResult = Option<Result<Vec<CommentMention>, String>>;
     #[derive(Clone, Default)]
     struct FakeGithub {
         notifications: Arc<StdMutex<Vec<Notification>>>,
         mention: Arc<StdMutex<FakeMentionResult>>,
+        mentions: Arc<StdMutex<FakeMentionsResult>>,
         pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         posts: Arc<StdMutex<Vec<String>>>,
         marks: Arc<StdMutex<Vec<String>>>,
@@ -856,16 +1022,15 @@ mod tests {
             &self,
             _notification: &Notification,
         ) -> Result<Option<CommentMention>> {
-            match self
-                .mention
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| Ok(None))
-            {
-                Ok(value) => Ok(value),
-                Err(message) => Err(anyhow!(message)),
+            self.take_mention()
+        }
+
+        async fn mentions_for(&self, _notification: &Notification) -> Result<Vec<CommentMention>> {
+            if let Some(result) = self.mentions.lock().unwrap().take() {
+                return result.map_err(|message| anyhow!(message));
             }
+
+            Ok(self.take_mention()?.into_iter().collect())
         }
 
         async fn open_pull_requests(&self, _repo: &RepoSlug) -> Result<Vec<PullRequest>> {
@@ -946,6 +1111,15 @@ mod tests {
             self.events.lock().unwrap().push("mark".to_string());
             self.marks.lock().unwrap().push(notification.id.clone());
             Ok(())
+        }
+    }
+
+    impl FakeGithub {
+        fn take_mention(&self) -> Result<Option<CommentMention>> {
+            match self.mention.lock().unwrap().take().unwrap_or(Ok(None)) {
+                Ok(value) => Ok(value),
+                Err(message) => Err(anyhow!(message)),
+            }
         }
     }
 
@@ -1196,7 +1370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responds_then_marks_notification_handled() {
+    async fn responds_then_marks_mention_handled() {
         let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
@@ -1218,10 +1392,10 @@ mod tests {
 
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(github.marks.lock().unwrap().is_empty());
         assert_eq!(
             *github.events.lock().unwrap(),
-            vec!["start", "post", "handled", "mark"]
+            vec!["start", "post", "handled"]
         );
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
@@ -1565,7 +1739,7 @@ mod tests {
 
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.marks.lock().unwrap().is_empty());
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
         assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
@@ -1653,6 +1827,7 @@ mod tests {
         let maid = maid(github.clone(), worktrees, codex);
 
         let first_report = maid.run_once().await.unwrap();
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
         let second_report = maid.run_once().await.unwrap();
 
         assert_eq!(first_report.responded, 1);
@@ -1694,7 +1869,154 @@ mod tests {
         assert_eq!(first_report.responded, 1);
         assert_eq!(second_report.responded, 1);
         assert_eq!(github.posts.lock().unwrap().len(), 2);
-        assert_eq!(*github.marks.lock().unwrap(), vec!["n1", "n1"]);
+        assert!(github.marks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn responds_to_pending_mention_hidden_behind_latest_bot_comment() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
+            "maid-bot",
+            "codex response",
+            "4",
+        ))));
+        github
+            .handled_mentions
+            .lock()
+            .unwrap()
+            .insert("https://api.github.com/repos/o/r/issues/comments/2".to_string());
+        *github.mentions.lock().unwrap() = Some(Ok(vec![
+            mention_with_comment("dionysuzx", "@maid-bot first", "2"),
+            mention_with_comment("dionysuzx", "@maid-bot second", "3"),
+            mention_with_comment("maid-bot", "codex response", "4"),
+        ]));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.started_mentions.lock().unwrap(),
+            vec!["https://api.github.com/repos/o/r/issues/comments/3"]
+        );
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert!(github.marks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_run_starts_multiple_pending_mentions_from_same_notification() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
+            "maid-bot",
+            "codex response",
+            "4",
+        ))));
+        *github.mentions.lock().unwrap() = Some(Ok(vec![
+            mention_with_comment("dionysuzx", "@maid-bot first", "2"),
+            mention_with_comment("dionysuzx", "@maid-bot second", "3"),
+            mention_with_comment("dionysuzx", "@maid-bot third", "4"),
+        ]));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), worktrees, codex).into_concurrent(4);
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.started, 3);
+        assert_eq!(
+            *github.started_mentions.lock().unwrap(),
+            vec![
+                "https://api.github.com/repos/o/r/issues/comments/2",
+                "https://api.github.com/repos/o/r/issues/comments/3",
+                "https://api.github.com/repos/o/r/issues/comments/4"
+            ]
+        );
+        assert!(github.marks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_run_scans_when_latest_mention_is_pending_trusted_request() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
+            "dionysuzx",
+            "@maid-bot third",
+            "4",
+        ))));
+        *github.mentions.lock().unwrap() = Some(Ok(vec![
+            mention_with_comment("dionysuzx", "@maid-bot first", "2"),
+            mention_with_comment("dionysuzx", "@maid-bot second", "3"),
+            mention_with_comment("dionysuzx", "@maid-bot third", "4"),
+        ]));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), worktrees, codex).into_concurrent(4);
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.started, 3);
+        assert_eq!(
+            *github.started_mentions.lock().unwrap(),
+            vec![
+                "https://api.github.com/repos/o/r/issues/comments/2",
+                "https://api.github.com/repos/o/r/issues/comments/3",
+                "https://api.github.com/repos/o/r/issues/comments/4"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn handled_latest_trusted_request_does_not_resurrect_older_mentions() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
+            "dionysuzx",
+            "@maid-bot already handled",
+            "4",
+        ))));
+        *github.mentions.lock().unwrap() = Some(Ok(vec![
+            mention_with_comment("dionysuzx", "@maid-bot older pending", "2"),
+            mention_with_comment("dionysuzx", "@maid-bot already handled", "4"),
+        ]));
+        github
+            .handled_mentions
+            .lock()
+            .unwrap()
+            .insert("https://api.github.com/repos/o/r/issues/comments/4".to_string());
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.started_mentions.lock().unwrap().is_empty());
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
     }
 
     #[tokio::test]
@@ -1796,7 +2118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handled_marker_failure_after_post_still_marks_notification_handled() {
+    async fn handled_marker_failure_after_post_leaves_notification_pending() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
@@ -1815,11 +2137,85 @@ mod tests {
 
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert!(github.marks.lock().unwrap().is_empty());
         assert!(github.handled_mentions.lock().unwrap().is_empty());
         assert_eq!(
             *github.events.lock().unwrap(),
-            vec!["start", "post", "handled", "mark"]
+            vec!["start", "post", "handled"]
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_pending_mention_marker_without_rerunning_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("pending-handled-markers.json");
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+        *github.handled_error.lock().unwrap() = Some("reaction failed".to_string());
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), worktrees, codex.clone())
+            .with_pending_handled_marker_store(
+                crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path),
+            );
+
+        let first_report = maid.run_once().await.unwrap();
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+        let second_report = maid.run_once().await.unwrap();
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+        let third_report = maid.run_once().await.unwrap();
+
+        assert_eq!(first_report.responded, 1);
+        assert_eq!(second_report.skipped, 1);
+        assert_eq!(third_report.skipped, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1", "n1"]);
+        assert!(
+            github
+                .handled_mentions
+                .lock()
+                .unwrap()
+                .contains("https://api.github.com/repos/o/r/issues/comments/2")
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_pending_auto_review_marker_without_rerunning_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("pending-handled-markers.json");
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        *github.handled_error.lock().unwrap() = Some("reaction failed".to_string());
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), worktrees, codex.clone())
+            .with_pending_handled_marker_store(
+                crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path),
+            );
+
+        let first_report = maid.run_once().await.unwrap();
+        let second_report = maid.run_once().await.unwrap();
+
+        assert_eq!(first_report.responded, 1);
+        assert_eq!(second_report.skipped, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert!(
+            github
+                .handled_prs
+                .lock()
+                .unwrap()
+                .contains("https://github.com/o/r/pull/1")
         );
     }
 }
