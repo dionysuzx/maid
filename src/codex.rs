@@ -1,6 +1,6 @@
 use crate::{
     domain::{CodexPromptTemplates, CodexTask},
-    maid::{CodexRun, CodexRunMetadata, CodexRunner},
+    maid::{CodexRun, CodexRunner},
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -128,11 +128,6 @@ impl CodexRunner for CodexCli {
         Ok(CodexRun {
             response,
             session_id: json.session_id,
-            metadata: Some(CodexRunMetadata {
-                model: self.model.clone(),
-                reasoning_effort: self.reasoning_effort.clone(),
-                prompt,
-            }),
         })
     }
 }

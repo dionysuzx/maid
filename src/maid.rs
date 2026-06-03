@@ -108,18 +108,9 @@ impl PreparedWorktree {
 pub struct CodexRun {
     pub response: String,
     pub session_id: Option<String>,
-    pub metadata: Option<CodexRunMetadata>,
 }
 
 impl CodexRun {
-    pub fn comment_body(&self) -> String {
-        let Some(metadata) = &self.metadata else {
-            return self.response.clone();
-        };
-
-        format!("{}\n\n{}", self.response, metadata.footer())
-    }
-
     pub fn resume_command(&self) -> Option<(&str, String)> {
         self.session_id.as_deref().map(|session_id| {
             (
@@ -128,45 +119,6 @@ impl CodexRun {
             )
         })
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CodexRunMetadata {
-    pub model: String,
-    pub reasoning_effort: String,
-    pub prompt: String,
-}
-
-impl CodexRunMetadata {
-    fn footer(&self) -> String {
-        let model = &self.model;
-        let reasoning_effort = &self.reasoning_effort;
-        let prompt = fenced_code_block("text", &self.prompt);
-
-        format!(
-            "\
----
-**Codex run**
-
-| Setting | Value |
-| --- | --- |
-| Model | `{model}` |
-| Reasoning effort | `{reasoning_effort}` |
-
-<details>
-<summary>Input prompt</summary>
-
-{prompt}
-
-</details>"
-        )
-    }
-}
-
-fn fenced_code_block(language: &str, value: &str) -> String {
-    let longest_backtick_run = value.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat(longest_backtick_run.max(2) + 1);
-    format!("{fence}{language}\n{value}\n{fence}")
 }
 
 #[derive(Clone)]
@@ -629,7 +581,7 @@ where
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
             self.github
-                .post_pr_comment(&mention.pr, &codex_run.comment_body())
+                .post_pr_comment(&mention.pr, &codex_run.response)
                 .await?;
             if let Err(err) = self.github.mark_mention_handled(&mention).await {
                 error!(
@@ -690,7 +642,7 @@ where
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
             self.github
-                .post_pr_comment(&pr, &codex_run.comment_body())
+                .post_pr_comment(&pr, &codex_run.response)
                 .await?;
             if let Err(err) = self.github.mark_pr_handled(&pr).await {
                 error!(
@@ -1482,7 +1434,6 @@ mod tests {
             Ok(CodexRun {
                 response: "codex response".to_string(),
                 session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
-                metadata: None,
             })
         }
     }
@@ -1516,7 +1467,6 @@ mod tests {
             Ok(CodexRun {
                 response: "codex response".to_string(),
                 session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
-                metadata: None,
             })
         }
     }
@@ -1675,7 +1625,6 @@ mod tests {
         let run = CodexRun {
             response: "done".to_string(),
             session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
-            metadata: None,
         };
 
         assert_eq!(
@@ -1686,30 +1635,6 @@ mod tests {
                     .to_string()
             ))
         );
-    }
-
-    #[test]
-    fn appends_codex_run_metadata_footer_to_comment_body() {
-        let run = CodexRun {
-            response: "done".to_string(),
-            session_id: Some("session-1".to_string()),
-            metadata: Some(CodexRunMetadata {
-                model: "gpt-test".to_string(),
-                reasoning_effort: "high".to_string(),
-                prompt: "please include ``` safely".to_string(),
-            }),
-        };
-
-        let body = run.comment_body();
-
-        assert!(body.starts_with("done\n\n---"));
-        assert!(body.contains("**Codex run**"));
-        assert!(body.contains("| Model | `gpt-test` |"));
-        assert!(body.contains("| Reasoning effort | `high` |"));
-        assert!(!body.contains("session-1"));
-        assert!(body.contains("<summary>Input prompt</summary>"));
-        assert!(body.contains("please include ``` safely"));
-        assert!(body.contains("````text"));
     }
 
     #[test]
