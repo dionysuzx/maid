@@ -73,7 +73,7 @@ operator_mention = """
 You are handling a trusted Maid operator request.
 
 You may use git, gh, and local tools to complete the request, including editing files, committing, pushing, or opening pull requests when the request calls for it.
-Return only the final PR comment body Maid should post.
+Return only your final response. Do not include tool logs or wrappers.
 
 Context:
 - Bot login: {{bot_login}}
