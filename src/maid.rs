@@ -28,9 +28,11 @@ pub trait GithubClient: Send + Sync {
     -> Result<ReviewState>;
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()>;
+    async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()>;
     async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState>;
     async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()>;
     async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()>;
+    async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
 }
 
@@ -173,6 +175,8 @@ where
     }
 
     pub async fn run_once(&self) -> Result<PollReport> {
+        self.retry_pending_handled_markers().await?;
+
         let notifications = self.github.notifications().await?;
         let mut report = PollReport {
             seen: notifications.len(),
@@ -245,6 +249,33 @@ where
         }
 
         Ok(report)
+    }
+
+    async fn retry_pending_handled_markers(&self) -> Result<()> {
+        for marker in self.pending_handled_markers.pending()? {
+            match &marker {
+                PendingHandledMarker::Mention { api_url } => {
+                    self.github.mark_mention_api_url_handled(api_url).await?;
+                    self.pending_handled_markers.remove(&marker)?;
+                    info!(
+                        mention_api_url = %api_url,
+                        "marked pending completed mention handled"
+                    );
+                }
+                PendingHandledMarker::PullRequest { html_url } => {
+                    self.github
+                        .mark_pull_request_html_url_handled(html_url)
+                        .await?;
+                    self.pending_handled_markers.remove(&marker)?;
+                    info!(
+                        pr = %html_url,
+                        "marked pending completed auto-review pull request handled"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_assessments(
@@ -1084,6 +1115,18 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()> {
+            self.events.lock().unwrap().push("handled".to_string());
+            if let Some(message) = self.handled_error.lock().unwrap().take() {
+                return Err(anyhow!(message));
+            }
+            self.handled_mentions
+                .lock()
+                .unwrap()
+                .insert(api_url.to_string());
+            Ok(())
+        }
+
         async fn pr_state(&self, pr: &PullRequest, _bot_login: &str) -> Result<ReviewState> {
             if self.handled_prs.lock().unwrap().contains(&pr.html_url) {
                 Ok(ReviewState::Handled)
@@ -1104,6 +1147,18 @@ mod tests {
                 return Err(anyhow!(message));
             }
             self.handled_prs.lock().unwrap().insert(pr.html_url.clone());
+            Ok(())
+        }
+
+        async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()> {
+            self.events.lock().unwrap().push("handled_pr".to_string());
+            if let Some(message) = self.handled_error.lock().unwrap().take() {
+                return Err(anyhow!(message));
+            }
+            self.handled_prs
+                .lock()
+                .unwrap()
+                .insert(html_url.to_string());
             Ok(())
         }
 
@@ -2186,6 +2241,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_pending_mention_marker_without_notification() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("pending-handled-markers.json");
+        let marker = PendingHandledMarker::Mention {
+            api_url: "https://api.github.com/repos/o/r/issues/comments/2".to_string(),
+        };
+        let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
+        store.record(&marker).unwrap();
+
+        let github = FakeGithub::default();
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid =
+            maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.started, 0);
+        assert_eq!(*github.posts.lock().unwrap(), Vec::<String>::new());
+        assert_eq!(codex.calls.lock().unwrap().len(), 0);
+        assert!(
+            github
+                .handled_mentions
+                .lock()
+                .unwrap()
+                .contains("https://api.github.com/repos/o/r/issues/comments/2")
+        );
+        assert!(
+            !crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)
+                .contains(&marker)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn retries_pending_auto_review_marker_without_rerunning_codex() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("pending-handled-markers.json");
@@ -2216,6 +2310,45 @@ mod tests {
                 .lock()
                 .unwrap()
                 .contains("https://github.com/o/r/pull/1")
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_pending_auto_review_marker_without_open_pull_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("pending-handled-markers.json");
+        let marker = PendingHandledMarker::PullRequest {
+            html_url: "https://github.com/o/r/pull/1".to_string(),
+        };
+        let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
+        store.record(&marker).unwrap();
+
+        let github = FakeGithub::default();
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid =
+            maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.started, 0);
+        assert_eq!(*github.posts.lock().unwrap(), Vec::<String>::new());
+        assert_eq!(codex.calls.lock().unwrap().len(), 0);
+        assert!(
+            github
+                .handled_prs
+                .lock()
+                .unwrap()
+                .contains("https://github.com/o/r/pull/1")
+        );
+        assert!(
+            !crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)
+                .contains(&marker)
+                .unwrap()
         );
     }
 }

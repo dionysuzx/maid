@@ -17,6 +17,7 @@ pub trait PendingHandledMarkerStore: Send + Sync {
     fn record(&self, marker: &PendingHandledMarker) -> Result<()>;
     fn contains(&self, marker: &PendingHandledMarker) -> Result<bool>;
     fn remove(&self, marker: &PendingHandledMarker) -> Result<()>;
+    fn pending(&self) -> Result<Vec<PendingHandledMarker>>;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -47,6 +48,14 @@ impl PendingHandledMarkerStore for MemoryPendingHandledMarkerStore {
             .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?
             .remove(marker);
         Ok(())
+    }
+
+    fn pending(&self) -> Result<Vec<PendingHandledMarker>> {
+        Ok(self
+            .ledger
+            .lock()
+            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?
+            .pending())
     }
 }
 
@@ -92,6 +101,14 @@ impl PendingHandledMarkerStore for FilePendingHandledMarkerStore {
         let mut ledger = PendingHandledMarkerLedger::read(&self.path)?;
         ledger.remove(marker);
         ledger.write(&self.path)
+    }
+
+    fn pending(&self) -> Result<Vec<PendingHandledMarker>> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
+        Ok(PendingHandledMarkerLedger::read(&self.path)?.pending())
     }
 }
 
@@ -146,6 +163,20 @@ impl PendingHandledMarkerLedger {
         }
     }
 
+    fn pending(&self) -> Vec<PendingHandledMarker> {
+        self.mention_api_urls
+            .iter()
+            .cloned()
+            .map(|api_url| PendingHandledMarker::Mention { api_url })
+            .chain(
+                self.pull_request_html_urls
+                    .iter()
+                    .cloned()
+                    .map(|html_url| PendingHandledMarker::PullRequest { html_url }),
+            )
+            .collect()
+    }
+
     fn write(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -189,8 +220,10 @@ mod tests {
 
         let reloaded = FilePendingHandledMarkerStore::new(&path);
         assert!(reloaded.contains(&marker).unwrap());
+        assert_eq!(reloaded.pending().unwrap(), vec![marker.clone()]);
 
         reloaded.remove(&marker).unwrap();
         assert!(!store.contains(&marker).unwrap());
+        assert!(reloaded.pending().unwrap().is_empty());
     }
 }
