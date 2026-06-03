@@ -175,11 +175,12 @@ where
     }
 
     pub async fn run_once(&self) -> Result<PollReport> {
-        self.retry_pending_handled_markers().await?;
+        let pending_marker_failures = self.retry_pending_handled_markers().await?;
 
         let notifications = self.github.notifications().await?;
         let mut report = PollReport {
             seen: notifications.len(),
+            failed: pending_marker_failures,
             ..PollReport::default()
         };
         let mut seen_this_poll = HashSet::new();
@@ -251,27 +252,58 @@ where
         Ok(report)
     }
 
-    async fn retry_pending_handled_markers(&self) -> Result<()> {
+    async fn retry_pending_handled_markers(&self) -> Result<usize> {
+        let mut failures = 0;
         for marker in self.pending_handled_markers.pending()? {
-            match &marker {
-                PendingHandledMarker::Mention { api_url } => {
-                    self.github.mark_mention_api_url_handled(api_url).await?;
-                    self.pending_handled_markers.remove(&marker)?;
-                    info!(
-                        mention_api_url = %api_url,
-                        "marked pending completed mention handled"
+            if let Err(err) = self.retry_pending_handled_marker(&marker).await {
+                failures += 1;
+                if is_permanent_pending_marker_error(&err) {
+                    if let Err(remove_err) = self.pending_handled_markers.remove(&marker) {
+                        failures += 1;
+                        error!(
+                            marker = ?marker,
+                            error = ?remove_err,
+                            "failed to remove permanently failed pending handled marker"
+                        );
+                    } else {
+                        error!(
+                            marker = ?marker,
+                            error = ?err,
+                            "dropping permanently failed pending handled marker"
+                        );
+                    }
+                } else {
+                    error!(
+                        marker = ?marker,
+                        error = ?err,
+                        "failed to retry pending handled marker"
                     );
                 }
-                PendingHandledMarker::PullRequest { html_url } => {
-                    self.github
-                        .mark_pull_request_html_url_handled(html_url)
-                        .await?;
-                    self.pending_handled_markers.remove(&marker)?;
-                    info!(
-                        pr = %html_url,
-                        "marked pending completed auto-review pull request handled"
-                    );
-                }
+            }
+        }
+
+        Ok(failures)
+    }
+
+    async fn retry_pending_handled_marker(&self, marker: &PendingHandledMarker) -> Result<()> {
+        match marker {
+            PendingHandledMarker::Mention { api_url } => {
+                self.github.mark_mention_api_url_handled(api_url).await?;
+                self.pending_handled_markers.remove(marker)?;
+                info!(
+                    mention_api_url = %api_url,
+                    "marked pending completed mention handled"
+                );
+            }
+            PendingHandledMarker::PullRequest { html_url } => {
+                self.github
+                    .mark_pull_request_html_url_handled(html_url)
+                    .await?;
+                self.pending_handled_markers.remove(marker)?;
+                info!(
+                    pr = %html_url,
+                    "marked pending completed auto-review pull request handled"
+                );
             }
         }
 
@@ -412,12 +444,14 @@ where
             .master_accounts
             .contains(&latest.author.to_ascii_lowercase())
             && MentionRequest::parse(&latest.body, &self.bot_login)?.is_some()
-            && self.github.mention_state(&latest, &self.bot_login).await? == ReviewState::Pending
         {
-            return self.scanned_mentions_or_latest(notification, latest).await;
+            return match self.github.mention_state(&latest, &self.bot_login).await? {
+                ReviewState::Pending => self.scanned_mentions_or_latest(notification, latest).await,
+                ReviewState::Handled => Ok(vec![latest]),
+            };
         }
 
-        Ok(vec![latest])
+        self.scanned_mentions_or_latest(notification, latest).await
     }
 
     async fn scanned_mentions_or_latest(
@@ -727,11 +761,12 @@ where
     C: CodexRunner + Clone + 'static,
 {
     pub async fn run_once(&self) -> Result<PollReport> {
-        self.maid.retry_pending_handled_markers().await?;
+        let pending_marker_failures = self.maid.retry_pending_handled_markers().await?;
 
         let notifications = self.maid.github.notifications().await?;
         let mut report = PollReport {
             seen: notifications.len(),
+            failed: pending_marker_failures,
             ..PollReport::default()
         };
         let mut seen_this_poll = HashSet::new();
@@ -986,6 +1021,13 @@ fn work_key(notification: &Notification) -> String {
         .as_deref()
         .unwrap_or(&notification.id)
         .to_string()
+}
+
+fn is_permanent_pending_marker_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains(" 404") || message.contains("404:") || message.contains("not found")
+    })
 }
 
 fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> HashSet<String> {
@@ -1970,6 +2012,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responds_to_pending_mention_hidden_behind_latest_unrelated_comment() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
+        *github.mention.lock().unwrap() =
+            Some(Ok(Some(mention_with_comment("contributor", "thanks", "4"))));
+        *github.mentions.lock().unwrap() = Some(Ok(vec![
+            mention_with_comment("dionysuzx", "@maid-bot review", "2"),
+            mention_with_comment("contributor", "thanks", "4"),
+        ]));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.started_mentions.lock().unwrap(),
+            vec!["https://api.github.com/repos/o/r/issues/comments/2"]
+        );
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert!(github.marks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn concurrent_run_starts_multiple_pending_mentions_from_same_notification() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
@@ -2274,6 +2347,76 @@ mod tests {
                 .unwrap()
                 .contains("https://api.github.com/repos/o/r/issues/comments/2")
         );
+        assert!(
+            !crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)
+                .contains(&marker)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_pending_mention_marker_failure_does_not_stop_polling() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("pending-handled-markers.json");
+        let marker = PendingHandledMarker::Mention {
+            api_url: "https://api.github.com/repos/o/r/issues/comments/99".to_string(),
+        };
+        let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
+        store.record(&marker).unwrap();
+
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+        *github.handled_error.lock().unwrap() = Some("network failed".to_string());
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid =
+            maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert!(
+            crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)
+                .contains(&marker)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_pending_mention_marker_failure_is_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("pending-handled-markers.json");
+        let marker = PendingHandledMarker::Mention {
+            api_url: "https://api.github.com/repos/o/r/issues/comments/99".to_string(),
+        };
+        let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
+        store.record(&marker).unwrap();
+
+        let github = FakeGithub::default();
+        *github.handled_error.lock().unwrap() =
+            Some("POST https://api.github.com/repos/o/r/issues/comments/99/reactions returned 404: Not Found".to_string());
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid =
+            maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.started, 0);
+        assert_eq!(codex.calls.lock().unwrap().len(), 0);
         assert!(
             !crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)
                 .contains(&marker)
