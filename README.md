@@ -1,15 +1,15 @@
 ![Maid banner](assets/maid-banner-v2.jpg)
 
-Maid is a small Rust bot that runs local Codex on GitHub pull requests.
+Maid is a smol bot that runs local Codex on GitHub events.
 
-It watches for PR comments that mention your GitHub bot account, checks that the
-request came from a trusted account, prepares an isolated worktree, runs
-`codex`, and posts Codex's final answer back to the PR. It can also run
+It watches for PRs and mentions to your configured GitHub bot account (a "maid), checks that the
+request came from a trusted master account, prepares an isolated worktree, runs
+`codex`, and posts Codex's final answer back as a comment. It can also run
 automatic reviews for configured repositories, and trusted users can request
-operator tasks with `/operate`.
+adhoc operator tasks with `/operate`.
 
 Each task runs in its own git worktree while sharing a cached bare repository
-for the GitHub repo.
+for the source GitHub repo.
 
 ## Getting Started
 
@@ -32,6 +32,8 @@ Useful commands:
 just status
 just logs
 just stop
+just restart
+just update
 ```
 
 ## Configuration
