@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
 use std::{
+    env,
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     process::Stdio,
@@ -23,7 +24,7 @@ impl GitWorktrees {
         let credential = format!("x-access-token:{}", github_token.into());
         let encoded = general_purpose::STANDARD.encode(credential);
         Self {
-            root: root.into(),
+            root: absolute_root(root.into()),
             auth_header: format!("Authorization: Basic {encoded}"),
         }
     }
@@ -194,6 +195,16 @@ struct RepoLock {
     _file: File,
 }
 
+fn absolute_root(root: PathBuf) -> PathBuf {
+    if root.is_absolute() {
+        return root;
+    }
+
+    env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(root)
+}
+
 fn worktree_key(task: &CodexTask) -> String {
     format!(
         "{}-{:016x}",
@@ -268,6 +279,18 @@ mod tests {
         assert_eq!(
             worktrees.worktree_dir(&pr, &task).unwrap(),
             worktrees.worktree_dir(&pr, &task).unwrap()
+        );
+    }
+
+    #[test]
+    fn maps_relative_git_dir_from_the_process_directory() {
+        let current_dir = std::env::current_dir().unwrap();
+        let worktrees = GitWorktrees::new("target/maid-git", "token");
+        let pr = pr("dionysuzx", "forkcast");
+
+        assert_eq!(
+            worktrees.repo_dir(&pr).unwrap(),
+            current_dir.join("target/maid-git/repos/dionysuzx/forkcast.git")
         );
     }
 

@@ -57,6 +57,8 @@ impl Config {
         let git_dir = non_empty(file.git_dir)
             .map(|path| expand_home(&path))
             .transpose()?
+            .map(absolute_path)
+            .transpose()?
             .unwrap_or_else(|| maid_home.join("git"));
         let task_limit_per_24h = file.task_limit_per_24h;
         let max_concurrent_requests = file.max_concurrent_requests.unwrap_or(1);
@@ -67,7 +69,7 @@ impl Config {
             file.github_api_requests_per_hour
                 .unwrap_or(DEFAULT_GITHUB_API_REQUESTS_PER_HOUR),
         )?;
-        let codex_bin = non_empty(file.codex_bin).unwrap_or_else(|| "codex".to_string());
+        let codex_bin = normalize_command(non_empty(file.codex_bin))?;
         let codex_model = required_string(file.codex_model, "codex_model")
             .with_context(|| format!("codex_model is required in {}", config_path.display()))?;
         let codex_reasoning_effort =
@@ -148,12 +150,14 @@ fn maid_home() -> Result<PathBuf> {
     if let Ok(value) = env::var("MAID_HOME")
         && !value.trim().is_empty()
     {
-        return Ok(PathBuf::from(value));
+        return absolute_path(expand_home(&value)?);
     }
 
-    Ok(dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not determine the home directory"))?
-        .join(".maid"))
+    absolute_path(
+        dirs::home_dir()
+            .ok_or_else(|| anyhow!("could not determine the home directory"))?
+            .join(".maid"),
+    )
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -250,6 +254,30 @@ fn expand_home(path: &str) -> Result<PathBuf> {
     }
 
     Ok(PathBuf::from(path))
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    Ok(env::current_dir()
+        .context("failed to resolve the current directory")?
+        .join(path))
+}
+
+fn normalize_command(command: Option<String>) -> Result<String> {
+    let Some(command) = command else {
+        return Ok("codex".to_string());
+    };
+
+    if !command.contains('/') {
+        return Ok(command);
+    }
+
+    Ok(absolute_path(expand_home(&command)?)?
+        .to_string_lossy()
+        .to_string())
 }
 
 fn gh_token_for(login: &str) -> Result<String> {
@@ -495,6 +523,38 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(
             expand_home("/tmp/maid").unwrap(),
             PathBuf::from("/tmp/maid")
+        );
+    }
+
+    #[test]
+    fn absolutizes_relative_paths() {
+        let current_dir = env::current_dir().unwrap();
+
+        assert_eq!(
+            absolute_path(PathBuf::from("relative/git")).unwrap(),
+            current_dir.join("relative/git")
+        );
+        assert_eq!(
+            absolute_path(PathBuf::from("/tmp/maid")).unwrap(),
+            PathBuf::from("/tmp/maid")
+        );
+    }
+
+    #[test]
+    fn absolutizes_path_like_codex_commands() {
+        let current_dir = env::current_dir().unwrap();
+
+        assert_eq!(normalize_command(None).unwrap(), "codex");
+        assert_eq!(
+            normalize_command(Some("codex-test".to_string())).unwrap(),
+            "codex-test"
+        );
+        assert_eq!(
+            normalize_command(Some("./bin/codex-test".to_string())).unwrap(),
+            current_dir
+                .join("./bin/codex-test")
+                .to_string_lossy()
+                .to_string()
         );
     }
 }
