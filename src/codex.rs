@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
-const CODEX_EXIT_AFTER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+const CODEX_EXIT_AFTER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct CodexCli {
@@ -22,6 +22,7 @@ pub struct CodexCli {
     model: String,
     reasoning_effort: String,
     prompts: CodexPromptTemplates,
+    exit_after_completion_timeout: Duration,
 }
 
 impl CodexCli {
@@ -36,6 +37,7 @@ impl CodexCli {
             model: model.into(),
             reasoning_effort: reasoning_effort.into(),
             prompts,
+            exit_after_completion_timeout: CODEX_EXIT_AFTER_COMPLETION_TIMEOUT,
         }
     }
 
@@ -46,6 +48,12 @@ impl CodexCli {
         prompts: CodexPromptTemplates,
     ) -> Self {
         Self::new(bin, model, reasoning_effort, prompts)
+    }
+
+    #[cfg(test)]
+    fn with_exit_after_completion_timeout(mut self, timeout: Duration) -> Self {
+        self.exit_after_completion_timeout = timeout;
+        self
     }
 }
 
@@ -126,14 +134,14 @@ impl CodexRunner for CodexCli {
                     .map(|_| ())
             } => {
                 completed.context("Codex completion channel closed")?;
-                match timeout(CODEX_EXIT_AFTER_COMPLETION_TIMEOUT, child.wait()).await {
+                match timeout(self.exit_after_completion_timeout, child.wait()).await {
                     Ok(status) => Some(status.context("Codex failed to run")?),
                     Err(_) => {
                         warn!("Codex process did not exit after task completion; terminating wrapper");
                         child
                             .start_kill()
                             .context("failed to terminate completed Codex process")?;
-                        let _ = timeout(CODEX_EXIT_AFTER_COMPLETION_TIMEOUT, child.wait()).await;
+                        let _ = timeout(self.exit_after_completion_timeout, child.wait()).await;
                         None
                     }
                 }
@@ -438,7 +446,8 @@ sleep 5
                 pull_request_opened: "{{author}}".to_string(),
                 operator_mention: "{{request_text}}".to_string(),
             },
-        );
+        )
+        .with_exit_after_completion_timeout(Duration::from_millis(100));
         let task = CodexTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
             origin: CodexTaskOrigin::Mention {
@@ -454,6 +463,60 @@ sleep 5
             .unwrap();
 
         assert_eq!(run.response, "file final");
+        assert_eq!(run.session_id.as_deref(), Some("session-1"));
+    }
+
+    #[tokio::test]
+    async fn run_waits_for_normal_exit_after_task_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("fake-codex");
+        fs::write(
+            &bin,
+            r#"#!/bin/sh
+output_path=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--output-last-message" ]; then
+    output_path="$argument"
+  fi
+  previous="$argument"
+done
+
+cat >/dev/null
+python3 -c 'import sys, time; output_path = sys.argv[1]; print("{\"type\":\"thread.started\",\"thread_id\":\"session-1\"}"); print("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"json final\"}}"); print("{\"type\":\"turn.completed\"}"); sys.stdout.flush(); time.sleep(0.2); open(output_path, "w").write("file final after graceful exit\n")' "$output_path"
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&bin, permissions).unwrap();
+
+        let codex = CodexCli::new(
+            bin.display().to_string(),
+            "test-model",
+            "low",
+            CodexPromptTemplates {
+                mention: "{{cleaned_text}}".to_string(),
+                pull_request_opened: "{{author}}".to_string(),
+                operator_mention: "{{request_text}}".to_string(),
+            },
+        )
+        .with_exit_after_completion_timeout(Duration::from_secs(2));
+        let task = CodexTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: CodexTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot test".to_string(),
+                cleaned_text: "test".to_string(),
+            },
+        };
+
+        let run = timeout(Duration::from_secs(3), codex.run(temp.path(), &task))
+            .await
+            .expect("Codex run should wait for ordinary graceful exit after completion")
+            .unwrap();
+
+        assert_eq!(run.response, "file final after graceful exit");
         assert_eq!(run.session_id.as_deref(), Some("session-1"));
     }
 }
