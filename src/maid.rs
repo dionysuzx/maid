@@ -460,6 +460,15 @@ where
                         task,
                     })));
                 }
+                MentionThreadAction::MarkSuperseded { mention } => {
+                    self.github.mark_mention_handled(&mention).await?;
+                    info!(
+                        notification_id = notification.id,
+                        mention = %mention.html_url,
+                        "skipping superseded mention"
+                    );
+                    assessments.push(TaskAssessment::Skipped);
+                }
                 MentionThreadAction::MarkHandled { mention, marker } => {
                     observed_pending_markers.insert(marker);
                     self.github.mark_mention_handled(&mention).await?;
@@ -1459,6 +1468,13 @@ mod tests {
         notification_with_comment(id, "2")
     }
 
+    fn notification_with_reason(id: &str, comment_id: &str, reason: &str) -> Notification {
+        Notification {
+            reason: reason.to_string(),
+            ..notification_with_comment(id, comment_id)
+        }
+    }
+
     fn notification_with_comment(id: &str, comment_id: &str) -> Notification {
         Notification {
             id: id.to_string(),
@@ -2150,6 +2166,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responds_to_pr_comment_notification_that_mentions_bot() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() =
+            vec![notification_with_reason("n1", "2", "comment")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
+            "dionysuzx",
+            "@maid-bot review latest head",
+            "2",
+        ))));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.started_mentions.lock().unwrap(),
+            vec!["https://api.github.com/repos/o/r/issues/comments/2"]
+        );
+        assert!(github.marks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn responds_to_pending_mention_hidden_behind_latest_bot_comment() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
@@ -2221,7 +2267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_run_starts_multiple_pending_mentions_from_same_notification() {
+    async fn concurrent_run_starts_only_newest_pending_mention_from_same_notification() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
@@ -2244,14 +2290,25 @@ mod tests {
 
         let report = maid.run_once().await.unwrap();
 
-        assert_eq!(report.started, 3);
+        assert_eq!(report.started, 1);
+        assert_eq!(report.skipped, 2);
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
-            vec![
-                "https://api.github.com/repos/o/r/issues/comments/2",
-                "https://api.github.com/repos/o/r/issues/comments/3",
-                "https://api.github.com/repos/o/r/issues/comments/4"
-            ]
+            vec!["https://api.github.com/repos/o/r/issues/comments/4"]
+        );
+        assert!(
+            github
+                .handled_mentions
+                .lock()
+                .unwrap()
+                .contains("https://api.github.com/repos/o/r/issues/comments/2")
+        );
+        assert!(
+            github
+                .handled_mentions
+                .lock()
+                .unwrap()
+                .contains("https://api.github.com/repos/o/r/issues/comments/3")
         );
         assert!(github.marks.lock().unwrap().is_empty());
     }
@@ -2280,14 +2337,11 @@ mod tests {
 
         let report = maid.run_once().await.unwrap();
 
-        assert_eq!(report.started, 3);
+        assert_eq!(report.started, 1);
+        assert_eq!(report.skipped, 2);
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
-            vec![
-                "https://api.github.com/repos/o/r/issues/comments/2",
-                "https://api.github.com/repos/o/r/issues/comments/3",
-                "https://api.github.com/repos/o/r/issues/comments/4"
-            ]
+            vec!["https://api.github.com/repos/o/r/issues/comments/4"]
         );
     }
 

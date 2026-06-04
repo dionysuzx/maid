@@ -56,6 +56,27 @@ impl MentionObservation {
             has_pending_marker,
         }
     }
+
+    fn disposition(&self, is_newest_pending_request: bool) -> MentionDisposition {
+        match (
+            self.state,
+            self.has_pending_marker,
+            is_newest_pending_request,
+        ) {
+            (ReviewState::Handled, _, _) => MentionDisposition::AlreadyHandled,
+            (ReviewState::Pending, true, _) => MentionDisposition::PendingHandledMarker,
+            (ReviewState::Pending, false, true) => MentionDisposition::NewestPendingRequest,
+            (ReviewState::Pending, false, false) => MentionDisposition::SupersededPendingRequest,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MentionDisposition {
+    AlreadyHandled,
+    PendingHandledMarker,
+    NewestPendingRequest,
+    SupersededPendingRequest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +97,9 @@ pub enum MentionThreadAction {
         mention: CommentMention,
         task: CodexTask,
     },
+    MarkSuperseded {
+        mention: CommentMention,
+    },
     MarkHandled {
         mention: CommentMention,
         marker: PendingHandledMarker,
@@ -87,10 +111,20 @@ pub enum MentionThreadAction {
 }
 
 pub fn plan_mention_thread(thread: MentionThread, bot_login: &str) -> MentionThreadPlan {
+    let newest_pending_request = thread.observations.iter().rposition(|observation| {
+        observation.state == ReviewState::Pending && !observation.has_pending_marker
+    });
     let actions = thread
         .observations
         .into_iter()
-        .map(|observation| mention_action_for(observation, bot_login))
+        .enumerate()
+        .map(|(index, observation)| {
+            mention_action_for(
+                observation,
+                newest_pending_request == Some(index),
+                bot_login,
+            )
+        })
         .collect::<Vec<_>>();
     let notification = if actions
         .iter()
@@ -107,24 +141,34 @@ pub fn plan_mention_thread(thread: MentionThread, bot_login: &str) -> MentionThr
     }
 }
 
-fn mention_action_for(observation: MentionObservation, bot_login: &str) -> MentionThreadAction {
-    let marker = PendingHandledMarker::for_mention(&observation.mention);
-    match observation.state {
-        ReviewState::Handled => MentionThreadAction::ForgetHandledMarker {
-            mention: observation.mention,
-            marker,
-        },
-        ReviewState::Pending if observation.has_pending_marker => {
+fn mention_action_for(
+    observation: MentionObservation,
+    is_newest_pending_request: bool,
+    bot_login: &str,
+) -> MentionThreadAction {
+    match observation.disposition(is_newest_pending_request) {
+        MentionDisposition::AlreadyHandled => {
+            let marker = PendingHandledMarker::for_mention(&observation.mention);
+            MentionThreadAction::ForgetHandledMarker {
+                mention: observation.mention,
+                marker,
+            }
+        }
+        MentionDisposition::PendingHandledMarker => {
+            let marker = PendingHandledMarker::for_mention(&observation.mention);
             MentionThreadAction::MarkHandled {
                 mention: observation.mention,
                 marker,
             }
         }
-        ReviewState::Pending => MentionThreadAction::StartTask {
+        MentionDisposition::NewestPendingRequest => MentionThreadAction::StartTask {
             task: CodexTask {
                 pr_url: observation.mention.pr.html_url.clone(),
                 origin: mention_task_origin(&observation.mention, observation.request, bot_login),
             },
+            mention: observation.mention,
+        },
+        MentionDisposition::SupersededPendingRequest => MentionThreadAction::MarkSuperseded {
             mention: observation.mention,
         },
     }
@@ -233,6 +277,37 @@ mod tests {
         assert!(matches!(
             plan.actions.as_slice(),
             [MentionThreadAction::StartTask { mention: started, .. }] if started == &mention
+        ));
+    }
+
+    #[test]
+    fn newest_pending_request_supersedes_older_pending_requests() {
+        let older = mention("dionysuzx", "@maid-bot review old head", "2");
+        let newer = mention("dionysuzx", "@maid-bot review latest head", "3");
+        let older_request = MentionRequest::parse(&older.body, "maid-bot")
+            .unwrap()
+            .unwrap();
+        let newer_request = MentionRequest::parse(&newer.body, "maid-bot")
+            .unwrap()
+            .unwrap();
+
+        let plan = plan_mention_thread(
+            MentionThread::from_observations(vec![
+                MentionObservation::new(older.clone(), older_request, ReviewState::Pending, false),
+                MentionObservation::new(newer.clone(), newer_request, ReviewState::Pending, false),
+            ]),
+            "maid-bot",
+        );
+
+        assert_eq!(plan.notification, MentionNotificationPlan::LeaveUnread);
+        assert_eq!(plan.actions.len(), 2);
+        assert_eq!(
+            plan.actions[0],
+            MentionThreadAction::MarkSuperseded { mention: older }
+        );
+        assert!(matches!(
+            &plan.actions[1],
+            MentionThreadAction::StartTask { mention: started, .. } if started == &newer
         ));
     }
 
