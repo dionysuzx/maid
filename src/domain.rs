@@ -15,8 +15,7 @@ pub struct Notification {
 
 impl Notification {
     pub fn is_pr_mention_candidate(&self) -> bool {
-        self.reason == "mention"
-            && self.subject_kind == "PullRequest"
+        self.subject_kind == "PullRequest"
             && self.subject_url.is_some()
             && self.latest_comment_url.is_some()
     }
@@ -266,7 +265,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filters_to_pull_request_mention_notifications_with_comment_urls() {
+    fn filters_to_pull_request_notifications_with_comment_urls() {
         let eligible = Notification {
             id: "1".to_string(),
             reason: "mention".to_string(),
@@ -278,12 +277,15 @@ mod tests {
         };
 
         assert!(eligible.is_pr_mention_candidate());
-
-        for notification in [
+        assert!(
             Notification {
                 reason: "comment".to_string(),
                 ..eligible.clone()
-            },
+            }
+            .is_pr_mention_candidate()
+        );
+
+        for notification in [
             Notification {
                 subject_kind: "Issue".to_string(),
                 ..eligible.clone()
