@@ -591,6 +591,14 @@ mod tests {
         assert_eq!(secondary_backoff(4), Duration::from_secs(960));
         assert_eq!(secondary_backoff(5), Duration::from_secs(960));
     }
+
+    #[test]
+    fn builds_reaction_page_urls() {
+        assert_eq!(
+            reaction_page_url("https://api.github.com/repos/o/r/issues/1/reactions", 2),
+            "https://api.github.com/repos/o/r/issues/1/reactions?per_page=100&page=2"
+        );
+    }
 }
 
 impl GitHubRestClient {
@@ -659,13 +667,12 @@ impl GitHubRestClient {
         bot_login: &str,
         content: &str,
     ) -> Result<bool> {
-        let reactions = self
-            .get::<Vec<ApiReaction>>(&format!("{}/reactions?per_page=100", mention.api_url))
-            .await?;
-
-        Ok(reactions.into_iter().any(|reaction| {
-            reaction.content == content && reaction.user.login.eq_ignore_ascii_case(bot_login)
-        }))
+        self.reactions_include(
+            &format!("{}/reactions", mention.api_url),
+            bot_login,
+            content,
+        )
+        .await
     }
 
     async fn add_reaction(&self, mention: &CommentMention, content: &str) -> Result<()> {
@@ -684,13 +691,8 @@ impl GitHubRestClient {
         bot_login: &str,
         content: &str,
     ) -> Result<bool> {
-        let reactions = self
-            .get::<Vec<ApiReaction>>(&format!("{}?per_page=100", self.pr_reactions_url(pr)))
-            .await?;
-
-        Ok(reactions.into_iter().any(|reaction| {
-            reaction.content == content && reaction.user.login.eq_ignore_ascii_case(bot_login)
-        }))
+        self.reactions_include(&self.pr_reactions_url(pr), bot_login, content)
+            .await
     }
 
     async fn add_pr_reaction(&self, pr: &PullRequest, content: &str) -> Result<()> {
@@ -704,6 +706,34 @@ impl GitHubRestClient {
             pr.owner, pr.repo, pr.number
         )
     }
+
+    async fn reactions_include(
+        &self,
+        reactions_url: &str,
+        bot_login: &str,
+        content: &str,
+    ) -> Result<bool> {
+        for page in 1.. {
+            let reactions = self
+                .get::<Vec<ApiReaction>>(&reaction_page_url(reactions_url, page))
+                .await?;
+            let done = reactions.len() < 100;
+            if reactions.into_iter().any(|reaction| {
+                reaction.content == content && reaction.user.login.eq_ignore_ascii_case(bot_login)
+            }) {
+                return Ok(true);
+            }
+            if done {
+                return Ok(false);
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+fn reaction_page_url(reactions_url: &str, page: u64) -> String {
+    format!("{reactions_url}?per_page=100&page={page}")
 }
 
 fn parse_pull_request_html_url(html_url: &str) -> Result<(&str, &str, u64)> {
