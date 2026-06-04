@@ -813,21 +813,25 @@ where
 
         for notification in notifications {
             let work_key = work_key(&notification);
-            if !seen_this_poll.insert(work_key) {
+            if !seen_this_poll.insert(work_key.clone()) {
                 report.skipped += 1;
                 continue;
             }
 
+            let reservation = if notification.is_pr_mention_candidate() {
+                let Some(reservation) = self.work.try_reserve(notification_key(&work_key)) else {
+                    report.skipped += 1;
+                    continue;
+                };
+                Some(reservation)
+            } else {
+                None
+            };
+
             match self.maid.task_for_notification(&notification).await {
                 Ok(assessments) => {
-                    for assessment in assessments {
-                        match assessment {
-                            TaskAssessment::Ready(intent) => {
-                                self.start_or_defer(intent, &mut report).await;
-                            }
-                            TaskAssessment::Skipped => report.skipped += 1,
-                        }
-                    }
+                    self.handle_assessments(assessments, reservation, &mut report)
+                        .await;
                 }
                 Err(err) => {
                     report.failed += 1;
@@ -845,9 +849,15 @@ where
             report.seen += pull_requests.len();
 
             for pr in pull_requests {
+                let Some(reservation) = self.work.try_reserve(task_key_for_trigger(&pr.html_url))
+                else {
+                    report.skipped += 1;
+                    continue;
+                };
+
                 match self.maid.task_for_auto_review_pr(&pr).await {
                     Ok(TaskAssessment::Ready(intent)) => {
-                        self.start_or_defer(intent, &mut report).await;
+                        self.start_reserved(intent, reservation, &mut report).await;
                     }
                     Ok(TaskAssessment::Skipped) => report.skipped += 1,
                     Err(err) => {
@@ -866,12 +876,46 @@ where
         Ok(report)
     }
 
+    async fn handle_assessments(
+        &self,
+        assessments: Vec<TaskAssessment>,
+        mut reservation: Option<WorkReservation>,
+        report: &mut PollReport,
+    ) {
+        for assessment in assessments {
+            match assessment {
+                TaskAssessment::Ready(intent) => {
+                    if let Some(reservation) = reservation.take() {
+                        self.start_reserved(intent, reservation, report).await;
+                    } else {
+                        self.start_or_defer(intent, report).await;
+                    }
+                }
+                TaskAssessment::Skipped => report.skipped += 1,
+            }
+        }
+    }
+
     async fn start_or_defer(&self, intent: Box<TaskIntent>, report: &mut PollReport) {
         let task_key = intent.task_key();
         let Some(reservation) = self.work.try_reserve(task_key) else {
             report.skipped += 1;
             return;
         };
+
+        self.start_reserved(intent, reservation, report).await;
+    }
+
+    async fn start_reserved(
+        &self,
+        intent: Box<TaskIntent>,
+        mut reservation: WorkReservation,
+        report: &mut PollReport,
+    ) {
+        if !reservation.add_key(intent.task_key()) {
+            report.skipped += 1;
+            return;
+        }
 
         match self.maid.start_task(intent).await {
             Ok(TaskStartOutcome::Started(task)) => {
@@ -897,50 +941,69 @@ where
 struct WorkQueue {
     slots: Arc<Semaphore>,
     running: Arc<std::sync::Mutex<HashSet<String>>>,
+    max_concurrent_requests: usize,
 }
 
 impl WorkQueue {
     fn new(max_concurrent_requests: usize) -> Self {
+        let max_concurrent_requests = max_concurrent_requests.max(1);
         Self {
-            slots: Arc::new(Semaphore::new(max_concurrent_requests.max(1))),
+            slots: Arc::new(Semaphore::new(max_concurrent_requests)),
             running: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            max_concurrent_requests,
         }
     }
 
     fn try_reserve(&self, key: String) -> Option<WorkReservation> {
-        let permit = self.slots.clone().try_acquire_owned().ok()?;
         let mut running = self.running.lock().expect("work queue lock is poisoned");
+        if running.contains(&key) {
+            return None;
+        }
+
+        let permit = self.slots.clone().try_acquire_owned().ok()?;
         if !running.insert(key.clone()) {
             return None;
         }
 
         Some(WorkReservation {
-            key,
+            keys: vec![key],
             running: self.running.clone(),
             _permit: permit,
         })
     }
 
     fn in_flight(&self) -> usize {
-        self.running
-            .lock()
-            .expect("work queue lock is poisoned")
-            .len()
+        self.max_concurrent_requests - self.slots.available_permits()
     }
 }
 
 struct WorkReservation {
-    key: String,
+    keys: Vec<String>,
     running: Arc<std::sync::Mutex<HashSet<String>>>,
     _permit: OwnedSemaphorePermit,
 }
 
+impl WorkReservation {
+    fn add_key(&mut self, key: String) -> bool {
+        if self.keys.contains(&key) {
+            return true;
+        }
+
+        let mut running = self.running.lock().expect("work queue lock is poisoned");
+        if !running.insert(key.clone()) {
+            return false;
+        }
+        self.keys.push(key);
+        true
+    }
+}
+
 impl Drop for WorkReservation {
     fn drop(&mut self) {
-        self.running
-            .lock()
-            .expect("work queue lock is poisoned")
-            .remove(&self.key);
+        let mut running = self.running.lock().expect("work queue lock is poisoned");
+        for key in &self.keys {
+            running.remove(key);
+        }
     }
 }
 
@@ -973,7 +1036,7 @@ impl TaskIntent {
     fn task_key(&self) -> String {
         match self {
             Self::Mention { task, .. } | Self::AutoReviewPullRequest { task, .. } => {
-                format!("task:{}", task.trigger_url())
+                task_key_for_trigger(task.trigger_url())
             }
         }
     }
@@ -1043,6 +1106,14 @@ fn work_key(notification: &Notification) -> String {
         .to_string()
 }
 
+fn notification_key(work_key: &str) -> String {
+    format!("notification:{work_key}")
+}
+
+fn task_key_for_trigger(trigger_url: &str) -> String {
+    format!("task:{trigger_url}")
+}
+
 fn is_permanent_pending_marker_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         let message = cause.to_string().to_ascii_lowercase();
@@ -1078,6 +1149,9 @@ mod tests {
         posts: Arc<StdMutex<Vec<String>>>,
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
+        mention_calls: Arc<StdMutex<usize>>,
+        mentions_calls: Arc<StdMutex<usize>>,
+        pr_state_calls: Arc<StdMutex<Vec<String>>>,
         post_error: Arc<StdMutex<Option<String>>>,
         handled_error: Arc<StdMutex<Option<String>>>,
         started_mentions: Arc<StdMutex<Vec<String>>>,
@@ -1096,10 +1170,12 @@ mod tests {
             &self,
             _notification: &Notification,
         ) -> Result<Option<CommentMention>> {
+            *self.mention_calls.lock().unwrap() += 1;
             self.take_mention()
         }
 
         async fn mentions_for(&self, _notification: &Notification) -> Result<Vec<CommentMention>> {
+            *self.mentions_calls.lock().unwrap() += 1;
             if let Some(result) = self.mentions.lock().unwrap().take() {
                 return result.map_err(|message| anyhow!(message));
             }
@@ -1171,6 +1247,10 @@ mod tests {
         }
 
         async fn pr_state(&self, pr: &PullRequest, _bot_login: &str) -> Result<ReviewState> {
+            self.pr_state_calls
+                .lock()
+                .unwrap()
+                .push(pr.html_url.clone());
             if self.handled_prs.lock().unwrap().contains(&pr.html_url) {
                 Ok(ReviewState::Handled)
             } else {
@@ -1649,6 +1729,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_run_skips_in_flight_notification_before_hydrating_it() {
+        let worktree = PathBuf::from("/tmp/maid-test-worktree");
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+        let worktrees = FakeWorktrees {
+            worktree,
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = BlockingCodex::new();
+        let entered = codex.entered.clone();
+        let release = codex.release.clone();
+        let maid = maid(github.clone(), worktrees, codex).into_concurrent(1);
+
+        let first_report = maid.run_once().await.unwrap();
+        entered.wait().await;
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+
+        let second_report = maid.run_once().await.unwrap();
+
+        assert_eq!(first_report.started, 1);
+        assert_eq!(second_report.skipped, 1);
+        assert_eq!(second_report.in_flight, 1);
+        assert_eq!(*github.mention_calls.lock().unwrap(), 1);
+        assert_eq!(*github.mentions_calls.lock().unwrap(), 1);
+
+        release.notify_waiters();
+        wait_until(|| github.posts.lock().unwrap().len() == 1).await;
+    }
+
+    #[tokio::test]
     async fn concurrent_run_respects_max_concurrent_requests() {
         let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
@@ -1669,6 +1781,10 @@ mod tests {
         assert_eq!(first_report.started, 1);
         assert_eq!(first_report.skipped, 1);
         assert_eq!(first_report.in_flight, 1);
+        assert_eq!(
+            *github.pr_state_calls.lock().unwrap(),
+            vec!["https://github.com/o/r/pull/1"]
+        );
         entered.wait().await;
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
 

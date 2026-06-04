@@ -29,7 +29,7 @@ impl DaemonLock {
         lock_daemon_file(&lock_file, &path)?;
 
         if let Some(existing_pid) = read_pid(&path)
-            && process_is_current_executable(existing_pid)
+            && pid_is_this_process_or_current_executable(existing_pid)
         {
             bail!("maid is already running with pid {existing_pid}");
         }
@@ -73,7 +73,7 @@ fn lock_daemon_file(file: &fs::File, pid_path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(TryLockError::WouldBlock) => {
             if let Some(existing_pid) = read_pid(pid_path)
-                && process_is_current_executable(existing_pid)
+                && pid_is_this_process_or_current_executable(existing_pid)
             {
                 bail!("maid is already running with pid {existing_pid}");
             }
@@ -107,6 +107,10 @@ fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
         Ok(()) => Ok(()),
         Err(err) => Err(err.error).with_context(|| format!("failed to create {}", path.display())),
     }
+}
+
+fn pid_is_this_process_or_current_executable(pid: u32) -> bool {
+    pid == process::id() || process_is_current_executable(pid)
 }
 
 #[cfg(unix)]
