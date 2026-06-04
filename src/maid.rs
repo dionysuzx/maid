@@ -2236,6 +2236,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignores_hyphenated_login_prefix_when_scanning_recent_comments() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
+            "maid-bot",
+            "codex response",
+            "4",
+        ))));
+        *github.mentions.lock().unwrap() = Some(Ok(vec![
+            mention_with_comment("dionysuzx", "@maid-bot-test review", "2"),
+            mention_with_comment("maid-bot", "codex response", "4"),
+        ]));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.started_mentions.lock().unwrap().is_empty());
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+    }
+
+    #[tokio::test]
     async fn responds_to_pending_mention_hidden_behind_latest_unrelated_comment() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];

@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use regex::Regex;
 use std::fmt;
 
 pub const OPERATOR_TRIGGER: &str = "/operate";
@@ -96,15 +95,13 @@ pub struct MentionRequest {
 
 impl MentionRequest {
     pub fn parse(body: &str, bot_login: &str) -> Result<Option<Self>> {
-        let pattern = Regex::new(&format!(r"(?i)@{}\b", regex::escape(bot_login)))?;
-        if !pattern.is_match(body) {
+        let Some(cleaned_text) = remove_bot_mentions(body, bot_login) else {
             return Ok(None);
-        }
+        };
 
-        let cleaned_text = pattern.replace_all(body, "").trim().to_string();
         Ok(Some(Self {
             raw_body: body.to_string(),
-            cleaned_text,
+            cleaned_text: cleaned_text.trim().to_string(),
         }))
     }
 
@@ -121,6 +118,55 @@ impl MentionRequest {
             Some(text.to_string())
         }
     }
+}
+
+fn remove_bot_mentions(body: &str, bot_login: &str) -> Option<String> {
+    let bot_login = bot_login.trim();
+    if bot_login.is_empty() {
+        return None;
+    }
+
+    let needle = format!("@{}", bot_login.to_ascii_lowercase());
+    let lower_body = body.to_ascii_lowercase();
+    let mut cleaned = String::with_capacity(body.len());
+    let mut search_from = 0;
+    let mut kept_until = 0;
+    let mut found = false;
+
+    while let Some(offset) = lower_body[search_from..].find(&needle) {
+        let start = search_from + offset;
+        let end = start + needle.len();
+        search_from = end;
+
+        if !is_mention_boundary_before(body.as_bytes(), start)
+            || !is_mention_boundary_after(body.as_bytes(), end)
+        {
+            continue;
+        }
+
+        cleaned.push_str(&body[kept_until..start]);
+        kept_until = end;
+        found = true;
+    }
+
+    if !found {
+        return None;
+    }
+
+    cleaned.push_str(&body[kept_until..]);
+    Some(cleaned)
+}
+
+fn is_mention_boundary_before(bytes: &[u8], start: usize) -> bool {
+    start == 0 || !is_github_login_byte(bytes[start - 1])
+}
+
+fn is_mention_boundary_after(bytes: &[u8], end: usize) -> bool {
+    end == bytes.len() || !is_github_login_byte(bytes[end])
+}
+
+fn is_github_login_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,10 +360,26 @@ mod tests {
                 .is_none()
         );
         assert!(
+            MentionRequest::parse("@maid-bot-test not you", "maid-bot")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            MentionRequest::parse("mail@maid-bot.example is not a mention", "maid-bot")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
             MentionRequest::parse("@MAID-BOT check this", "maid-bot")
                 .unwrap()
                 .is_some()
         );
+
+        let repeated = MentionRequest::parse("cc @maid-bot, @MAID-BOT please review", "maid-bot")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(repeated.cleaned_text, "cc ,  please review");
     }
 
     #[test]
