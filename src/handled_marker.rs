@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum PendingHandledMarker {
     Mention { api_url: String },
     PullRequest { html_url: String },
