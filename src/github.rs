@@ -4,6 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use reqwest::{Client, Method, StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,8 +19,8 @@ const STARTED_REACTION: &str = "eyes";
 const HANDLED_REACTION: &str = "+1";
 pub const DEFAULT_GITHUB_API_REQUESTS_PER_HOUR: u32 = 1_200;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
-const PARTICIPATING_NOTIFICATIONS_URL: &str =
-    "https://api.github.com/notifications?participating=true&all=true&per_page=50";
+const NOTIFICATION_PAGE_SIZE: usize = 50;
+const RECENT_NOTIFICATION_WINDOW_HOURS: i64 = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GitHubApiRequestRate {
@@ -202,29 +203,41 @@ impl GitHubRestClient {
 impl GithubClient for GitHubRestClient {
     async fn notifications(&self) -> Result<Vec<Notification>> {
         self.notifications.wait_until_allowed().await;
+        let since = recent_notification_since();
+        let mut notifications = Vec::new();
 
-        let response = self
-            .request::<Vec<ApiNotification>, _>(
-                Method::GET,
-                PARTICIPATING_NOTIFICATIONS_URL,
-                Option::<&()>::None,
-                HeaderMap::new(),
-            )
-            .await?;
-        self.notifications.record_headers(response.headers()).await;
+        for page in 1.. {
+            let response = self
+                .request::<Vec<ApiNotification>, _>(
+                    Method::GET,
+                    &notification_page_url(&since, page),
+                    Option::<&()>::None,
+                    HeaderMap::new(),
+                )
+                .await?;
+            self.notifications.record_headers(response.headers()).await;
 
-        let notifications = response.into_json()?;
+            let page_notifications = response.into_json()?;
+            let done = page_notifications.len() < NOTIFICATION_PAGE_SIZE;
+            notifications.extend(
+                page_notifications
+                    .into_iter()
+                    .map(|notification| Notification {
+                        id: notification.id,
+                        reason: notification.reason,
+                        subject_kind: notification.subject.kind,
+                        subject_url: notification.subject.url,
+                        latest_comment_url: notification.subject.latest_comment_url,
+                        unread: notification.unread,
+                        updated_at: notification.updated_at,
+                    }),
+            );
+            if done {
+                break;
+            }
+        }
 
-        Ok(notifications
-            .into_iter()
-            .map(|notification| Notification {
-                id: notification.id,
-                reason: notification.reason,
-                subject_kind: notification.subject.kind,
-                subject_url: notification.subject.url,
-                latest_comment_url: notification.subject.latest_comment_url,
-            })
-            .collect())
+        Ok(notifications)
     }
 
     async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>> {
@@ -596,10 +609,10 @@ mod tests {
     }
 
     #[test]
-    fn polls_recent_participating_notifications_including_read_ones() {
+    fn builds_recent_participating_notification_page_urls() {
         assert_eq!(
-            PARTICIPATING_NOTIFICATIONS_URL,
-            "https://api.github.com/notifications?participating=true&all=true&per_page=50"
+            notification_page_url("2026-06-08T04:00:00Z", 2),
+            "https://api.github.com/notifications?participating=true&all=true&per_page=50&page=2&since=2026-06-08T04:00:00Z"
         );
     }
 
@@ -802,6 +815,17 @@ fn reaction_page_url(reactions_url: &str, page: u64) -> String {
     format!("{reactions_url}?per_page=100&page={page}")
 }
 
+fn notification_page_url(since: &str, page: usize) -> String {
+    format!(
+        "https://api.github.com/notifications?participating=true&all=true&per_page={NOTIFICATION_PAGE_SIZE}&page={page}&since={since}"
+    )
+}
+
+fn recent_notification_since() -> String {
+    (Utc::now() - ChronoDuration::hours(RECENT_NOTIFICATION_WINDOW_HOURS))
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
 fn recent_comments(mut comments: Vec<ApiComment>, limit: usize) -> Vec<ApiComment> {
     comments.sort_by(|left, right| {
         left.created_at
@@ -855,6 +879,8 @@ fn parse_pull_request_html_url(html_url: &str) -> Result<(&str, &str, u64)> {
 struct ApiNotification {
     id: String,
     reason: String,
+    unread: bool,
+    updated_at: String,
     subject: ApiNotificationSubject,
 }
 

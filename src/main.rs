@@ -1,7 +1,8 @@
 use anyhow::Result;
 use maid::{
     codex::CodexCli, config::Config, daemon_lock::DaemonLock, github::GitHubRestClient,
-    handled_marker::FilePendingHandledMarkerStore, maid::Maid, task_limit::FileTaskStartRecorder,
+    handled_marker::FilePendingHandledMarkerStore, maid::Maid,
+    observed_notification::FileObservedNotificationStore, task_limit::FileTaskStartRecorder,
     worktree::GitWorktrees,
 };
 use std::time::Duration;
@@ -41,6 +42,9 @@ async fn main() -> Result<()> {
     .with_pending_handled_marker_store(FilePendingHandledMarkerStore::new(
         config.pending_handled_marker_ledger_path.clone(),
     ))
+    .with_observed_notification_store(FileObservedNotificationStore::new(
+        config.observed_notification_ledger_path.clone(),
+    ))
     .into_concurrent(config.max_concurrent_requests);
 
     let task_limit_per_24h = config
@@ -68,6 +72,7 @@ async fn main() -> Result<()> {
         daemon_pid = %config.daemon_pid_path.display(),
         task_start_ledger = %config.task_start_ledger_path.display(),
         pending_handled_marker_ledger = %config.pending_handled_marker_ledger_path.display(),
+        observed_notification_ledger = %config.observed_notification_ledger_path.display(),
         github_api_requests_per_hour = config.github_api_requests_per_hour.requests_per_hour(),
         task_limit_per_24h = %task_limit_per_24h,
         max_concurrent_requests = config.max_concurrent_requests,

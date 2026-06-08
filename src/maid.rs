@@ -12,6 +12,7 @@ use crate::mention_thread::{
     MentionNotificationPlan, MentionObservation, MentionThread, MentionThreadAction,
     MentionThreadPlan, MentionThreadRead, choose_mention_thread_read, plan_mention_thread,
 };
+use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -113,6 +114,7 @@ pub struct Maid<G, R, C> {
     auto_review_repos: Vec<RepoSlug>,
     task_starts: Arc<dyn TaskStartRecorder>,
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
+    observed_notifications: Arc<dyn ObservedNotificationStore>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -150,6 +152,7 @@ where
             auto_review_repos: auto_review_repos.into_iter().collect(),
             task_starts: Arc::new(NoTaskLimit),
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
+            observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
         }
     }
 
@@ -166,6 +169,14 @@ where
         pending_handled_markers: impl PendingHandledMarkerStore + 'static,
     ) -> Self {
         self.pending_handled_markers = Arc::new(pending_handled_markers);
+        self
+    }
+
+    pub fn with_observed_notification_store(
+        mut self,
+        observed_notifications: impl ObservedNotificationStore + 'static,
+    ) -> Self {
+        self.observed_notifications = Arc::new(observed_notifications);
         self
     }
 
@@ -193,14 +204,22 @@ where
                 report.skipped += 1;
                 continue;
             }
+            if self.should_skip_observed_notification(&notification)? {
+                report.skipped += 1;
+                continue;
+            }
 
             match self
                 .task_for_notification(&notification, &mut observed_pending_markers)
                 .await
             {
                 Ok(assessments) => {
+                    let has_work = assessments.iter().any(TaskAssessment::is_ready);
                     self.handle_assessments(&notification, assessments, &mut report)
                         .await;
+                    if !has_work {
+                        self.record_observed_notification(&notification)?;
+                    }
                 }
                 Err(err) => {
                     report.failed += 1;
@@ -379,6 +398,14 @@ where
 
         self.github.mark_notification_handled(notification).await?;
         Ok(vec![TaskAssessment::Skipped])
+    }
+
+    fn should_skip_observed_notification(&self, notification: &Notification) -> Result<bool> {
+        Ok(notification.is_read() && self.observed_notifications.contains_current(notification)?)
+    }
+
+    fn record_observed_notification(&self, notification: &Notification) -> Result<()> {
+        self.observed_notifications.record_current(notification)
     }
 
     async fn tasks_for_mentions(
@@ -861,6 +888,10 @@ where
                 report.skipped += 1;
                 continue;
             }
+            if self.maid.should_skip_observed_notification(&notification)? {
+                report.skipped += 1;
+                continue;
+            }
 
             let reservation = if notification.is_pr_mention_candidate() {
                 let Some(reservation) = self.work.try_reserve(notification_key(&work_key)) else {
@@ -878,8 +909,12 @@ where
                 .await
             {
                 Ok(assessments) => {
+                    let has_work = assessments.iter().any(TaskAssessment::is_ready);
                     self.handle_assessments(assessments, reservation, &mut report)
                         .await;
+                    if !has_work {
+                        self.maid.record_observed_notification(&notification)?;
+                    }
                 }
                 Err(err) => {
                     report.failed += 1;
@@ -1067,6 +1102,12 @@ impl Drop for WorkReservation {
 enum TaskAssessment {
     Ready(Box<TaskIntent>),
     Skipped,
+}
+
+impl TaskAssessment {
+    fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1487,6 +1528,16 @@ mod tests {
             latest_comment_url: Some(format!(
                 "https://api.github.com/repos/o/r/issues/comments/{comment_id}"
             )),
+            unread: true,
+            updated_at: "2026-06-08T04:00:00Z".to_string(),
+        }
+    }
+
+    fn read_notification(id: &str, updated_at: &str) -> Notification {
+        Notification {
+            unread: false,
+            updated_at: updated_at.to_string(),
+            ..notification(id)
         }
     }
 
@@ -1504,6 +1555,8 @@ mod tests {
             subject_kind: "Issue".to_string(),
             subject_url: Some("https://api.github.com/repos/o/r/issues/1".to_string()),
             latest_comment_url: None,
+            unread: true,
+            updated_at: "2026-06-08T04:00:00Z".to_string(),
         }
     }
 
@@ -2076,6 +2129,126 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
         assert!(github.posts.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn responds_to_unobserved_read_notification() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() =
+            vec![read_notification("n1", "2026-06-08T04:00:00Z")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.started_mentions.lock().unwrap(),
+            vec!["https://api.github.com/repos/o/r/issues/comments/2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_read_notification_already_observed_at_same_update() {
+        let github = FakeGithub::default();
+        let notification = read_notification("n1", "2026-06-08T04:00:00Z");
+        let observed_notifications =
+            crate::observed_notification::MemoryObservedNotificationStore::default();
+        crate::observed_notification::ObservedNotificationStore::record_current(
+            &observed_notifications,
+            &notification,
+        )
+        .unwrap();
+        *github.notifications.lock().unwrap() = vec![notification];
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
+            .with_observed_notification_store(observed_notifications)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(*github.mention_calls.lock().unwrap(), 0);
+        assert!(github.marks.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rescans_read_notification_after_updated_at_changes() {
+        let github = FakeGithub::default();
+        let old_notification = read_notification("n1", "2026-06-08T04:00:00Z");
+        let new_notification = read_notification("n1", "2026-06-08T04:05:00Z");
+        let observed_notifications =
+            crate::observed_notification::MemoryObservedNotificationStore::default();
+        crate::observed_notification::ObservedNotificationStore::record_current(
+            &observed_notifications,
+            &old_notification,
+        )
+        .unwrap();
+        *github.notifications.lock().unwrap() = vec![new_notification];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees, codex)
+            .with_observed_notification_store(observed_notifications)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.mention_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn records_no_work_read_notification_observations() {
+        let github = FakeGithub::default();
+        let notification = read_notification("n1", "2026-06-08T04:00:00Z");
+        let mention = mention("dionysuzx", "@maid-bot review");
+        *github.notifications.lock().unwrap() = vec![notification.clone()];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention.clone())));
+        github
+            .handled_mentions
+            .lock()
+            .unwrap()
+            .insert(mention.api_url);
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), worktrees.clone(), codex.clone());
+
+        let first = maid.run_once().await.unwrap();
+        *github.notifications.lock().unwrap() = vec![notification];
+        let second = maid.run_once().await.unwrap();
+
+        assert_eq!(first.skipped, 1);
+        assert_eq!(second.skipped, 1);
+        assert_eq!(*github.mention_calls.lock().unwrap(), 1);
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
         assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
