@@ -506,7 +506,7 @@ where
         notification: &Notification,
     ) -> Result<Vec<CommentMention>> {
         let Some(latest) = self.github.mention_for(notification).await? else {
-            return Ok(Vec::new());
+            return self.github.mentions_for(notification).await;
         };
 
         match self.choose_mention_thread_read(&latest).await? {
@@ -1490,6 +1490,13 @@ mod tests {
         }
     }
 
+    fn notification_without_latest_comment(id: &str) -> Notification {
+        Notification {
+            latest_comment_url: None,
+            ..notification_with_comment(id, "2")
+        }
+    }
+
     fn irrelevant_notification(id: &str) -> Notification {
         Notification {
             id: id.to_string(),
@@ -2328,6 +2335,36 @@ mod tests {
             "contributor",
             "top-level issue comment",
             "2",
+        )]));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.started_mentions.lock().unwrap(),
+            vec!["https://api.github.com/repos/o/r/pulls/comments/99"]
+        );
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert!(github.marks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scans_pr_notification_without_latest_comment_url() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification_without_latest_comment("n1")];
+        *github.mentions.lock().unwrap() = Some(Ok(vec![review_mention(
+            "dionysuzx",
+            "@maid-bot review this inline comment",
+            "99",
         )]));
         let worktrees = FakeWorktrees {
             worktree: PathBuf::from("/tmp/worktree"),
