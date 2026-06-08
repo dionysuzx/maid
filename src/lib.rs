@@ -7,5 +7,6 @@ pub mod github;
 pub mod handled_marker;
 pub mod maid;
 pub mod mention_thread;
+pub mod observed_notification;
 pub mod task_limit;
 pub mod worktree;

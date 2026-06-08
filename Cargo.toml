@@ -11,6 +11,7 @@ repository = "https://github.com/dionysuzx/maid"
 anyhow = "1.0.99"
 async-trait = "0.1.88"
 base64 = "0.22.1"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 dirs = "6.0.0"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }

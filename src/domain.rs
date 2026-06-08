@@ -10,11 +10,17 @@ pub struct Notification {
     pub subject_kind: String,
     pub subject_url: Option<String>,
     pub latest_comment_url: Option<String>,
+    pub unread: bool,
+    pub updated_at: String,
 }
 
 impl Notification {
     pub fn is_pr_mention_candidate(&self) -> bool {
         self.subject_kind == "PullRequest" && self.subject_url.is_some()
+    }
+
+    pub fn is_read(&self) -> bool {
+        !self.unread
     }
 }
 
@@ -318,6 +324,8 @@ mod tests {
             latest_comment_url: Some(
                 "https://api.github.com/repos/o/r/issues/comments/2".to_string(),
             ),
+            unread: true,
+            updated_at: "2026-06-08T04:00:00Z".to_string(),
         };
 
         assert!(eligible.is_pr_mention_candidate());
