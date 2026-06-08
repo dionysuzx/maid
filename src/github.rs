@@ -18,6 +18,8 @@ const STARTED_REACTION: &str = "eyes";
 const HANDLED_REACTION: &str = "+1";
 pub const DEFAULT_GITHUB_API_REQUESTS_PER_HOUR: u32 = 1_200;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
+const PARTICIPATING_NOTIFICATIONS_URL: &str =
+    "https://api.github.com/notifications?participating=true&all=true&per_page=50";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GitHubApiRequestRate {
@@ -204,7 +206,7 @@ impl GithubClient for GitHubRestClient {
         let response = self
             .request::<Vec<ApiNotification>, _>(
                 Method::GET,
-                "https://api.github.com/notifications?participating=true&per_page=50",
+                PARTICIPATING_NOTIFICATIONS_URL,
                 Option::<&()>::None,
                 HeaderMap::new(),
             )
@@ -590,6 +592,14 @@ mod tests {
         assert_eq!(
             reaction_page_url("https://api.github.com/repos/o/r/issues/1/reactions", 2),
             "https://api.github.com/repos/o/r/issues/1/reactions?per_page=100&page=2"
+        );
+    }
+
+    #[test]
+    fn polls_recent_participating_notifications_including_read_ones() {
+        assert_eq!(
+            PARTICIPATING_NOTIFICATIONS_URL,
+            "https://api.github.com/notifications?participating=true&all=true&per_page=50"
         );
     }
 
