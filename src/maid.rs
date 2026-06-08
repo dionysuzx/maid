@@ -522,9 +522,12 @@ where
         notification: &Notification,
         latest: CommentMention,
     ) -> Result<Vec<CommentMention>> {
-        let mentions = self.github.mentions_for(notification).await?;
-        if mentions.is_empty() {
-            return Ok(vec![latest]);
+        let mut mentions = self.github.mentions_for(notification).await?;
+        if !mentions
+            .iter()
+            .any(|mention| mention.api_url == latest.api_url)
+        {
+            mentions.push(latest);
         }
 
         Ok(mentions)
@@ -1535,6 +1538,16 @@ mod tests {
         }
     }
 
+    fn review_mention(author: &str, body: &str, comment_id: &str) -> CommentMention {
+        CommentMention {
+            author: author.to_string(),
+            body: body.to_string(),
+            api_url: format!("https://api.github.com/repos/o/r/pulls/comments/{comment_id}"),
+            html_url: format!("https://github.com/o/r/pull/1#discussion_r{comment_id}"),
+            pr: pr(),
+        }
+    }
+
     fn maid<C>(
         github: FakeGithub,
         worktrees: FakeWorktrees,
@@ -2292,6 +2305,46 @@ mod tests {
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
             vec!["https://api.github.com/repos/o/r/issues/comments/2"]
+        );
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert!(github.marks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preserves_latest_review_comment_missing_from_recent_issue_scan() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![Notification {
+            latest_comment_url: Some(
+                "https://api.github.com/repos/o/r/pulls/comments/99".to_string(),
+            ),
+            ..notification("n1")
+        }];
+        *github.mention.lock().unwrap() = Some(Ok(Some(review_mention(
+            "dionysuzx",
+            "@maid-bot review this inline comment",
+            "99",
+        ))));
+        *github.mentions.lock().unwrap() = Some(Ok(vec![mention_with_comment(
+            "contributor",
+            "top-level issue comment",
+            "2",
+        )]));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees, codex)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.started_mentions.lock().unwrap(),
+            vec!["https://api.github.com/repos/o/r/pulls/comments/99"]
         );
         assert_eq!(github.posts.lock().unwrap().len(), 1);
         assert!(github.marks.lock().unwrap().is_empty());

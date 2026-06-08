@@ -262,19 +262,12 @@ impl GithubClient for GitHubRestClient {
         };
 
         let pr = self.pull_request_from_url(&pr_url).await?;
-        let comments = self.issue_comments_for_pr(&pr).await?;
+        let mut comments = self.issue_comments_for_pr(&pr).await?;
+        comments.append(&mut self.review_comments_for_pr(&pr).await?);
 
-        let start = comments.len().saturating_sub(20);
-        Ok(comments
+        Ok(recent_comments(comments, 20)
             .into_iter()
-            .skip(start)
-            .map(|comment| CommentMention {
-                author: comment.user.login,
-                body: comment.body,
-                api_url: comment.url,
-                html_url: comment.html_url,
-                pr: pr.clone(),
-            })
+            .map(|comment| comment_mention(comment, &pr))
             .collect())
     }
 
@@ -599,6 +592,51 @@ mod tests {
             "https://api.github.com/repos/o/r/issues/1/reactions?per_page=100&page=2"
         );
     }
+
+    #[test]
+    fn keeps_recent_comments_across_issue_and_review_comment_streams() {
+        let mut comments = (0..21)
+            .map(|index| {
+                api_comment(
+                    &format!("https://api.github.com/repos/o/r/issues/comments/{index}"),
+                    &format!("https://github.com/o/r/pull/1#issuecomment-{index}"),
+                    &format!("2026-06-08T00:00:{index:02}Z"),
+                )
+            })
+            .collect::<Vec<_>>();
+        comments.push(api_comment(
+            "https://api.github.com/repos/o/r/pulls/comments/99",
+            "https://github.com/o/r/pull/1#discussion_r99",
+            "2026-06-08T00:00:21Z",
+        ));
+
+        let recent = recent_comments(comments, 20);
+
+        assert_eq!(recent.len(), 20);
+        assert!(
+            !recent
+                .iter()
+                .any(|comment| comment.url.ends_with("/issues/comments/0"))
+        );
+        assert_eq!(
+            recent.last().map(|comment| comment.url.as_str()),
+            Some("https://api.github.com/repos/o/r/pulls/comments/99")
+        );
+    }
+
+    fn api_comment(url: &str, html_url: &str, created_at: &str) -> ApiComment {
+        ApiComment {
+            url: url.to_string(),
+            body: "@maid-bot review".to_string(),
+            html_url: html_url.to_string(),
+            created_at: created_at.to_string(),
+            user: ApiUser {
+                login: "dionysuzx".to_string(),
+            },
+            issue_url: None,
+            pull_request_url: Some("https://api.github.com/repos/o/r/pulls/1".to_string()),
+        }
+    }
 }
 
 impl GitHubRestClient {
@@ -627,6 +665,24 @@ impl GitHubRestClient {
         for page in 1.. {
             let url = format!(
                 "https://api.github.com/repos/{}/{}/issues/{}/comments?per_page=100&page={}",
+                pr.owner, pr.repo, pr.number, page
+            );
+            let mut page_comments = self.get::<Vec<ApiComment>>(&url).await?;
+            let done = page_comments.len() < 100;
+            comments.append(&mut page_comments);
+            if done {
+                return Ok(comments);
+            }
+        }
+
+        Ok(comments)
+    }
+
+    async fn review_comments_for_pr(&self, pr: &PullRequest) -> Result<Vec<ApiComment>> {
+        let mut comments = Vec::new();
+        for page in 1.. {
+            let url = format!(
+                "https://api.github.com/repos/{}/{}/pulls/{}/comments?per_page=100&page={}",
                 pr.owner, pr.repo, pr.number, page
             );
             let mut page_comments = self.get::<Vec<ApiComment>>(&url).await?;
@@ -736,6 +792,26 @@ fn reaction_page_url(reactions_url: &str, page: u64) -> String {
     format!("{reactions_url}?per_page=100&page={page}")
 }
 
+fn recent_comments(mut comments: Vec<ApiComment>, limit: usize) -> Vec<ApiComment> {
+    comments.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.url.cmp(&right.url))
+    });
+    let start = comments.len().saturating_sub(limit);
+    comments.into_iter().skip(start).collect()
+}
+
+fn comment_mention(comment: ApiComment, pr: &PullRequest) -> CommentMention {
+    CommentMention {
+        author: comment.user.login,
+        body: comment.body,
+        api_url: comment.url,
+        html_url: comment.html_url,
+        pr: pr.clone(),
+    }
+}
+
 fn parse_pull_request_html_url(html_url: &str) -> Result<(&str, &str, u64)> {
     let Some(path) = html_url.strip_prefix("https://github.com/") else {
         bail!("pull request URL must start with https://github.com/: {html_url}");
@@ -785,6 +861,7 @@ struct ApiComment {
     url: String,
     body: String,
     html_url: String,
+    created_at: String,
     user: ApiUser,
     issue_url: Option<String>,
     pull_request_url: Option<String>,
