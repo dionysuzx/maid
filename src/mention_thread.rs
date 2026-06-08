@@ -57,16 +57,11 @@ impl MentionObservation {
         }
     }
 
-    fn disposition(&self, is_newest_pending_request: bool) -> MentionDisposition {
-        match (
-            self.state,
-            self.has_pending_marker,
-            is_newest_pending_request,
-        ) {
-            (ReviewState::Handled, _, _) => MentionDisposition::AlreadyHandled,
-            (ReviewState::Pending, true, _) => MentionDisposition::PendingHandledMarker,
-            (ReviewState::Pending, false, true) => MentionDisposition::NewestPendingRequest,
-            (ReviewState::Pending, false, false) => MentionDisposition::SupersededPendingRequest,
+    fn disposition(&self) -> MentionDisposition {
+        match (self.state, self.has_pending_marker) {
+            (ReviewState::Handled, _) => MentionDisposition::AlreadyHandled,
+            (ReviewState::Pending, true) => MentionDisposition::PendingHandledMarker,
+            (ReviewState::Pending, false) => MentionDisposition::PendingRequest,
         }
     }
 }
@@ -75,8 +70,7 @@ impl MentionObservation {
 enum MentionDisposition {
     AlreadyHandled,
     PendingHandledMarker,
-    NewestPendingRequest,
-    SupersededPendingRequest,
+    PendingRequest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,9 +91,6 @@ pub enum MentionThreadAction {
         mention: CommentMention,
         task: CodexTask,
     },
-    MarkSuperseded {
-        mention: CommentMention,
-    },
     MarkHandled {
         mention: CommentMention,
         marker: PendingHandledMarker,
@@ -111,20 +102,10 @@ pub enum MentionThreadAction {
 }
 
 pub fn plan_mention_thread(thread: MentionThread, bot_login: &str) -> MentionThreadPlan {
-    let newest_pending_request = thread.observations.iter().rposition(|observation| {
-        observation.state == ReviewState::Pending && !observation.has_pending_marker
-    });
     let actions = thread
         .observations
         .into_iter()
-        .enumerate()
-        .map(|(index, observation)| {
-            mention_action_for(
-                observation,
-                newest_pending_request == Some(index),
-                bot_login,
-            )
-        })
+        .map(|observation| mention_action_for(observation, bot_login))
         .collect::<Vec<_>>();
     let notification = if actions
         .iter()
@@ -141,12 +122,8 @@ pub fn plan_mention_thread(thread: MentionThread, bot_login: &str) -> MentionThr
     }
 }
 
-fn mention_action_for(
-    observation: MentionObservation,
-    is_newest_pending_request: bool,
-    bot_login: &str,
-) -> MentionThreadAction {
-    match observation.disposition(is_newest_pending_request) {
+fn mention_action_for(observation: MentionObservation, bot_login: &str) -> MentionThreadAction {
+    match observation.disposition() {
         MentionDisposition::AlreadyHandled => {
             let marker = PendingHandledMarker::for_mention(&observation.mention);
             MentionThreadAction::ForgetHandledMarker {
@@ -161,14 +138,11 @@ fn mention_action_for(
                 marker,
             }
         }
-        MentionDisposition::NewestPendingRequest => MentionThreadAction::StartTask {
+        MentionDisposition::PendingRequest => MentionThreadAction::StartTask {
             task: CodexTask {
                 pr_url: observation.mention.pr.html_url.clone(),
                 origin: mention_task_origin(&observation.mention, observation.request, bot_login),
             },
-            mention: observation.mention,
-        },
-        MentionDisposition::SupersededPendingRequest => MentionThreadAction::MarkSuperseded {
             mention: observation.mention,
         },
     }
@@ -281,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn newest_pending_request_supersedes_older_pending_requests() {
+    fn pending_requests_each_start_tasks() {
         let older = mention("dionysuzx", "@maid-bot review old head", "2");
         let newer = mention("dionysuzx", "@maid-bot review latest head", "3");
         let older_request = MentionRequest::parse(&older.body, "maid-bot")
@@ -301,10 +275,10 @@ mod tests {
 
         assert_eq!(plan.notification, MentionNotificationPlan::LeaveUnread);
         assert_eq!(plan.actions.len(), 2);
-        assert_eq!(
-            plan.actions[0],
-            MentionThreadAction::MarkSuperseded { mention: older }
-        );
+        assert!(matches!(
+            &plan.actions[0],
+            MentionThreadAction::StartTask { mention: started, .. } if started == &older
+        ));
         assert!(matches!(
             &plan.actions[1],
             MentionThreadAction::StartTask { mention: started, .. } if started == &newer

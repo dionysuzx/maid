@@ -487,16 +487,6 @@ where
                         task,
                     })));
                 }
-                MentionThreadAction::MarkSuperseded { mention } => {
-                    self.github.mark_mention_started(&mention).await?;
-                    self.github.mark_mention_handled(&mention).await?;
-                    info!(
-                        notification_id = notification.id,
-                        mention = %mention.html_url,
-                        "skipping superseded mention"
-                    );
-                    assessments.push(TaskAssessment::Skipped);
-                }
                 MentionThreadAction::MarkHandled { mention, marker } => {
                     observed_pending_markers.insert(marker);
                     self.github.mark_mention_handled(&mention).await?;
@@ -2562,7 +2552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_run_starts_only_newest_pending_mention_from_same_notification() {
+    async fn concurrent_run_starts_each_pending_mention_from_same_notification() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention_with_comment(
@@ -2585,8 +2575,8 @@ mod tests {
 
         let report = maid.run_once().await.unwrap();
 
-        assert_eq!(report.started, 1);
-        assert_eq!(report.skipped, 2);
+        assert_eq!(report.started, 3);
+        assert_eq!(report.skipped, 0);
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
             vec![
@@ -2597,22 +2587,9 @@ mod tests {
         );
         assert_eq!(
             *github.events.lock().unwrap(),
-            vec!["start", "handled", "start", "handled", "start"]
+            vec!["start", "start", "start"]
         );
-        assert!(
-            github
-                .handled_mentions
-                .lock()
-                .unwrap()
-                .contains("https://api.github.com/repos/o/r/issues/comments/2")
-        );
-        assert!(
-            github
-                .handled_mentions
-                .lock()
-                .unwrap()
-                .contains("https://api.github.com/repos/o/r/issues/comments/3")
-        );
+        assert!(github.handled_mentions.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
     }
 
@@ -2640,8 +2617,8 @@ mod tests {
 
         let report = maid.run_once().await.unwrap();
 
-        assert_eq!(report.started, 1);
-        assert_eq!(report.skipped, 2);
+        assert_eq!(report.started, 3);
+        assert_eq!(report.skipped, 0);
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
             vec![
@@ -2652,7 +2629,7 @@ mod tests {
         );
         assert_eq!(
             *github.events.lock().unwrap(),
-            vec!["start", "handled", "start", "handled", "start"]
+            vec!["start", "start", "start"]
         );
     }
 
