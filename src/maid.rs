@@ -488,6 +488,7 @@ where
                     })));
                 }
                 MentionThreadAction::MarkSuperseded { mention } => {
+                    self.github.mark_mention_started(&mention).await?;
                     self.github.mark_mention_handled(&mention).await?;
                     info!(
                         notification_id = notification.id,
@@ -2588,7 +2589,15 @@ mod tests {
         assert_eq!(report.skipped, 2);
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
-            vec!["https://api.github.com/repos/o/r/issues/comments/4"]
+            vec![
+                "https://api.github.com/repos/o/r/issues/comments/2",
+                "https://api.github.com/repos/o/r/issues/comments/3",
+                "https://api.github.com/repos/o/r/issues/comments/4",
+            ]
+        );
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["start", "handled", "start", "handled", "start"]
         );
         assert!(
             github
@@ -2635,7 +2644,15 @@ mod tests {
         assert_eq!(report.skipped, 2);
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
-            vec!["https://api.github.com/repos/o/r/issues/comments/4"]
+            vec![
+                "https://api.github.com/repos/o/r/issues/comments/2",
+                "https://api.github.com/repos/o/r/issues/comments/3",
+                "https://api.github.com/repos/o/r/issues/comments/4",
+            ]
+        );
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["start", "handled", "start", "handled", "start"]
         );
     }
 
