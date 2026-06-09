@@ -524,7 +524,7 @@ mod tests {
 
         let prompt = task.prompt(&test_prompts()).unwrap();
         assert!(prompt.contains("Mention URL:\nhttps://github.com/o/r/pull/1#issuecomment-2"));
-        assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
+        assert!(prompt.contains("Target URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Raw mention body:\n@maid-bot review"));
         assert!(prompt.contains("Cleaned request text:\nreview"));
     }
@@ -555,14 +555,14 @@ mod tests {
             },
         };
         let templates = CodexPromptTemplates {
-            mention: "PR={{ pr_url }} REQUEST={{cleaned_text}}".to_string(),
+            mention: "TARGET={{ target_url }} REQUEST={{cleaned_text}}".to_string(),
             pull_request_opened: String::new(),
             operator_mention: String::new(),
         };
 
         assert_eq!(
             task.prompt(&templates).unwrap(),
-            "PR=https://github.com/o/r/pull/1 REQUEST=review"
+            "TARGET=https://github.com/o/r/pull/1 REQUEST=review"
         );
     }
 
@@ -599,7 +599,7 @@ mod tests {
             mention: String::new(),
             pull_request_opened: String::new(),
             operator_mention:
-                "{{bot_login}}|{{trigger_author}}|{{mention_url}}|{{pr_url}}|{{raw_body}}|{{request_text}}"
+                "{{bot_login}}|{{trigger_author}}|{{mention_url}}|{{target_url}}|{{raw_body}}|{{request_text}}"
                     .to_string(),
         };
 
@@ -661,8 +661,8 @@ mod tests {
 Mention URL:
 {{mention_url}}
 
-Pull request URL:
-{{pr_url}}
+Target URL:
+{{target_url}}
 
 Raw mention body:
 {{raw_body}}
@@ -692,8 +692,8 @@ Trigger author:
 Mention URL:
 {{mention_url}}
 
-Pull request URL:
-{{pr_url}}
+Target URL:
+{{target_url}}
 
 Raw mention body:
 {{raw_body}}
