@@ -15,8 +15,8 @@ pub struct Notification {
 }
 
 impl Notification {
-    pub fn is_pr_mention_candidate(&self) -> bool {
-        self.subject_kind == "PullRequest" && self.subject_url.is_some()
+    pub fn is_mention_candidate(&self) -> bool {
+        matches!(self.subject_kind.as_str(), "PullRequest" | "Issue") && self.subject_url.is_some()
     }
 
     pub fn is_read(&self) -> bool {
@@ -77,12 +77,91 @@ impl PullRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Issue {
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+    pub author: String,
+    pub api_url: String,
+    pub html_url: String,
+    pub clone_url: String,
+    pub default_branch: String,
+}
+
+impl Issue {
+    pub fn repo_key(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkTarget {
+    PullRequest(PullRequest),
+    Issue(Issue),
+}
+
+impl WorkTarget {
+    pub fn owner(&self) -> &str {
+        match self {
+            Self::PullRequest(pr) => &pr.owner,
+            Self::Issue(issue) => &issue.owner,
+        }
+    }
+
+    pub fn repo(&self) -> &str {
+        match self {
+            Self::PullRequest(pr) => &pr.repo,
+            Self::Issue(issue) => &issue.repo,
+        }
+    }
+
+    pub fn number(&self) -> u64 {
+        match self {
+            Self::PullRequest(pr) => pr.number,
+            Self::Issue(issue) => issue.number,
+        }
+    }
+
+    pub fn html_url(&self) -> &str {
+        match self {
+            Self::PullRequest(pr) => &pr.html_url,
+            Self::Issue(issue) => &issue.html_url,
+        }
+    }
+
+    pub fn clone_url(&self) -> &str {
+        match self {
+            Self::PullRequest(pr) => &pr.clone_url,
+            Self::Issue(issue) => &issue.clone_url,
+        }
+    }
+
+    pub fn repo_key(&self) -> String {
+        format!("{}/{}", self.owner(), self.repo())
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::PullRequest(_) => "pulls",
+            Self::Issue(_) => "issues",
+        }
+    }
+
+    pub fn fetch_ref(&self) -> String {
+        match self {
+            Self::PullRequest(pr) => format!("pull/{}/head", pr.number),
+            Self::Issue(issue) => issue.default_branch.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommentMention {
     pub author: String,
     pub body: String,
     pub api_url: String,
     pub html_url: String,
-    pub pr: PullRequest,
+    pub target: WorkTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +270,7 @@ impl CodexTask {
                 &[
                     ("mention_url", mention_url.as_str()),
                     ("pr_url", self.pr_url.as_str()),
+                    ("target_url", self.pr_url.as_str()),
                     ("raw_body", raw_body.as_str()),
                     ("cleaned_text", cleaned_text.as_str()),
                 ],
@@ -215,6 +295,7 @@ impl CodexTask {
                     ("mention_url", mention_url.as_str()),
                     ("operator_trigger", OPERATOR_TRIGGER),
                     ("pr_url", self.pr_url.as_str()),
+                    ("target_url", self.pr_url.as_str()),
                     ("raw_body", raw_body.as_str()),
                     ("request_text", request_text.as_str()),
                     ("trigger_author", trigger_author.as_str()),
@@ -315,7 +396,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filters_to_pull_request_notifications_with_pull_request_subjects() {
+    fn filters_to_mention_notifications_with_supported_subjects() {
         let eligible = Notification {
             id: "1".to_string(),
             reason: "mention".to_string(),
@@ -328,25 +409,33 @@ mod tests {
             updated_at: "2026-06-08T04:00:00Z".to_string(),
         };
 
-        assert!(eligible.is_pr_mention_candidate());
+        assert!(eligible.is_mention_candidate());
         assert!(
             Notification {
                 reason: "comment".to_string(),
                 ..eligible.clone()
             }
-            .is_pr_mention_candidate()
+            .is_mention_candidate()
         );
         assert!(
             Notification {
                 latest_comment_url: None,
                 ..eligible.clone()
             }
-            .is_pr_mention_candidate()
+            .is_mention_candidate()
+        );
+        assert!(
+            Notification {
+                subject_kind: "Issue".to_string(),
+                subject_url: Some("https://api.github.com/repos/o/r/issues/1".to_string()),
+                ..eligible.clone()
+            }
+            .is_mention_candidate()
         );
 
         for notification in [
             Notification {
-                subject_kind: "Issue".to_string(),
+                subject_kind: "Discussion".to_string(),
                 ..eligible.clone()
             },
             Notification {
@@ -354,7 +443,7 @@ mod tests {
                 ..eligible.clone()
             },
         ] {
-            assert!(!notification.is_pr_mention_candidate());
+            assert!(!notification.is_mention_candidate());
         }
     }
 
