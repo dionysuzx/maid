@@ -4,6 +4,7 @@ use crate::auto_review::{
 };
 use crate::domain::{
     CodexTask, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug, ReviewState,
+    WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -32,6 +33,7 @@ pub trait GithubClient: Send + Sync {
         Ok(self.mention_for(notification).await?.into_iter().collect())
     }
     async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>>;
+    async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
     -> Result<ReviewState>;
@@ -47,7 +49,7 @@ pub trait GithubClient: Send + Sync {
 
 #[async_trait]
 pub trait Worktrees: Send + Sync {
-    async fn prepare(&self, pr: &PullRequest, task: &CodexTask) -> Result<PreparedWorktree>;
+    async fn prepare(&self, target: &WorkTarget, task: &CodexTask) -> Result<PreparedWorktree>;
     async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()>;
 }
 
@@ -390,7 +392,7 @@ where
         notification: &Notification,
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<Vec<TaskAssessment>> {
-        if notification.is_pr_mention_candidate() {
+        if notification.is_mention_candidate() {
             return self
                 .tasks_for_mentions(notification, observed_pending_markers)
                 .await;
@@ -683,10 +685,10 @@ where
         self.github.mark_mention_started(&mention).await?;
         info!(
             notification_id = notification.id,
-            pr = %mention.pr.html_url,
+            target = %mention.target.html_url(),
             mention = %mention.html_url,
             task_kind = task.task_kind(),
-            "started handling pull request mention"
+            "started handling mention"
         );
 
         Ok(TaskStartOutcome::Started(Box::new(StartedTask::Mention {
@@ -715,19 +717,19 @@ where
         mention: Box<CommentMention>,
         task: CodexTask,
     ) -> Result<()> {
-        let worktree = self.worktrees.prepare(&mention.pr, &task).await?;
+        let worktree = self.worktrees.prepare(&mention.target, &task).await?;
         let result = async {
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
             self.github
-                .post_pr_comment(&mention.pr, &codex_run.response)
+                .post_comment(&mention.target, &codex_run.response)
                 .await?;
             let marker = PendingHandledMarker::for_mention(&mention);
             self.pending_handled_markers.record(&marker)?;
             if let Err(err) = self.github.mark_mention_handled(&mention).await {
                 error!(
                     notification_id = notification.id,
-                    pr = %mention.pr.html_url,
+                    target = %mention.target.html_url(),
                     mention = %mention.html_url,
                     error = ?err,
                     "failed to mark mention handled after posting response"
@@ -736,7 +738,7 @@ where
             if let Some((session_id, resume_command)) = codex_run.resume_command() {
                 info!(
                     notification_id = notification.id,
-                    pr = %mention.pr.html_url,
+                    target = %mention.target.html_url(),
                     mention = %mention.html_url,
                     codex_session_id = %session_id,
                     codex_resume = %resume_command,
@@ -745,7 +747,7 @@ where
             } else {
                 info!(
                     notification_id = notification.id,
-                    pr = %mention.pr.html_url,
+                    target = %mention.target.html_url(),
                     mention = %mention.html_url,
                     "responded to mention"
                 );
@@ -776,7 +778,8 @@ where
     }
 
     async fn finish_auto_review_task(&self, pr: PullRequest, task: CodexTask) -> Result<()> {
-        let worktree = self.worktrees.prepare(&pr, &task).await?;
+        let target = WorkTarget::PullRequest(pr.clone());
+        let worktree = self.worktrees.prepare(&target, &task).await?;
         let result = async {
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
@@ -884,7 +887,7 @@ where
                 continue;
             }
 
-            let reservation = if notification.is_pr_mention_candidate() {
+            let reservation = if notification.is_mention_candidate() {
                 let Some(reservation) = self.work.try_reserve(notification_key(&work_key)) else {
                     report.skipped += 1;
                     continue;
@@ -1137,7 +1140,7 @@ impl TaskIntent {
                 ..
             } => info!(
                 notification_id = notification.id,
-                pr = %mention.pr.html_url,
+                target = %mention.target.html_url(),
                 mention = %mention.html_url,
                 "skipping mention because the 24-hour task limit is reached"
             ),
@@ -1172,7 +1175,7 @@ impl StartedTask {
                 ..
             } => error!(
                 notification_id = notification.id,
-                pr = %mention.pr.html_url,
+                target = %mention.target.html_url(),
                 mention = %mention.html_url,
                 error = ?err,
                 "failed to handle notification task"
@@ -1220,7 +1223,7 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::CodexTaskOrigin;
+    use crate::domain::{CodexTaskOrigin, Issue};
     use anyhow::{Result, anyhow};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
@@ -1277,13 +1280,18 @@ mod tests {
             Ok(self.pull_requests.lock().unwrap().clone())
         }
 
-        async fn post_pr_comment(&self, _pr: &PullRequest, body: &str) -> Result<()> {
+        async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
             self.events.lock().unwrap().push("post".to_string());
             if let Some(message) = self.post_error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
             self.posts.lock().unwrap().push(body.to_string());
             Ok(())
+        }
+
+        async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
+            self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
+                .await
         }
 
         async fn mention_state(
@@ -1417,8 +1425,12 @@ mod tests {
 
     #[async_trait]
     impl Worktrees for FakeWorktrees {
-        async fn prepare(&self, pr: &PullRequest, _task: &CodexTask) -> Result<PreparedWorktree> {
-            self.calls.lock().unwrap().push(pr.repo_key());
+        async fn prepare(
+            &self,
+            target: &WorkTarget,
+            _task: &CodexTask,
+        ) -> Result<PreparedWorktree> {
+            self.calls.lock().unwrap().push(target.repo_key());
             if let Some(message) = self.error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
@@ -1524,6 +1536,20 @@ mod tests {
         }
     }
 
+    fn issue_notification(id: &str, comment_id: &str) -> Notification {
+        Notification {
+            id: id.to_string(),
+            reason: "mention".to_string(),
+            subject_kind: "Issue".to_string(),
+            subject_url: Some("https://api.github.com/repos/o/r/issues/322".to_string()),
+            latest_comment_url: Some(format!(
+                "https://api.github.com/repos/o/r/issues/comments/{comment_id}"
+            )),
+            unread: true,
+            updated_at: "2026-06-08T04:00:00Z".to_string(),
+        }
+    }
+
     fn read_notification(id: &str, updated_at: &str) -> Notification {
         Notification {
             unread: false,
@@ -1575,6 +1601,19 @@ mod tests {
         }
     }
 
+    fn issue() -> Issue {
+        Issue {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 322,
+            author: "external".to_string(),
+            api_url: "https://api.github.com/repos/o/r/issues/322".to_string(),
+            html_url: "https://github.com/o/r/issues/322".to_string(),
+            clone_url: "https://github.com/o/r.git".to_string(),
+            default_branch: "main".to_string(),
+        }
+    }
+
     fn mention(author: &str, body: &str) -> CommentMention {
         mention_with_comment(author, body, "2")
     }
@@ -1585,7 +1624,17 @@ mod tests {
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
             html_url: format!("https://github.com/o/r/pull/1#issuecomment-{comment_id}"),
-            pr: pr(),
+            target: WorkTarget::PullRequest(pr()),
+        }
+    }
+
+    fn issue_mention(author: &str, body: &str, comment_id: &str) -> CommentMention {
+        CommentMention {
+            author: author.to_string(),
+            body: body.to_string(),
+            api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
+            html_url: format!("https://github.com/o/r/issues/322#issuecomment-{comment_id}"),
+            target: WorkTarget::Issue(issue()),
         }
     }
 
@@ -1595,7 +1644,7 @@ mod tests {
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/pulls/comments/{comment_id}"),
             html_url: format!("https://github.com/o/r/pull/1#discussion_r{comment_id}"),
-            pr: pr(),
+            target: WorkTarget::PullRequest(pr()),
         }
     }
 
@@ -1665,7 +1714,7 @@ mod tests {
         let first = TaskIntent::Mention {
             notification: notification_with_comment("n1", "2"),
             task: CodexTask {
-                pr_url: first_mention.pr.html_url.clone(),
+                pr_url: first_mention.target.html_url().to_string(),
                 origin: CodexTaskOrigin::Mention {
                     mention_url: first_mention.html_url.clone(),
                     raw_body: first_mention.body.clone(),
@@ -1677,7 +1726,7 @@ mod tests {
         let second = TaskIntent::Mention {
             notification: notification_with_comment("n1", "3"),
             task: CodexTask {
-                pr_url: second_mention.pr.html_url.clone(),
+                pr_url: second_mention.target.html_url().to_string(),
                 origin: CodexTaskOrigin::Mention {
                     mention_url: second_mention.html_url.clone(),
                     raw_body: second_mention.body.clone(),
@@ -1786,6 +1835,50 @@ mod tests {
         assert_eq!(
             calls[0].1.prompt(&templates).unwrap(),
             "operate implement and push for dionysuzx"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_issue_operate_mention_runs_on_issue_target() {
+        let worktree = PathBuf::from("/tmp/maid-test-worktree");
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![issue_notification("n1", "2")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(issue_mention(
+            "dionysuzx",
+            "@maid-bot /operate fix this issue",
+            "2",
+        ))));
+        let worktrees = FakeWorktrees {
+            worktree: worktree.clone(),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["start", "post", "handled"]
+        );
+        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
+        let calls = codex.calls.lock().unwrap();
+        assert_eq!(calls[0].0, worktree);
+        assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/issues/322");
+        assert_eq!(
+            calls[0].1.origin,
+            CodexTaskOrigin::OperatorMention {
+                mention_url: "https://github.com/o/r/issues/322#issuecomment-2".to_string(),
+                raw_body: "@maid-bot /operate fix this issue".to_string(),
+                request_text: "fix this issue".to_string(),
+                trigger_author: "dionysuzx".to_string(),
+                bot_login: "maid-bot".to_string(),
+            }
         );
     }
 

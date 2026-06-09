@@ -140,7 +140,7 @@ fn mention_action_for(observation: MentionObservation, bot_login: &str) -> Menti
         }
         MentionDisposition::PendingRequest => MentionThreadAction::StartTask {
             task: CodexTask {
-                pr_url: observation.mention.pr.html_url.clone(),
+                pr_url: observation.mention.target.html_url().to_string(),
                 origin: mention_task_origin(&observation.mention, observation.request, bot_login),
             },
             mention: observation.mention,
@@ -173,7 +173,7 @@ fn mention_task_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::PullRequest;
+    use crate::domain::{PullRequest, WorkTarget};
 
     #[test]
     fn handled_latest_trusted_request_does_not_scan_old_comments() {
@@ -291,7 +291,7 @@ mod tests {
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
             html_url: format!("https://github.com/o/r/pull/1#issuecomment-{comment_id}"),
-            pr: PullRequest {
+            target: WorkTarget::PullRequest(PullRequest {
                 owner: "o".to_string(),
                 repo: "r".to_string(),
                 number: 1,
@@ -299,7 +299,7 @@ mod tests {
                 api_url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
                 html_url: "https://github.com/o/r/pull/1".to_string(),
                 clone_url: "https://github.com/o/r.git".to_string(),
-            },
+            }),
         }
     }
 }

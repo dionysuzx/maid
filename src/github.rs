@@ -1,5 +1,5 @@
 use crate::{
-    domain::{CommentMention, Notification, PullRequest, RepoSlug, ReviewState},
+    domain::{CommentMention, Issue, Notification, PullRequest, RepoSlug, ReviewState, WorkTarget},
     maid::GithubClient,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -246,43 +246,39 @@ impl GithubClient for GitHubRestClient {
         };
 
         let comment = self.get::<ApiComment>(comment_url).await?;
-        let pr_url = if let Some(pull_request_url) = comment.pull_request_url {
-            pull_request_url
-        } else if let Some(subject_url) = notification.subject_url.as_deref() {
-            subject_url.to_string()
-        } else if let Some(issue_url) = comment.issue_url {
-            let issue = self.get::<ApiIssue>(&issue_url).await?;
-            match issue.pull_request {
-                Some(pull_request) => pull_request.url,
-                None => return Ok(None),
-            }
-        } else {
+        let Some(target) = self
+            .target_for_comment_notification(notification, &comment)
+            .await?
+        else {
             return Ok(None);
         };
-
-        let pr = self.pull_request_from_url(&pr_url).await?;
 
         Ok(Some(CommentMention {
             author: comment.user.login,
             body: comment.body,
             api_url: comment_url.to_string(),
             html_url: comment.html_url,
-            pr,
+            target,
         }))
     }
 
     async fn mentions_for(&self, notification: &Notification) -> Result<Vec<CommentMention>> {
-        let Some(pr_url) = self.pr_url_for_notification(notification).await? else {
+        let Some(target) = self.target_for_notification(notification).await? else {
             return Ok(Vec::new());
         };
 
-        let pr = self.pull_request_from_url(&pr_url).await?;
-        let mut comments = self.issue_comments_for_pr(&pr).await?;
-        comments.append(&mut self.review_comments_for_pr(&pr).await?);
+        let comments = match &target {
+            WorkTarget::PullRequest(pr) => {
+                let mut comments = self.issue_comments_for_pr(pr).await?;
+                comments.append(&mut self.review_comments_for_pr(pr).await?);
+                comments
+            }
+            WorkTarget::Issue(issue) => self.issue_comments_for_issue(issue).await?,
+        };
 
         Ok(recent_comments(comments, 20)
             .into_iter()
-            .map(|comment| comment_mention(comment, &pr))
+            .map(|comment| comment_mention(comment, &target))
             .collect())
     }
 
@@ -298,12 +294,19 @@ impl GithubClient for GitHubRestClient {
             .collect()
     }
 
-    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
+    async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/issues/{}/comments",
-            pr.owner, pr.repo, pr.number
+            target.owner(),
+            target.repo(),
+            target.number()
         );
         self.post_json(&url, &PostComment { body }).await
+    }
+
+    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
+        self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
+            .await
     }
 
     async fn mention_state(
@@ -663,24 +666,65 @@ mod tests {
 }
 
 impl GitHubRestClient {
-    async fn pr_url_for_notification(&self, notification: &Notification) -> Result<Option<String>> {
+    async fn target_for_notification(
+        &self,
+        notification: &Notification,
+    ) -> Result<Option<WorkTarget>> {
         if let Some(subject_url) = notification.subject_url.as_deref() {
-            return Ok(Some(subject_url.to_string()));
+            return self.target_for_subject_url(subject_url).await;
         }
 
         let Some(comment_url) = notification.latest_comment_url.as_deref() else {
             return Ok(None);
         };
         let comment = self.get::<ApiComment>(comment_url).await?;
-        if let Some(pull_request_url) = comment.pull_request_url {
-            return Ok(Some(pull_request_url));
+        self.target_for_comment_notification(notification, &comment)
+            .await
+    }
+
+    async fn target_for_comment_notification(
+        &self,
+        notification: &Notification,
+        comment: &ApiComment,
+    ) -> Result<Option<WorkTarget>> {
+        if let Some(pull_request_url) = comment.pull_request_url.as_deref() {
+            return Ok(Some(WorkTarget::PullRequest(
+                self.pull_request_from_url(pull_request_url).await?,
+            )));
         }
-        if let Some(issue_url) = comment.issue_url {
-            let issue = self.get::<ApiIssue>(&issue_url).await?;
-            return Ok(issue.pull_request.map(|pull_request| pull_request.url));
+        if let Some(subject_url) = notification.subject_url.as_deref() {
+            return self.target_for_subject_url(subject_url).await;
+        }
+        if let Some(issue_url) = comment.issue_url.as_deref() {
+            let issue = self.get::<ApiIssue>(issue_url).await?;
+            return self.target_from_issue(issue).await;
         }
 
         Ok(None)
+    }
+
+    async fn target_for_subject_url(&self, subject_url: &str) -> Result<Option<WorkTarget>> {
+        if subject_url.contains("/pulls/") {
+            return Ok(Some(WorkTarget::PullRequest(
+                self.pull_request_from_url(subject_url).await?,
+            )));
+        }
+        if subject_url.contains("/issues/") {
+            let issue = self.get::<ApiIssue>(subject_url).await?;
+            return self.target_from_issue(issue).await;
+        }
+
+        Ok(None)
+    }
+
+    async fn target_from_issue(&self, issue: ApiIssue) -> Result<Option<WorkTarget>> {
+        if let Some(pull_request) = issue.pull_request.as_ref() {
+            return Ok(Some(WorkTarget::PullRequest(
+                self.pull_request_from_url(&pull_request.url).await?,
+            )));
+        }
+
+        Ok(Some(WorkTarget::Issue(self.issue_from_api(issue).await?)))
     }
 
     async fn issue_comments_for_pr(&self, pr: &PullRequest) -> Result<Vec<ApiComment>> {
@@ -689,6 +733,24 @@ impl GitHubRestClient {
             let url = format!(
                 "https://api.github.com/repos/{}/{}/issues/{}/comments?per_page=100&page={}",
                 pr.owner, pr.repo, pr.number, page
+            );
+            let mut page_comments = self.get::<Vec<ApiComment>>(&url).await?;
+            let done = page_comments.len() < 100;
+            comments.append(&mut page_comments);
+            if done {
+                return Ok(comments);
+            }
+        }
+
+        Ok(comments)
+    }
+
+    async fn issue_comments_for_issue(&self, issue: &Issue) -> Result<Vec<ApiComment>> {
+        let mut comments = Vec::new();
+        for page in 1.. {
+            let url = format!(
+                "https://api.github.com/repos/{}/{}/issues/{}/comments?per_page=100&page={}",
+                issue.owner, issue.repo, issue.number, page
             );
             let mut page_comments = self.get::<Vec<ApiComment>>(&url).await?;
             let done = page_comments.len() < 100;
@@ -737,6 +799,35 @@ impl GitHubRestClient {
             api_url: pr.url,
             html_url: pr.html_url,
             clone_url: pr.base.repo.clone_url,
+        })
+    }
+
+    async fn issue_from_api(&self, issue: ApiIssue) -> Result<Issue> {
+        let repository_url = issue
+            .repository_url
+            .ok_or_else(|| anyhow!("issue has no repository URL"))?;
+        let repo = self.get::<ApiRepo>(&repository_url).await?;
+        let owner = repo
+            .owner
+            .ok_or_else(|| anyhow!("issue repository has no owner"))?;
+        let default_branch = repo
+            .default_branch
+            .ok_or_else(|| anyhow!("issue repository has no default branch"))?;
+
+        Ok(Issue {
+            owner: owner.login,
+            repo: repo.name,
+            number: issue.number.ok_or_else(|| anyhow!("issue has no number"))?,
+            author: issue
+                .user
+                .ok_or_else(|| anyhow!("issue has no author"))?
+                .login,
+            api_url: issue.url.ok_or_else(|| anyhow!("issue has no URL"))?,
+            html_url: issue
+                .html_url
+                .ok_or_else(|| anyhow!("issue has no HTML URL"))?,
+            clone_url: repo.clone_url,
+            default_branch,
         })
     }
 
@@ -836,13 +927,13 @@ fn recent_comments(mut comments: Vec<ApiComment>, limit: usize) -> Vec<ApiCommen
     comments.into_iter().skip(start).collect()
 }
 
-fn comment_mention(comment: ApiComment, pr: &PullRequest) -> CommentMention {
+fn comment_mention(comment: ApiComment, target: &WorkTarget) -> CommentMention {
     CommentMention {
         author: comment.user.login,
         body: comment.body,
         api_url: comment.url,
         html_url: comment.html_url,
-        pr: pr.clone(),
+        target: target.clone(),
     }
 }
 
@@ -916,6 +1007,11 @@ struct ApiReaction {
 
 #[derive(Debug, Deserialize)]
 struct ApiIssue {
+    url: Option<String>,
+    html_url: Option<String>,
+    repository_url: Option<String>,
+    number: Option<u64>,
+    user: Option<ApiUser>,
     pull_request: Option<ApiIssuePullRequest>,
 }
 
@@ -943,6 +1039,7 @@ struct ApiRepo {
     name: String,
     clone_url: String,
     owner: Option<ApiUser>,
+    default_branch: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

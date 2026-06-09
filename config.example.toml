@@ -29,15 +29,15 @@ codex_reasoning_effort = "high"
 
 # Required. These templates are the full prompts Maid sends to Codex.
 # Supported mention placeholders:
-# {{mention_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
+# {{mention_url}}, {{target_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
 # Supported pull_request_opened placeholders:
 # {{pr_url}}, {{author}}
 # Supported operator_mention placeholders:
-# {{bot_login}}, {{trigger_author}}, {{mention_url}}, {{pr_url}},
+# {{bot_login}}, {{trigger_author}}, {{mention_url}}, {{target_url}}, {{pr_url}},
 # {{raw_body}}, {{request_text}}, {{operator_trigger}}
 [codex_prompts]
 mention = """
-You are responding to a GitHub pull request mention.
+You are responding to a GitHub mention.
 
 Inspect the worktree in your current working directory and answer the request.
 Return only the GitHub comment body to post. Do not include tool logs or wrappers.
@@ -45,8 +45,8 @@ Return only the GitHub comment body to post. Do not include tool logs or wrapper
 Mention URL:
 {{mention_url}}
 
-Pull request URL:
-{{pr_url}}
+Target URL:
+{{target_url}}
 
 Raw mention body:
 {{raw_body}}
@@ -78,7 +78,7 @@ Context:
 - Bot login: {{bot_login}}
 - Trigger author: {{trigger_author}}
 - Mention URL: {{mention_url}}
-- Pull request URL: {{pr_url}}
+- Target URL: {{target_url}}
 
 Operator request:
 {{request_text}}
