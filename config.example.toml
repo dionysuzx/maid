@@ -1,9 +1,9 @@
 # Required.
 bot_login = "maid-bot"
-master_accounts = ["your-name"]
+trusted_accounts = ["your-name"]
 
-# Optional. Defaults to master_accounts when omitted.
-auto_review_accounts = ["your-name"]
+# Optional. Defaults to trusted_accounts when omitted.
+auto_reviewers = ["your-name"]
 
 # Optional. Empty or omitted disables automatic PR-open reviews.
 auto_review_repos = ["your-name/maid"]

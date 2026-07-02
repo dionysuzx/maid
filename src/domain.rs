@@ -156,7 +156,7 @@ impl WorkTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommentMention {
+pub struct Mention {
     pub author: String,
     pub body: String,
     pub api_url: String,

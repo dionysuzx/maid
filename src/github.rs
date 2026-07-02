@@ -1,5 +1,5 @@
 use crate::{
-    domain::{CommentMention, Issue, Notification, PullRequest, RepoSlug, ReviewState, WorkTarget},
+    domain::{Issue, Mention, Notification, PullRequest, RepoSlug, ReviewState, WorkTarget},
     maid::GithubClient,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -240,7 +240,7 @@ impl GithubClient for GitHubRestClient {
         Ok(notifications)
     }
 
-    async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>> {
+    async fn mention_for(&self, notification: &Notification) -> Result<Option<Mention>> {
         let Some(comment_url) = notification.latest_comment_url.as_deref() else {
             return Ok(None);
         };
@@ -253,7 +253,7 @@ impl GithubClient for GitHubRestClient {
             return Ok(None);
         };
 
-        Ok(Some(CommentMention {
+        Ok(Some(Mention {
             author: comment.user.login,
             body: comment.body,
             api_url: comment_url.to_string(),
@@ -262,7 +262,7 @@ impl GithubClient for GitHubRestClient {
         }))
     }
 
-    async fn mentions_for(&self, notification: &Notification) -> Result<Vec<CommentMention>> {
+    async fn mentions_for(&self, notification: &Notification) -> Result<Vec<Mention>> {
         let Some(target) = self.target_for_notification(notification).await? else {
             return Ok(Vec::new());
         };
@@ -309,11 +309,7 @@ impl GithubClient for GitHubRestClient {
             .await
     }
 
-    async fn mention_state(
-        &self,
-        mention: &CommentMention,
-        bot_login: &str,
-    ) -> Result<ReviewState> {
+    async fn mention_state(&self, mention: &Mention, bot_login: &str) -> Result<ReviewState> {
         if self
             .mention_has_reaction(mention, bot_login, HANDLED_REACTION)
             .await?
@@ -324,11 +320,11 @@ impl GithubClient for GitHubRestClient {
         }
     }
 
-    async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()> {
+    async fn mark_mention_started(&self, mention: &Mention) -> Result<()> {
         self.add_reaction(mention, STARTED_REACTION).await
     }
 
-    async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()> {
+    async fn mark_mention_handled(&self, mention: &Mention) -> Result<()> {
         self.add_reaction(mention, HANDLED_REACTION).await
     }
 
@@ -833,7 +829,7 @@ impl GitHubRestClient {
 
     async fn mention_has_reaction(
         &self,
-        mention: &CommentMention,
+        mention: &Mention,
         bot_login: &str,
         content: &str,
     ) -> Result<bool> {
@@ -845,7 +841,7 @@ impl GitHubRestClient {
         .await
     }
 
-    async fn add_reaction(&self, mention: &CommentMention, content: &str) -> Result<()> {
+    async fn add_reaction(&self, mention: &Mention, content: &str) -> Result<()> {
         self.add_reaction_to_api_url(&mention.api_url, content)
             .await
     }
@@ -927,8 +923,8 @@ fn recent_comments(mut comments: Vec<ApiComment>, limit: usize) -> Vec<ApiCommen
     comments.into_iter().skip(start).collect()
 }
 
-fn comment_mention(comment: ApiComment, target: &WorkTarget) -> CommentMention {
-    CommentMention {
+fn comment_mention(comment: ApiComment, target: &WorkTarget) -> Mention {
+    Mention {
         author: comment.user.login,
         body: comment.body,
         api_url: comment.url,

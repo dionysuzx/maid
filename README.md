@@ -3,7 +3,7 @@
 Maid is a smol bot that runs local Codex on GitHub events.
 
 It watches for opened PRs and issue or PR mentions to your configured GitHub bot account
-(a "maid), checks that the request came from a trusted master account, prepares
+(a "maid), checks that the request came from a trusted account, prepares
 an isolated worktree, runs `codex`, and posts Codex's final answer back as a
 comment. It can also run automatic reviews for configured repositories, and
 trusted users can request adhoc operator tasks with `/operate`.

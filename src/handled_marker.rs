@@ -1,4 +1,4 @@
-use crate::domain::{CommentMention, PullRequest};
+use crate::domain::{Mention, PullRequest};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,7 +15,7 @@ pub enum PendingHandledMarker {
 }
 
 impl PendingHandledMarker {
-    pub fn for_mention(mention: &CommentMention) -> Self {
+    pub fn for_mention(mention: &Mention) -> Self {
         Self::Mention {
             api_url: mention.api_url.clone(),
         }

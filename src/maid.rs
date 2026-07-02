@@ -1,9 +1,9 @@
 use crate::auto_review::{
-    AutoReviewAction, AutoReviewAuthor, AutoReviewObservation, classify_auto_review_author,
-    plan_auto_review,
+    AutoReviewAction, AutoReviewEligibility, AutoReviewObservation,
+    classify_auto_review_eligibility, plan_auto_review,
 };
 use crate::domain::{
-    CodexTask, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug, ReviewState,
+    CodexTask, Mention, MentionRequest, Notification, PullRequest, RepoSlug, ReviewState,
     WorkTarget,
 };
 use crate::handled_marker::{
@@ -28,17 +28,16 @@ use tracing::{error, info};
 #[async_trait]
 pub trait GithubClient: Send + Sync {
     async fn notifications(&self) -> Result<Vec<Notification>>;
-    async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>>;
-    async fn mentions_for(&self, notification: &Notification) -> Result<Vec<CommentMention>> {
+    async fn mention_for(&self, notification: &Notification) -> Result<Option<Mention>>;
+    async fn mentions_for(&self, notification: &Notification) -> Result<Vec<Mention>> {
         Ok(self.mention_for(notification).await?.into_iter().collect())
     }
     async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
-    async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
-    -> Result<ReviewState>;
-    async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
-    async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()>;
+    async fn mention_state(&self, mention: &Mention, bot_login: &str) -> Result<ReviewState>;
+    async fn mark_mention_started(&self, mention: &Mention) -> Result<()>;
+    async fn mark_mention_handled(&self, mention: &Mention) -> Result<()>;
     async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()>;
     async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState>;
     async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()>;
@@ -111,8 +110,8 @@ pub struct Maid<G, R, C> {
     worktrees: R,
     codex: C,
     bot_login: String,
-    master_accounts: HashSet<String>,
-    auto_review_accounts: HashSet<String>,
+    trusted_accounts: HashSet<String>,
+    auto_reviewers: HashSet<String>,
     auto_review_repos: Vec<RepoSlug>,
     task_starts: Arc<dyn TaskStartRecorder>,
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
@@ -140,8 +139,8 @@ where
         worktrees: R,
         codex: C,
         bot_login: impl Into<String>,
-        master_accounts: impl IntoIterator<Item = impl Into<String>>,
-        auto_review_accounts: impl IntoIterator<Item = impl Into<String>>,
+        trusted_accounts: impl IntoIterator<Item = impl Into<String>>,
+        auto_reviewers: impl IntoIterator<Item = impl Into<String>>,
         auto_review_repos: impl IntoIterator<Item = RepoSlug>,
     ) -> Self {
         Self {
@@ -149,8 +148,8 @@ where
             worktrees,
             codex,
             bot_login: bot_login.into(),
-            master_accounts: normalized_logins(master_accounts),
-            auto_review_accounts: normalized_logins(auto_review_accounts),
+            trusted_accounts: normalized_logins(trusted_accounts),
+            auto_reviewers: normalized_logins(auto_reviewers),
             auto_review_repos: auto_review_repos.into_iter().collect(),
             task_starts: Arc::new(NoTaskLimit),
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
@@ -437,21 +436,21 @@ where
     async fn observe_mention(
         &self,
         notification: &Notification,
-        mention: CommentMention,
+        mention: Mention,
     ) -> Result<Option<MentionObservation>> {
         if mention.author.eq_ignore_ascii_case(&self.bot_login) {
             return Ok(None);
         }
 
         if !self
-            .master_accounts
+            .trusted_accounts
             .contains(&mention.author.to_ascii_lowercase())
         {
             info!(
                 notification_id = notification.id,
                 mention = %mention.html_url,
                 author = %mention.author,
-                "skipping mention from non-master account"
+                "skipping mention from non-trusted account"
             );
             return Ok(None);
         }
@@ -521,10 +520,7 @@ where
         Ok(assessments)
     }
 
-    async fn mentions_for_notification(
-        &self,
-        notification: &Notification,
-    ) -> Result<Vec<CommentMention>> {
+    async fn mentions_for_notification(&self, notification: &Notification) -> Result<Vec<Mention>> {
         let Some(latest) = self.github.mention_for(notification).await? else {
             return self.github.mentions_for(notification).await;
         };
@@ -540,8 +536,8 @@ where
     async fn scanned_mentions_or_latest(
         &self,
         notification: &Notification,
-        latest: CommentMention,
-    ) -> Result<Vec<CommentMention>> {
+        latest: Mention,
+    ) -> Result<Vec<Mention>> {
         let mut mentions = self.github.mentions_for(notification).await?;
         if !mentions
             .iter()
@@ -553,12 +549,9 @@ where
         Ok(mentions)
     }
 
-    async fn choose_mention_thread_read(
-        &self,
-        latest: &CommentMention,
-    ) -> Result<MentionThreadRead> {
+    async fn choose_mention_thread_read(&self, latest: &Mention) -> Result<MentionThreadRead> {
         if !self
-            .master_accounts
+            .trusted_accounts
             .contains(&latest.author.to_ascii_lowercase())
         {
             return Ok(choose_mention_thread_read(
@@ -598,13 +591,13 @@ where
     }
 
     async fn observe_auto_review_pr(&self, pr: &PullRequest) -> Result<AutoReviewObservation> {
-        let author = classify_auto_review_author(
+        let author = classify_auto_review_eligibility(
             pr,
             &self.bot_login,
-            self.auto_review_accounts
+            self.auto_reviewers
                 .contains(&pr.author.to_ascii_lowercase()),
         );
-        if author != AutoReviewAuthor::Allowed {
+        if author != AutoReviewEligibility::Trusted {
             return Ok(AutoReviewObservation::new(pr.clone(), author, None, false));
         }
 
@@ -679,7 +672,7 @@ where
     async fn start_mention_task(
         &self,
         notification: Notification,
-        mention: Box<CommentMention>,
+        mention: Box<Mention>,
         task: CodexTask,
     ) -> Result<TaskStartOutcome> {
         self.github.mark_mention_started(&mention).await?;
@@ -714,7 +707,7 @@ where
     async fn finish_mention_task(
         &self,
         notification: Notification,
-        mention: Box<CommentMention>,
+        mention: Box<Mention>,
         task: CodexTask,
     ) -> Result<()> {
         let worktree = self.worktrees.prepare(&mention.target, &task).await?;
@@ -1114,7 +1107,7 @@ enum TaskStartOutcome {
 enum TaskIntent {
     Mention {
         notification: Notification,
-        mention: Box<CommentMention>,
+        mention: Box<Mention>,
         task: CodexTask,
     },
     AutoReviewPullRequest {
@@ -1157,7 +1150,7 @@ impl TaskIntent {
 enum StartedTask {
     Mention {
         notification: Notification,
-        mention: Box<CommentMention>,
+        mention: Box<Mention>,
         task: CodexTask,
     },
     AutoReviewPullRequest {
@@ -1229,8 +1222,8 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{Barrier, Notify};
 
-    type FakeMentionResult = Option<Result<Option<CommentMention>, String>>;
-    type FakeMentionsResult = Option<Result<Vec<CommentMention>, String>>;
+    type FakeMentionResult = Option<Result<Option<Mention>, String>>;
+    type FakeMentionsResult = Option<Result<Vec<Mention>, String>>;
     #[derive(Clone, Default)]
     struct FakeGithub {
         notifications: Arc<StdMutex<Vec<Notification>>>,
@@ -1259,15 +1252,12 @@ mod tests {
             Ok(self.notifications.lock().unwrap().clone())
         }
 
-        async fn mention_for(
-            &self,
-            _notification: &Notification,
-        ) -> Result<Option<CommentMention>> {
+        async fn mention_for(&self, _notification: &Notification) -> Result<Option<Mention>> {
             *self.mention_calls.lock().unwrap() += 1;
             self.take_mention()
         }
 
-        async fn mentions_for(&self, _notification: &Notification) -> Result<Vec<CommentMention>> {
+        async fn mentions_for(&self, _notification: &Notification) -> Result<Vec<Mention>> {
             *self.mentions_calls.lock().unwrap() += 1;
             if let Some(result) = self.mentions.lock().unwrap().take() {
                 return result.map_err(|message| anyhow!(message));
@@ -1294,11 +1284,7 @@ mod tests {
                 .await
         }
 
-        async fn mention_state(
-            &self,
-            mention: &CommentMention,
-            _bot_login: &str,
-        ) -> Result<ReviewState> {
+        async fn mention_state(&self, mention: &Mention, _bot_login: &str) -> Result<ReviewState> {
             if self
                 .stale_pending_mentions
                 .lock()
@@ -1320,7 +1306,7 @@ mod tests {
             }
         }
 
-        async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()> {
+        async fn mark_mention_started(&self, mention: &Mention) -> Result<()> {
             self.events.lock().unwrap().push("start".to_string());
             self.started_mentions
                 .lock()
@@ -1329,7 +1315,7 @@ mod tests {
             Ok(())
         }
 
-        async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()> {
+        async fn mark_mention_handled(&self, mention: &Mention) -> Result<()> {
             self.events.lock().unwrap().push("handled".to_string());
             if let Some(message) = self.handled_error.lock().unwrap().take() {
                 return Err(anyhow!(message));
@@ -1408,7 +1394,7 @@ mod tests {
     }
 
     impl FakeGithub {
-        fn take_mention(&self) -> Result<Option<CommentMention>> {
+        fn take_mention(&self) -> Result<Option<Mention>> {
             match self.mention.lock().unwrap().take().unwrap_or(Ok(None)) {
                 Ok(value) => Ok(value),
                 Err(message) => Err(anyhow!(message)),
@@ -1614,12 +1600,12 @@ mod tests {
         }
     }
 
-    fn mention(author: &str, body: &str) -> CommentMention {
+    fn mention(author: &str, body: &str) -> Mention {
         mention_with_comment(author, body, "2")
     }
 
-    fn mention_with_comment(author: &str, body: &str, comment_id: &str) -> CommentMention {
-        CommentMention {
+    fn mention_with_comment(author: &str, body: &str, comment_id: &str) -> Mention {
+        Mention {
             author: author.to_string(),
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
@@ -1628,8 +1614,8 @@ mod tests {
         }
     }
 
-    fn issue_mention(author: &str, body: &str, comment_id: &str) -> CommentMention {
-        CommentMention {
+    fn issue_mention(author: &str, body: &str, comment_id: &str) -> Mention {
+        Mention {
             author: author.to_string(),
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
@@ -1638,8 +1624,8 @@ mod tests {
         }
     }
 
-    fn review_mention(author: &str, body: &str, comment_id: &str) -> CommentMention {
-        CommentMention {
+    fn review_mention(author: &str, body: &str, comment_id: &str) -> Mention {
+        Mention {
             author: author.to_string(),
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/pulls/comments/{comment_id}"),
@@ -1883,7 +1869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responds_to_opened_pr_from_auto_review_account() {
+    async fn responds_to_opened_pr_from_auto_reviewer() {
         let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
@@ -2338,7 +2324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ignores_mentions_from_non_master_accounts() {
+    async fn ignores_mentions_from_non_trusted_accounts() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() =
@@ -2363,7 +2349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn master_account_matching_is_case_insensitive() {
+    async fn trusted_account_matching_is_case_insensitive() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("Dionysuzx", "@maid-bot review"))));

@@ -1,4 +1,4 @@
-use crate::domain::{CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, ReviewState};
+use crate::domain::{CodexTask, CodexTaskOrigin, Mention, MentionRequest, ReviewState};
 use crate::handled_marker::PendingHandledMarker;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8,7 +8,7 @@ pub enum MentionThreadRead {
 }
 
 pub fn choose_mention_thread_read(
-    latest: &CommentMention,
+    latest: &Mention,
     request: Option<&MentionRequest>,
     state: Option<ReviewState>,
     bot_login: &str,
@@ -36,7 +36,7 @@ impl MentionThread {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MentionObservation {
-    mention: CommentMention,
+    mention: Mention,
     request: MentionRequest,
     state: ReviewState,
     has_pending_marker: bool,
@@ -44,7 +44,7 @@ pub struct MentionObservation {
 
 impl MentionObservation {
     pub fn new(
-        mention: CommentMention,
+        mention: Mention,
         request: MentionRequest,
         state: ReviewState,
         has_pending_marker: bool,
@@ -88,15 +88,15 @@ pub enum MentionNotificationPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MentionThreadAction {
     StartTask {
-        mention: CommentMention,
+        mention: Mention,
         task: CodexTask,
     },
     MarkHandled {
-        mention: CommentMention,
+        mention: Mention,
         marker: PendingHandledMarker,
     },
     ForgetHandledMarker {
-        mention: CommentMention,
+        mention: Mention,
         marker: PendingHandledMarker,
     },
 }
@@ -149,7 +149,7 @@ fn mention_action_for(observation: MentionObservation, bot_login: &str) -> Menti
 }
 
 fn mention_task_origin(
-    mention: &CommentMention,
+    mention: &Mention,
     request: MentionRequest,
     bot_login: &str,
 ) -> CodexTaskOrigin {
@@ -285,8 +285,8 @@ mod tests {
         ));
     }
 
-    fn mention(author: &str, body: &str, comment_id: &str) -> CommentMention {
-        CommentMention {
+    fn mention(author: &str, body: &str, comment_id: &str) -> Mention {
+        Mention {
             author: author.to_string(),
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),

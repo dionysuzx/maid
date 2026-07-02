@@ -31,8 +31,8 @@ async fn main() -> Result<()> {
             config.codex_prompts.clone(),
         ),
         config.bot_login.clone(),
-        config.master_accounts.clone(),
-        config.auto_review_accounts.clone(),
+        config.trusted_accounts.clone(),
+        config.auto_reviewers.clone(),
         config.auto_review_repos.clone(),
     )
     .with_task_start_recorder(FileTaskStartRecorder::new(
@@ -76,8 +76,8 @@ async fn main() -> Result<()> {
         github_api_requests_per_hour = config.github_api_requests_per_hour.requests_per_hour(),
         task_limit_per_24h = %task_limit_per_24h,
         max_concurrent_requests = config.max_concurrent_requests,
-        master_accounts = config.master_accounts.len(),
-        auto_review_accounts = config.auto_review_accounts.len(),
+        trusted_accounts = config.trusted_accounts.len(),
+        auto_reviewers = config.auto_reviewers.len(),
         auto_review_repos = config.auto_review_repos.len(),
         "maid started"
     );

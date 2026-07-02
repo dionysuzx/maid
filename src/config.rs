@@ -15,8 +15,8 @@ use std::{
 pub struct Config {
     pub github_token: String,
     pub bot_login: String,
-    pub master_accounts: Vec<String>,
-    pub auto_review_accounts: Vec<String>,
+    pub trusted_accounts: Vec<String>,
+    pub auto_reviewers: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
     pub git_dir: PathBuf,
     pub daemon_pid_path: PathBuf,
@@ -44,14 +44,19 @@ impl Config {
                 config_path.display()
             )
         })?;
-        let master_accounts = required_logins(file.master_accounts, "master_accounts")
-            .with_context(|| format!("master_accounts is required in {}", config_path.display()))?;
-        let auto_review_accounts =
-            optional_logins(file.auto_review_accounts, "auto_review_accounts")?
-                .unwrap_or_else(|| master_accounts.clone());
-        for login in &auto_review_accounts {
-            if !master_accounts.contains(login) {
-                bail!("auto_review_accounts must be a subset of master_accounts: {login}");
+        let trusted_accounts = required_logins(
+            file.trusted_accounts.or(file.legacy_trusted_accounts),
+            "trusted_accounts",
+        )
+        .with_context(|| format!("trusted_accounts is required in {}", config_path.display()))?;
+        let auto_reviewers = optional_logins(
+            file.auto_reviewers.or(file.legacy_auto_reviewers),
+            "auto_reviewers",
+        )?
+        .unwrap_or_else(|| trusted_accounts.clone());
+        for login in &auto_reviewers {
+            if !trusted_accounts.contains(login) {
+                bail!("auto_reviewers must be a subset of trusted_accounts: {login}");
             }
         }
         let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
@@ -93,8 +98,8 @@ impl Config {
         Ok(Self {
             github_token,
             bot_login,
-            master_accounts,
-            auto_review_accounts,
+            trusted_accounts,
+            auto_reviewers,
             auto_review_repos,
             git_dir,
             daemon_pid_path: maid_home.join("maid.pid"),
@@ -116,8 +121,12 @@ impl Config {
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     bot_login: Option<String>,
-    master_accounts: Option<Vec<String>>,
-    auto_review_accounts: Option<Vec<String>>,
+    trusted_accounts: Option<Vec<String>>,
+    #[serde(rename = "master_accounts")]
+    legacy_trusted_accounts: Option<Vec<String>>,
+    auto_reviewers: Option<Vec<String>>,
+    #[serde(rename = "auto_review_accounts")]
+    legacy_auto_reviewers: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
     git_dir: Option<String>,
     task_limit_per_24h: Option<usize>,
@@ -320,8 +329,8 @@ mod tests {
             file,
             r#"
 bot_login = "maid-bot"
-master_accounts = ["dionysuzx"]
-auto_review_accounts = ["dionysuzx"]
+trusted_accounts = ["dionysuzx"]
+auto_reviewers = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
 git_dir = "~/.maid/git"
 task_limit_per_24h = 5
@@ -343,11 +352,8 @@ operator_mention = "operator {{{{request_text}}}}"
         let config = ConfigFile::read(file.path()).unwrap();
 
         assert_eq!(config.bot_login.as_deref(), Some("maid-bot"));
-        assert_eq!(config.master_accounts, Some(vec!["dionysuzx".to_string()]));
-        assert_eq!(
-            config.auto_review_accounts,
-            Some(vec!["dionysuzx".to_string()])
-        );
+        assert_eq!(config.trusted_accounts, Some(vec!["dionysuzx".to_string()]));
+        assert_eq!(config.auto_reviewers, Some(vec!["dionysuzx".to_string()]));
         assert_eq!(
             config.auto_review_repos,
             Some(vec!["dionysuzx/maid".to_string()])
@@ -376,12 +382,49 @@ operator_mention = "operator {{{{request_text}}}}"
     }
 
     #[test]
+    fn accepts_legacy_account_config_keys() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+bot_login = "maid-bot"
+master_accounts = ["dionysuzx"]
+auto_review_accounts = ["dionysuzx"]
+codex_model = "gpt-test"
+codex_reasoning_effort = "high"
+
+[codex_prompts]
+mention = "mention {{{{cleaned_text}}}}"
+pull_request_opened = "review {{{{pr_url}}}}"
+operator_mention = "operator {{{{request_text}}}}"
+"#
+        )
+        .unwrap();
+
+        let file = ConfigFile::read(file.path()).unwrap();
+        let trusted_accounts = required_logins(
+            file.trusted_accounts.or(file.legacy_trusted_accounts),
+            "trusted_accounts",
+        )
+        .unwrap();
+        let auto_reviewers = optional_logins(
+            file.auto_reviewers.or(file.legacy_auto_reviewers),
+            "auto_reviewers",
+        )
+        .unwrap()
+        .unwrap_or_else(|| trusted_accounts.clone());
+
+        assert_eq!(trusted_accounts, vec!["dionysuzx".to_string()]);
+        assert_eq!(auto_reviewers, vec!["dionysuzx".to_string()]);
+    }
+
+    #[test]
     fn missing_config_file_is_empty_config() {
         let config = ConfigFile::read(Path::new("/tmp/maid-missing-config-for-test.toml")).unwrap();
 
         assert_eq!(config.bot_login, None);
-        assert_eq!(config.master_accounts, None);
-        assert_eq!(config.auto_review_accounts, None);
+        assert_eq!(config.trusted_accounts, None);
+        assert_eq!(config.auto_reviewers, None);
         assert_eq!(config.auto_review_repos, None);
         assert_eq!(config.git_dir, None);
         assert_eq!(config.task_limit_per_24h, None);
@@ -460,15 +503,15 @@ operator_mention = "operator {{{{request_text}}}}"
                     "dionysuzx".to_string(),
                     "mayushii-admin".to_string()
                 ]),
-                "master_accounts"
+                "trusted_accounts"
             )
             .unwrap(),
             vec!["dionysuzx".to_string(), "mayushii-admin".to_string()]
         );
 
-        assert!(required_logins(None, "master_accounts").is_err());
-        assert!(required_logins(Some(Vec::new()), "master_accounts").is_err());
-        assert!(required_logins(Some(vec![" ".to_string()]), "master_accounts").is_err());
+        assert!(required_logins(None, "trusted_accounts").is_err());
+        assert!(required_logins(Some(Vec::new()), "trusted_accounts").is_err());
+        assert!(required_logins(Some(vec![" ".to_string()]), "trusted_accounts").is_err());
     }
 
     #[test]
@@ -476,17 +519,17 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(
             optional_logins(
                 Some(vec!["  Dionysuzx  ".to_string(), "dionysuzx".to_string()]),
-                "auto_review_accounts"
+                "auto_reviewers"
             )
             .unwrap(),
             Some(vec!["dionysuzx".to_string()])
         );
         assert_eq!(
-            optional_logins(Some(Vec::new()), "auto_review_accounts").unwrap(),
+            optional_logins(Some(Vec::new()), "auto_reviewers").unwrap(),
             Some(Vec::new())
         );
-        assert!(optional_logins(Some(vec![" ".to_string()]), "auto_review_accounts").is_err());
-        assert_eq!(optional_logins(None, "auto_review_accounts").unwrap(), None);
+        assert!(optional_logins(Some(vec![" ".to_string()]), "auto_reviewers").is_err());
+        assert_eq!(optional_logins(None, "auto_reviewers").unwrap(), None);
     }
 
     #[test]

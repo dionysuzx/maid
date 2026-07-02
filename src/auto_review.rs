@@ -2,30 +2,30 @@ use crate::domain::{CodexTask, CodexTaskOrigin, PullRequest, ReviewState};
 use crate::handled_marker::PendingHandledMarker;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AutoReviewAuthor {
-    Bot,
-    Allowed,
-    NotAllowed,
+pub enum AutoReviewEligibility {
+    SelfAuthored,
+    Trusted,
+    Untrusted,
 }
 
-pub fn classify_auto_review_author(
+pub fn classify_auto_review_eligibility(
     pr: &PullRequest,
     bot_login: &str,
-    is_allowed_author: bool,
-) -> AutoReviewAuthor {
+    is_trusted_author: bool,
+) -> AutoReviewEligibility {
     if pr.author.eq_ignore_ascii_case(bot_login) {
-        AutoReviewAuthor::Bot
-    } else if is_allowed_author {
-        AutoReviewAuthor::Allowed
+        AutoReviewEligibility::SelfAuthored
+    } else if is_trusted_author {
+        AutoReviewEligibility::Trusted
     } else {
-        AutoReviewAuthor::NotAllowed
+        AutoReviewEligibility::Untrusted
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoReviewObservation {
     pr: PullRequest,
-    author: AutoReviewAuthor,
+    author: AutoReviewEligibility,
     state: Option<ReviewState>,
     has_pending_marker: bool,
 }
@@ -33,7 +33,7 @@ pub struct AutoReviewObservation {
 impl AutoReviewObservation {
     pub fn new(
         pr: PullRequest,
-        author: AutoReviewAuthor,
+        author: AutoReviewEligibility,
         state: Option<ReviewState>,
         has_pending_marker: bool,
     ) -> Self {
@@ -68,13 +68,15 @@ pub enum AutoReviewAction {
 
 pub fn plan_auto_review(observation: AutoReviewObservation) -> AutoReviewAction {
     match observation.author {
-        AutoReviewAuthor::Bot => AutoReviewAction::SkipSelfAuthored,
-        AutoReviewAuthor::NotAllowed => AutoReviewAction::SkipUnauthorized { pr: observation.pr },
-        AutoReviewAuthor::Allowed => plan_allowed_auto_review(observation),
+        AutoReviewEligibility::SelfAuthored => AutoReviewAction::SkipSelfAuthored,
+        AutoReviewEligibility::Untrusted => {
+            AutoReviewAction::SkipUnauthorized { pr: observation.pr }
+        }
+        AutoReviewEligibility::Trusted => plan_trusted_auto_review(observation),
     }
 }
 
-fn plan_allowed_auto_review(observation: AutoReviewObservation) -> AutoReviewAction {
+fn plan_trusted_auto_review(observation: AutoReviewObservation) -> AutoReviewAction {
     let marker = PendingHandledMarker::for_pull_request(&observation.pr);
     match observation.state {
         Some(ReviewState::Handled) => AutoReviewAction::ForgetHandledMarker {
@@ -109,7 +111,7 @@ mod tests {
         let pr = pr("contributor");
         let action = plan_auto_review(AutoReviewObservation::new(
             pr.clone(),
-            AutoReviewAuthor::NotAllowed,
+            AutoReviewEligibility::Untrusted,
             None,
             false,
         ));
@@ -122,7 +124,7 @@ mod tests {
         let pr = pr("dionysuzx");
         let action = plan_auto_review(AutoReviewObservation::new(
             pr.clone(),
-            AutoReviewAuthor::Allowed,
+            AutoReviewEligibility::Trusted,
             Some(ReviewState::Pending),
             true,
         ));
@@ -141,7 +143,7 @@ mod tests {
         let pr = pr("dionysuzx");
         let action = plan_auto_review(AutoReviewObservation::new(
             pr.clone(),
-            AutoReviewAuthor::Allowed,
+            AutoReviewEligibility::Trusted,
             Some(ReviewState::Pending),
             false,
         ));
