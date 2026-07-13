@@ -1,8 +1,14 @@
 use anyhow::Result;
 use maid::{
-    codex::CodexCli, config::Config, daemon_lock::DaemonLock, github::GitHubRestClient,
-    handled_marker::FilePendingHandledMarkerStore, maid::Maid,
-    observed_notification::FileObservedNotificationStore, task_limit::FileTaskStartRecorder,
+    codex::CodexCli,
+    config::Config,
+    daemon_lock::DaemonLock,
+    github::GitHubRestClient,
+    handled_marker::FilePendingHandledMarkerStore,
+    maid::Maid,
+    observed_notification::FileObservedNotificationStore,
+    polling_metrics::{PollingMetrics, PollingMetricsEndpoint},
+    task_limit::FileTaskStartRecorder,
     worktree::GitWorktrees,
 };
 use std::time::Duration;
@@ -17,6 +23,10 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let _daemon_lock = DaemonLock::acquire(config.daemon_pid_path.clone())?;
+    let polling_metrics = PollingMetrics::new();
+    let metrics_endpoint =
+        PollingMetricsEndpoint::bind(config.metrics_bind_address, polling_metrics.clone()).await?;
+    let metrics_server = tokio::spawn(metrics_endpoint.serve());
     let maid = Maid::new(
         GitHubRestClient::with_options(
             config.github_token.clone(),
@@ -50,18 +60,22 @@ async fn main() -> Result<()> {
     let task_limit_per_24h = config
         .task_limit_per_24h
         .map_or_else(|| "none".to_string(), |limit| limit.to_string());
+    let poller_metrics = polling_metrics.clone();
     let poller = tokio::spawn(async move {
         loop {
             match maid.run_once().await {
-                Ok(report) => info!(
-                    seen = report.seen,
-                    skipped = report.skipped,
-                    started = report.started,
-                    responded = report.responded,
-                    failed = report.failed,
-                    in_flight = report.in_flight,
-                    "poll complete"
-                ),
+                Ok(report) => {
+                    poller_metrics.record_success();
+                    info!(
+                        seen = report.seen,
+                        skipped = report.skipped,
+                        started = report.started,
+                        responded = report.responded,
+                        failed = report.failed,
+                        in_flight = report.in_flight,
+                        "poll complete"
+                    )
+                }
                 Err(err) => error!(error = ?err, "poll failed"),
             }
         }
@@ -79,12 +93,15 @@ async fn main() -> Result<()> {
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),
+        metrics_bind_address = %config.metrics_bind_address,
         "maid started"
     );
 
     shutdown_signal().await;
     poller.abort();
     let _ = poller.await;
+    metrics_server.abort();
+    let _ = metrics_server.await;
 
     Ok(())
 }

@@ -40,3 +40,10 @@ just update
 
 Runtime config lives at `~/.maid/config.toml`. Run `just config` to edit it, and
 use [config.example.toml](config.example.toml) as the configuration reference.
+
+## Metrics
+
+Maid serves Prometheus metrics at `http://127.0.0.1:9464/metrics` by default.
+`maid_last_successful_poll_timestamp_seconds` records the Unix timestamp of the
+last poll that completed successfully. The sample is absent until the first
+successful poll. Configure `metrics_bind_address` to use a different address.

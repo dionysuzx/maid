@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::{
     env,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -31,6 +31,7 @@ pub struct Config {
     pub codex_reasoning_effort: String,
     pub codex_prompts: CodexPromptTemplates,
     pub github_api_ip: Option<IpAddr>,
+    pub metrics_bind_address: SocketAddr,
 }
 
 impl Config {
@@ -89,6 +90,12 @@ impl Config {
             .transpose()
             .context("github_api_ip must be an IPv4 or IPv6 address")?;
         let github_token = gh_token_for(&bot_login)?;
+        let metrics_bind_address = file
+            .metrics_bind_address
+            .as_deref()
+            .unwrap_or("127.0.0.1:9464")
+            .parse()
+            .context("metrics_bind_address must be an IP address and port")?;
 
         Ok(Self {
             github_token,
@@ -109,6 +116,7 @@ impl Config {
             codex_reasoning_effort,
             codex_prompts,
             github_api_ip,
+            metrics_bind_address,
         })
     }
 }
@@ -128,6 +136,7 @@ struct ConfigFile {
     codex_reasoning_effort: Option<String>,
     codex_prompts: Option<CodexPromptsFile>,
     github_api_ip: Option<String>,
+    metrics_bind_address: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
@@ -327,6 +336,7 @@ git_dir = "~/.maid/git"
 task_limit_per_24h = 5
 max_concurrent_requests = 3
 github_api_requests_per_hour = 1200
+metrics_bind_address = "127.0.0.1:9999"
 codex_bin = "codex-test"
 codex_model = "gpt-test"
 codex_reasoning_effort = "high"
@@ -356,6 +366,10 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.task_limit_per_24h, Some(5));
         assert_eq!(config.max_concurrent_requests, Some(3));
         assert_eq!(config.github_api_requests_per_hour, Some(1200));
+        assert_eq!(
+            config.metrics_bind_address.as_deref(),
+            Some("127.0.0.1:9999")
+        );
         assert_eq!(config.codex_bin.as_deref(), Some("codex-test"));
         assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
         assert_eq!(config.codex_reasoning_effort.as_deref(), Some("high"));
@@ -386,6 +400,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.git_dir, None);
         assert_eq!(config.task_limit_per_24h, None);
         assert_eq!(config.github_api_requests_per_hour, None);
+        assert_eq!(config.metrics_bind_address, None);
         assert_eq!(config.codex_prompts, None);
     }
 
