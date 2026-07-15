@@ -1,6 +1,9 @@
 use crate::{
     domain::{CodexPromptTemplates, RepoSlug},
-    github::{DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, GitHubApiRequestRate},
+    github::{
+        DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
+        GitHubApiRequestRate, GitHubNotificationWindow,
+    },
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -26,6 +29,7 @@ pub struct Config {
     pub task_limit_per_24h: Option<usize>,
     pub max_concurrent_requests: usize,
     pub github_api_requests_per_hour: GitHubApiRequestRate,
+    pub github_notification_window: GitHubNotificationWindow,
     pub codex_bin: String,
     pub codex_model: String,
     pub codex_reasoning_effort: String,
@@ -71,6 +75,10 @@ impl Config {
             file.github_api_requests_per_hour
                 .unwrap_or(DEFAULT_GITHUB_API_REQUESTS_PER_HOUR),
         )?;
+        let github_notification_window = GitHubNotificationWindow::hours(
+            file.github_notification_window_hours
+                .unwrap_or(DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS),
+        )?;
         let codex_bin = normalize_command(non_empty(file.codex_bin))?;
         let codex_model = required_string(file.codex_model, "codex_model")
             .with_context(|| format!("codex_model is required in {}", config_path.display()))?;
@@ -111,6 +119,7 @@ impl Config {
             task_limit_per_24h,
             max_concurrent_requests,
             github_api_requests_per_hour,
+            github_notification_window,
             codex_bin,
             codex_model,
             codex_reasoning_effort,
@@ -131,6 +140,7 @@ struct ConfigFile {
     task_limit_per_24h: Option<usize>,
     max_concurrent_requests: Option<usize>,
     github_api_requests_per_hour: Option<u32>,
+    github_notification_window_hours: Option<u32>,
     codex_bin: Option<String>,
     codex_model: Option<String>,
     codex_reasoning_effort: Option<String>,
@@ -336,6 +346,7 @@ git_dir = "~/.maid/git"
 task_limit_per_24h = 5
 max_concurrent_requests = 3
 github_api_requests_per_hour = 1200
+github_notification_window_hours = 96
 metrics_bind_address = "127.0.0.1:9999"
 codex_bin = "codex-test"
 codex_model = "gpt-test"
@@ -366,6 +377,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.task_limit_per_24h, Some(5));
         assert_eq!(config.max_concurrent_requests, Some(3));
         assert_eq!(config.github_api_requests_per_hour, Some(1200));
+        assert_eq!(config.github_notification_window_hours, Some(96));
         assert_eq!(
             config.metrics_bind_address.as_deref(),
             Some("127.0.0.1:9999")
@@ -400,6 +412,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.git_dir, None);
         assert_eq!(config.task_limit_per_24h, None);
         assert_eq!(config.github_api_requests_per_hour, None);
+        assert_eq!(config.github_notification_window_hours, None);
         assert_eq!(config.metrics_bind_address, None);
         assert_eq!(config.codex_prompts, None);
     }
