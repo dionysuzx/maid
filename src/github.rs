@@ -18,9 +18,36 @@ use tracing::warn;
 const STARTED_REACTION: &str = "eyes";
 const HANDLED_REACTION: &str = "+1";
 pub const DEFAULT_GITHUB_API_REQUESTS_PER_HOUR: u32 = 1_200;
+pub const DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS: u32 = 24;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const NOTIFICATION_PAGE_SIZE: usize = 50;
-const RECENT_NOTIFICATION_WINDOW_HOURS: i64 = 24;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GitHubNotificationWindow {
+    hours: u32,
+}
+
+impl GitHubNotificationWindow {
+    pub fn hours(hours: u32) -> Result<Self> {
+        if hours == 0 {
+            bail!("github_notification_window_hours must be at least 1");
+        }
+
+        Ok(Self { hours })
+    }
+
+    pub fn as_hours(self) -> u32 {
+        self.hours
+    }
+}
+
+impl Default for GitHubNotificationWindow {
+    fn default() -> Self {
+        Self {
+            hours: DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GitHubApiRequestRate {
@@ -59,6 +86,7 @@ pub struct GitHubRestClient {
     token: String,
     traffic: GitHubTraffic,
     notifications: NotificationPolling,
+    notification_window: GitHubNotificationWindow,
 }
 
 impl GitHubRestClient {
@@ -67,13 +95,19 @@ impl GitHubRestClient {
     }
 
     pub fn with_api_ip(token: impl Into<String>, api_ip: Option<IpAddr>) -> Self {
-        Self::with_options(token, api_ip, GitHubApiRequestRate::default())
+        Self::with_options(
+            token,
+            api_ip,
+            GitHubApiRequestRate::default(),
+            GitHubNotificationWindow::default(),
+        )
     }
 
     pub fn with_options(
         token: impl Into<String>,
         api_ip: Option<IpAddr>,
         request_rate: GitHubApiRequestRate,
+        notification_window: GitHubNotificationWindow,
     ) -> Self {
         let mut builder = Client::builder().timeout(Duration::from_secs(30));
         if let Some(api_ip) = api_ip {
@@ -87,6 +121,7 @@ impl GitHubRestClient {
             token: token.into(),
             traffic: GitHubTraffic::new(request_rate),
             notifications: NotificationPolling::default(),
+            notification_window,
         }
     }
 
@@ -203,7 +238,7 @@ impl GitHubRestClient {
 impl GithubClient for GitHubRestClient {
     async fn notifications(&self) -> Result<Vec<Notification>> {
         self.notifications.wait_until_allowed().await;
-        let since = recent_notification_since();
+        let since = recent_notification_since(self.notification_window);
         let mut notifications = Vec::new();
 
         for page in 1.. {
@@ -591,6 +626,16 @@ mod tests {
     }
 
     #[test]
+    fn validates_notification_window() {
+        assert!(GitHubNotificationWindow::hours(0).is_err());
+        assert_eq!(
+            GitHubNotificationWindow::default().as_hours(),
+            DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS
+        );
+        assert_eq!(GitHubNotificationWindow::hours(96).unwrap().as_hours(), 96);
+    }
+
+    #[test]
     fn request_rate_rejects_zero() {
         assert!(GitHubApiRequestRate::per_hour(0).is_err());
     }
@@ -912,8 +957,8 @@ fn notification_page_url(since: &str, page: usize) -> String {
     )
 }
 
-fn recent_notification_since() -> String {
-    (Utc::now() - ChronoDuration::hours(RECENT_NOTIFICATION_WINDOW_HOURS))
+fn recent_notification_since(window: GitHubNotificationWindow) -> String {
+    (Utc::now() - ChronoDuration::hours(i64::from(window.as_hours())))
         .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 

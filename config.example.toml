@@ -17,6 +17,9 @@ max_concurrent_requests = 1
 # API call Maid makes is paced through this budget, including concurrent tasks.
 github_api_requests_per_hour = 1200
 
+# Optional. How far back each notification poll searches. Defaults to 24 hours.
+github_notification_window_hours = 24
+
 # Optional. Prometheus metrics are served at /metrics on this address.
 metrics_bind_address = "127.0.0.1:9464"
 

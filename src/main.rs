@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
             config.github_token.clone(),
             config.github_api_ip,
             config.github_api_requests_per_hour,
+            config.github_notification_window,
         ),
         GitWorktrees::new(config.git_dir.clone(), config.github_token.clone()),
         CodexCli::with_options(
@@ -88,6 +89,7 @@ async fn main() -> Result<()> {
         pending_handled_marker_ledger = %config.pending_handled_marker_ledger_path.display(),
         observed_notification_ledger = %config.observed_notification_ledger_path.display(),
         github_api_requests_per_hour = config.github_api_requests_per_hour.requests_per_hour(),
+        github_notification_window_hours = config.github_notification_window.as_hours(),
         task_limit_per_24h = %task_limit_per_24h,
         max_concurrent_requests = config.max_concurrent_requests,
         master_accounts = config.master_accounts.len(),
