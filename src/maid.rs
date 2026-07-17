@@ -18,7 +18,7 @@ use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -119,6 +119,51 @@ pub struct Maid<G, R, C> {
     task_starts: Arc<dyn TaskStartRecorder>,
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
     observed_notifications: Arc<dyn ObservedNotificationStore>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AutoReviewSource {
+    Repository,
+    PublicAuthor { login: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutoReviewCandidate {
+    pr: PullRequest,
+    source: AutoReviewSource,
+}
+
+impl AutoReviewCandidate {
+    fn repository(pr: PullRequest) -> Self {
+        Self {
+            pr,
+            source: AutoReviewSource::Repository,
+        }
+    }
+
+    fn public_author(pr: PullRequest, login: &str) -> Self {
+        Self {
+            pr,
+            source: AutoReviewSource::PublicAuthor {
+                login: login.to_string(),
+            },
+        }
+    }
+
+    fn has_allowed_author(
+        &self,
+        repository_accounts: &HashSet<String>,
+        public_accounts: &HashSet<String>,
+    ) -> bool {
+        match &self.source {
+            AutoReviewSource::Repository => {
+                repository_accounts.contains(&self.pr.author.to_ascii_lowercase())
+            }
+            AutoReviewSource::PublicAuthor { login } => {
+                public_accounts.contains(login) && self.pr.author.eq_ignore_ascii_case(login)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -245,10 +290,11 @@ where
             }
         }
 
-        for pr in self.auto_review_pull_requests().await? {
+        for candidate in self.auto_review_candidates().await? {
+            let pr = &candidate.pr;
             report.seen += 1;
             match self
-                .task_for_auto_review_pr(&pr, &mut observed_pending_markers)
+                .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
                 .await
             {
                 Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
@@ -594,25 +640,28 @@ where
         ))
     }
 
-    async fn task_for_auto_review_pr(
+    async fn task_for_auto_review_candidate(
         &self,
-        pr: &PullRequest,
+        candidate: &AutoReviewCandidate,
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<TaskAssessment> {
-        let observation = self.observe_auto_review_pr(pr).await?;
+        let observation = self.observe_auto_review_candidate(candidate).await?;
         self.apply_auto_review_action(plan_auto_review(observation), observed_pending_markers)
             .await
     }
 
-    async fn observe_auto_review_pr(&self, pr: &PullRequest) -> Result<AutoReviewObservation> {
+    async fn observe_auto_review_candidate(
+        &self,
+        candidate: &AutoReviewCandidate,
+    ) -> Result<AutoReviewObservation> {
+        let pr = &candidate.pr;
         let author = classify_auto_review_author(
             pr,
             &self.bot_login,
-            self.auto_review_accounts
-                .contains(&pr.author.to_ascii_lowercase())
-                || self
-                    .auto_review_public_accounts
-                    .contains(&pr.author.to_ascii_lowercase()),
+            candidate.has_allowed_author(
+                &self.auto_review_accounts,
+                &self.auto_review_public_accounts,
+            ),
         );
         if author != AutoReviewAuthor::Allowed {
             return Ok(AutoReviewObservation::new(pr.clone(), author, None, false));
@@ -630,15 +679,12 @@ where
         ))
     }
 
-    async fn auto_review_pull_requests(&self) -> Result<Vec<PullRequest>> {
-        let mut pull_requests = Vec::new();
-        let mut seen = HashSet::new();
+    async fn auto_review_candidates(&self) -> Result<Vec<AutoReviewCandidate>> {
+        let mut candidates = Vec::new();
 
         for repo in &self.auto_review_repos {
             for pr in self.github.open_pull_requests(repo).await? {
-                if seen.insert(pr.html_url.to_ascii_lowercase()) {
-                    pull_requests.push(pr);
-                }
+                candidates.push(AutoReviewCandidate::repository(pr));
             }
         }
 
@@ -650,13 +696,15 @@ where
                 .open_public_pull_requests_by_author(author)
                 .await?
             {
-                if seen.insert(pr.html_url.to_ascii_lowercase()) {
-                    pull_requests.push(pr);
-                }
+                candidates.push(AutoReviewCandidate::public_author(pr, author));
             }
         }
 
-        Ok(pull_requests)
+        Ok(deduplicate_auto_review_candidates(
+            candidates,
+            &self.auto_review_accounts,
+            &self.auto_review_public_accounts,
+        ))
     }
 
     async fn apply_auto_review_action(
@@ -960,7 +1008,8 @@ where
             }
         }
 
-        for pr in self.maid.auto_review_pull_requests().await? {
+        for candidate in self.maid.auto_review_candidates().await? {
+            let pr = &candidate.pr;
             report.seen += 1;
             let Some(reservation) = self.work.try_reserve(task_key_for_trigger(&pr.html_url))
             else {
@@ -970,7 +1019,7 @@ where
 
             match self
                 .maid
-                .task_for_auto_review_pr(&pr, &mut observed_pending_markers)
+                .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
                 .await
             {
                 Ok(TaskAssessment::Ready(intent)) => {
@@ -1253,6 +1302,32 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
         .map(|login| login.into().trim().to_ascii_lowercase())
         .filter(|login| !login.is_empty())
         .collect()
+}
+
+fn deduplicate_auto_review_candidates(
+    candidates: Vec<AutoReviewCandidate>,
+    repository_accounts: &HashSet<String>,
+    public_accounts: &HashSet<String>,
+) -> Vec<AutoReviewCandidate> {
+    let mut deduplicated = Vec::<AutoReviewCandidate>::new();
+    let mut index_by_url = HashMap::<String, usize>::new();
+
+    for candidate in candidates {
+        let key = candidate.pr.html_url.to_ascii_lowercase();
+        if let Some(index) = index_by_url.get(&key).copied() {
+            let existing = &deduplicated[index];
+            if !existing.has_allowed_author(repository_accounts, public_accounts)
+                && candidate.has_allowed_author(repository_accounts, public_accounts)
+            {
+                deduplicated[index] = candidate;
+            }
+        } else {
+            index_by_url.insert(key, deduplicated.len());
+            deduplicated.push(candidate);
+        }
+    }
+
+    deduplicated
 }
 
 #[cfg(test)]
@@ -1990,11 +2065,22 @@ mod tests {
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), worktrees, codex)
-            .with_public_auto_review_accounts(["Dionysuzx"])
-            .run_once()
-            .await
-            .unwrap();
+        let report = Maid::new(
+            github.clone(),
+            worktrees,
+            codex,
+            "maid-bot",
+            ["dionysuzx"],
+            Vec::<String>::new(),
+            [RepoSlug {
+                owner: "configured".to_string(),
+                repo: "repo".to_string(),
+            }],
+        )
+        .with_public_auto_review_accounts(["Dionysuzx"])
+        .run_once()
+        .await
+        .unwrap();
 
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
@@ -2017,15 +2103,61 @@ mod tests {
         };
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), worktrees, codex)
-            .with_public_auto_review_accounts(["dionysuzx"])
-            .run_once()
-            .await
-            .unwrap();
+        let report = Maid::new(
+            github.clone(),
+            worktrees,
+            codex,
+            "maid-bot",
+            ["dionysuzx"],
+            Vec::<String>::new(),
+            [RepoSlug {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+            }],
+        )
+        .with_public_auto_review_accounts(["dionysuzx"])
+        .run_once()
+        .await
+        .unwrap();
 
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+    }
+
+    #[tokio::test]
+    async fn public_review_account_is_not_authorized_through_private_repo_discovery() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr_with_author("public-author")];
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = Maid::new(
+            github.clone(),
+            worktrees,
+            codex,
+            "maid-bot",
+            ["repo-author", "public-author"],
+            ["repo-author"],
+            [RepoSlug {
+                owner: "private".to_string(),
+                repo: "repo".to_string(),
+            }],
+        )
+        .with_public_auto_review_accounts(["public-author"])
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.skipped, 1);
+        assert!(github.public_pull_requests.lock().unwrap().is_empty());
+        assert!(github.pr_state_calls.lock().unwrap().is_empty());
+        assert!(github.posts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
