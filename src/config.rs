@@ -20,6 +20,7 @@ pub struct Config {
     pub bot_login: String,
     pub master_accounts: Vec<String>,
     pub auto_review_accounts: Vec<String>,
+    pub auto_review_public_accounts: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
     pub git_dir: PathBuf,
     pub daemon_pid_path: PathBuf,
@@ -54,11 +55,21 @@ impl Config {
         let auto_review_accounts =
             optional_logins(file.auto_review_accounts, "auto_review_accounts")?
                 .unwrap_or_else(|| master_accounts.clone());
-        for login in &auto_review_accounts {
-            if !master_accounts.contains(login) {
-                bail!("auto_review_accounts must be a subset of master_accounts: {login}");
-            }
-        }
+        require_subset(
+            &auto_review_accounts,
+            &master_accounts,
+            "auto_review_accounts",
+        )?;
+        let auto_review_public_accounts = optional_logins(
+            file.auto_review_public_accounts,
+            "auto_review_public_accounts",
+        )?
+        .unwrap_or_default();
+        require_subset(
+            &auto_review_public_accounts,
+            &master_accounts,
+            "auto_review_public_accounts",
+        )?;
         let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
         let git_dir = non_empty(file.git_dir)
             .map(|path| expand_home(&path))
@@ -110,6 +121,7 @@ impl Config {
             bot_login,
             master_accounts,
             auto_review_accounts,
+            auto_review_public_accounts,
             auto_review_repos,
             git_dir,
             daemon_pid_path: maid_home.join("maid.pid"),
@@ -135,6 +147,7 @@ struct ConfigFile {
     bot_login: Option<String>,
     master_accounts: Option<Vec<String>>,
     auto_review_accounts: Option<Vec<String>>,
+    auto_review_public_accounts: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
     git_dir: Option<String>,
     task_limit_per_24h: Option<usize>,
@@ -223,6 +236,15 @@ fn optional_repos(value: Option<Vec<String>>, key: &str) -> Result<Vec<RepoSlug>
         }
     }
     Ok(repos)
+}
+
+fn require_subset(logins: &[String], trusted_logins: &[String], key: &str) -> Result<()> {
+    for login in logins {
+        if !trusted_logins.contains(login) {
+            bail!("{key} must be a subset of master_accounts: {login}");
+        }
+    }
+    Ok(())
 }
 
 fn required_codex_prompts(value: Option<CodexPromptsFile>) -> Result<CodexPromptTemplates> {
@@ -341,6 +363,7 @@ mod tests {
 bot_login = "maid-bot"
 master_accounts = ["dionysuzx"]
 auto_review_accounts = ["dionysuzx"]
+auto_review_public_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
 git_dir = "~/.maid/git"
 task_limit_per_24h = 5
@@ -367,6 +390,10 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.master_accounts, Some(vec!["dionysuzx".to_string()]));
         assert_eq!(
             config.auto_review_accounts,
+            Some(vec!["dionysuzx".to_string()])
+        );
+        assert_eq!(
+            config.auto_review_public_accounts,
             Some(vec!["dionysuzx".to_string()])
         );
         assert_eq!(
@@ -408,6 +435,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.bot_login, None);
         assert_eq!(config.master_accounts, None);
         assert_eq!(config.auto_review_accounts, None);
+        assert_eq!(config.auto_review_public_accounts, None);
         assert_eq!(config.auto_review_repos, None);
         assert_eq!(config.git_dir, None);
         assert_eq!(config.task_limit_per_24h, None);
@@ -541,6 +569,30 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(
             optional_repos(None, "auto_review_repos").unwrap(),
             Vec::<RepoSlug>::new()
+        );
+    }
+
+    #[test]
+    fn auto_review_accounts_must_be_trusted() {
+        let masters = vec!["dionysuzx".to_string()];
+
+        assert!(
+            require_subset(
+                &["dionysuzx".to_string()],
+                &masters,
+                "auto_review_public_accounts"
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            require_subset(
+                &["untrusted".to_string()],
+                &masters,
+                "auto_review_public_accounts"
+            )
+            .unwrap_err()
+            .to_string(),
+            "auto_review_public_accounts must be a subset of master_accounts: untrusted"
         );
     }
 

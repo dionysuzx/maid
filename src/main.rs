@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
         config.auto_review_accounts.clone(),
         config.auto_review_repos.clone(),
     )
+    .with_public_auto_review_accounts(config.auto_review_public_accounts.clone())
     .with_task_start_recorder(FileTaskStartRecorder::new(
         config.task_limit_per_24h,
         config.task_start_ledger_path.clone(),
@@ -94,6 +95,7 @@ async fn main() -> Result<()> {
         max_concurrent_requests = config.max_concurrent_requests,
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),
+        auto_review_public_accounts = config.auto_review_public_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),
         metrics_bind_address = %config.metrics_bind_address,
         "maid started"
