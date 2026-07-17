@@ -26,6 +26,8 @@ const UNTRUSTED_PUBLIC_REVIEW_ARGS: &[&str] = &[
     "--disable",
     "apps",
     "--disable",
+    "plugins",
+    "--disable",
     "browser_use",
     "--disable",
     "computer_use",
@@ -392,25 +394,89 @@ mod tests {
         );
     }
 
-    #[test]
-    fn untrusted_public_reviews_disable_agentic_tools_and_persistence() {
+    #[tokio::test]
+    async fn untrusted_public_review_spawns_without_agentic_tools_or_repository_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("fake-codex");
+        fs::write(
+            &bin,
+            r#"#!/bin/sh
+output_path=""
+previous=""
+: > "${0}.args"
+for argument in "$@"; do
+  printf '%s\n' "$argument" >> "${0}.args"
+  if [ "$previous" = "--output-last-message" ]; then
+    output_path="$argument"
+  fi
+  previous="$argument"
+done
+pwd > "${0}.cwd"
+cat > "${0}.prompt"
+printf '%s\n' '{"type":"thread.started","thread_id":"ephemeral-session"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"safe review"}}'
+printf '%s\n' '{"type":"turn.completed"}'
+printf '%s\n' 'safe review' > "$output_path"
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&bin, permissions).unwrap();
+        let codex = CodexCli::new(
+            bin.display().to_string(),
+            "test-model",
+            "low",
+            CodexPromptTemplates {
+                mention: String::new(),
+                pull_request_opened: String::new(),
+                operator_mention: String::new(),
+            },
+        );
+        let task = CodexTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: CodexTaskOrigin::PublicPullRequestOpened {
+                author: "dionysuzx".to_string(),
+                review_input: "diff --git a/src/lib.rs b/src/lib.rs\n+public change".to_string(),
+            },
+        };
+
+        let run = codex.run(temp.path(), &task).await.unwrap();
+        let args = fs::read_to_string(format!("{}.args", bin.display())).unwrap();
+        let cwd = fs::read_to_string(format!("{}.cwd", bin.display())).unwrap();
+        let prompt = fs::read_to_string(format!("{}.prompt", bin.display())).unwrap();
+        let args = args.lines().collect::<Vec<_>>();
+
         for required in [
             "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
             "read-only",
-            "shell_tool",
-            "apps",
-            "browser_use",
-            "computer_use",
-            "multi_agent",
-            "hooks",
             "web_search=\"disabled\"",
             "mcp_servers={}",
             "shell_environment_policy.inherit=\"none\"",
         ] {
-            assert!(UNTRUSTED_PUBLIC_REVIEW_ARGS.contains(&required));
+            assert!(args.contains(&required));
         }
+        for feature in [
+            "shell_tool",
+            "apps",
+            "plugins",
+            "browser_use",
+            "computer_use",
+            "multi_agent",
+            "hooks",
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|arguments| arguments == ["--disable", feature])
+            );
+        }
+        assert_ne!(cwd.trim(), temp.path().to_string_lossy());
+        assert!(prompt.contains("<untrusted_patch_data>"));
+        assert!(prompt.contains("+public change"));
+        assert_eq!(run.response, "safe review");
+        assert_eq!(run.session_id, None);
     }
 
     #[tokio::test]
