@@ -10,8 +10,7 @@ auto_review_repos = ["your-name/maid"]
 
 # Optional. Reviews every open PR authored by these accounts when its base
 # repository is public, regardless of repository. Accounts must also appear in
-# master_accounts. Maid reviews bounded GitHub API patch data without cloning
-# the repository or enabling Codex tools. Empty or omitted disables this mode.
+# master_accounts. Empty or omitted disables cross-repository discovery.
 auto_review_public_accounts = ["your-name"]
 
 # Optional. Defaults shown below.

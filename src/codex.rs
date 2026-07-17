@@ -15,33 +15,6 @@ use tracing::{info, warn};
 
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_EXIT_AFTER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
-const UNTRUSTED_PUBLIC_REVIEW_ARGS: &[&str] = &[
-    "--ephemeral",
-    "--ignore-user-config",
-    "--ignore-rules",
-    "--sandbox",
-    "read-only",
-    "--disable",
-    "shell_tool",
-    "--disable",
-    "apps",
-    "--disable",
-    "plugins",
-    "--disable",
-    "browser_use",
-    "--disable",
-    "computer_use",
-    "--disable",
-    "multi_agent",
-    "--disable",
-    "hooks",
-    "--config",
-    "web_search=\"disabled\"",
-    "--config",
-    "mcp_servers={}",
-    "--config",
-    "shell_environment_policy.inherit=\"none\"",
-];
 
 #[derive(Clone, Debug)]
 pub struct CodexCli {
@@ -91,14 +64,6 @@ impl CodexRunner for CodexCli {
         let output_path = output_file.path().to_path_buf();
 
         let prompt = task.prompt(&self.prompts)?;
-        let isolated_dir = task
-            .is_untrusted_public_review()
-            .then(tempfile::tempdir)
-            .transpose()
-            .context("failed to create tool-free public review directory")?;
-        let execution_dir = isolated_dir
-            .as_ref()
-            .map_or(worktree, |directory| directory.path());
 
         let mut command = Command::new(&self.bin);
         command.arg("--ask-for-approval").arg("never");
@@ -107,21 +72,18 @@ impl CodexRunner for CodexCli {
             "model_reasoning_effort",
             &self.reasoning_effort,
         ));
-        command.arg("exec");
-        if task.is_untrusted_public_review() {
-            command.args(UNTRUSTED_PUBLIC_REVIEW_ARGS);
-        } else {
-            command.arg("--sandbox").arg("danger-full-access");
-        }
         let mut child = command
+            .arg("exec")
             .arg("--color")
             .arg("never")
             .arg("--json")
             .arg("--skip-git-repo-check")
+            .arg("--sandbox")
+            .arg("danger-full-access")
             .arg("--output-last-message")
             .arg(&output_path)
             .arg("-")
-            .current_dir(execution_dir)
+            .current_dir(worktree)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -225,9 +187,7 @@ impl CodexRunner for CodexCli {
 
         Ok(CodexRun {
             response,
-            session_id: (!task.is_untrusted_public_review())
-                .then_some(json.session_id)
-                .flatten(),
+            session_id: json.session_id,
         })
     }
 }
@@ -392,91 +352,6 @@ mod tests {
             codex_config_string("model_reasoning_effort", "high"),
             "model_reasoning_effort=\"high\""
         );
-    }
-
-    #[tokio::test]
-    async fn untrusted_public_review_spawns_without_agentic_tools_or_repository_cwd() {
-        let temp = tempfile::tempdir().unwrap();
-        let bin = temp.path().join("fake-codex");
-        fs::write(
-            &bin,
-            r#"#!/bin/sh
-output_path=""
-previous=""
-: > "${0}.args"
-for argument in "$@"; do
-  printf '%s\n' "$argument" >> "${0}.args"
-  if [ "$previous" = "--output-last-message" ]; then
-    output_path="$argument"
-  fi
-  previous="$argument"
-done
-pwd > "${0}.cwd"
-cat > "${0}.prompt"
-printf '%s\n' '{"type":"thread.started","thread_id":"ephemeral-session"}'
-printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"safe review"}}'
-printf '%s\n' '{"type":"turn.completed"}'
-printf '%s\n' 'safe review' > "$output_path"
-"#,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&bin).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&bin, permissions).unwrap();
-        let codex = CodexCli::new(
-            bin.display().to_string(),
-            "test-model",
-            "low",
-            CodexPromptTemplates {
-                mention: String::new(),
-                pull_request_opened: String::new(),
-                operator_mention: String::new(),
-            },
-        );
-        let task = CodexTask {
-            pr_url: "https://github.com/o/r/pull/1".to_string(),
-            origin: CodexTaskOrigin::PublicPullRequestOpened {
-                author: "dionysuzx".to_string(),
-                review_input: "diff --git a/src/lib.rs b/src/lib.rs\n+public change".to_string(),
-            },
-        };
-
-        let run = codex.run(temp.path(), &task).await.unwrap();
-        let args = fs::read_to_string(format!("{}.args", bin.display())).unwrap();
-        let cwd = fs::read_to_string(format!("{}.cwd", bin.display())).unwrap();
-        let prompt = fs::read_to_string(format!("{}.prompt", bin.display())).unwrap();
-        let args = args.lines().collect::<Vec<_>>();
-
-        for required in [
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "read-only",
-            "web_search=\"disabled\"",
-            "mcp_servers={}",
-            "shell_environment_policy.inherit=\"none\"",
-        ] {
-            assert!(args.contains(&required));
-        }
-        for feature in [
-            "shell_tool",
-            "apps",
-            "plugins",
-            "browser_use",
-            "computer_use",
-            "multi_agent",
-            "hooks",
-        ] {
-            assert!(
-                args.windows(2)
-                    .any(|arguments| arguments == ["--disable", feature])
-            );
-        }
-        assert_ne!(cwd.trim(), temp.path().to_string_lossy());
-        assert!(prompt.contains("<untrusted_patch_data>"));
-        assert!(prompt.contains("+public change"));
-        assert_eq!(run.response, "safe review");
-        assert_eq!(run.session_id, None);
     }
 
     #[tokio::test]

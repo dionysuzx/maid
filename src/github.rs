@@ -24,10 +24,6 @@ const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const NOTIFICATION_PAGE_SIZE: usize = 50;
 const SEARCH_PAGE_SIZE: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 1_000;
-const PULL_REQUEST_FILE_PAGE_SIZE: usize = 100;
-const MAX_PUBLIC_REVIEW_INPUT_BYTES: usize = 512 * 1_024;
-const PUBLIC_REVIEW_TRUNCATION_NOTICE: &str =
-    "\n[patch data truncated by Maid at the configured safety limit]\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GitHubNotificationWindow {
@@ -368,32 +364,6 @@ impl GithubClient for GitHubRestClient {
         }
 
         Ok(pull_requests)
-    }
-
-    async fn public_pull_request_review_input(&self, pr: &PullRequest) -> Result<String> {
-        let mut review_input = String::new();
-
-        for page in 1.. {
-            let url = format!(
-                "https://api.github.com/repos/{}/{}/pulls/{}/files?per_page={PULL_REQUEST_FILE_PAGE_SIZE}&page={page}",
-                pr.owner, pr.repo, pr.number
-            );
-            let files = self.get::<Vec<ApiPullRequestFile>>(&url).await?;
-            let done = files.len() < PULL_REQUEST_FILE_PAGE_SIZE;
-
-            for file in files {
-                if !append_public_review_file(&mut review_input, &file) {
-                    review_input.push_str(PUBLIC_REVIEW_TRUNCATION_NOTICE);
-                    return Ok(review_input);
-                }
-            }
-
-            if done {
-                return Ok(review_input);
-            }
-        }
-
-        Ok(review_input)
     }
 
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
@@ -780,30 +750,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_pull_request_files_as_bounded_review_input() {
-        let files = [
-            ApiPullRequestFile {
-                filename: "src/lib.rs".to_string(),
-                status: "modified".to_string(),
-                patch: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
-            },
-            ApiPullRequestFile {
-                filename: "assets/image.png".to_string(),
-                status: "added".to_string(),
-                patch: None,
-            },
-        ];
-        let mut input = String::new();
-
-        assert!(append_public_review_file(&mut input, &files[0]));
-        assert!(append_public_review_file(&mut input, &files[1]));
-        assert!(input.contains("diff --git a/src/lib.rs b/src/lib.rs"));
-        assert!(input.contains("@@ -1 +1 @@\n-old\n+new"));
-        assert!(input.contains("[patch unavailable for this file]"));
-        assert!(input.len() <= MAX_PUBLIC_REVIEW_INPUT_BYTES);
-    }
-
-    #[test]
     fn keeps_recent_comments_across_issue_and_review_comment_streams() {
         let mut comments = (0..21)
             .map(|index| {
@@ -1167,30 +1113,6 @@ fn public_pull_request_search_url(author: &str, page: usize) -> Result<String> {
     Ok(url.into())
 }
 
-fn append_public_review_file(review_input: &mut String, file: &ApiPullRequestFile) -> bool {
-    let patch = file
-        .patch
-        .as_deref()
-        .unwrap_or("[patch unavailable for this file]");
-    let section = format!(
-        "diff --git a/{0} b/{0}\nstatus: {1}\n{2}\n\n",
-        file.filename, file.status, patch
-    );
-    let content_limit = MAX_PUBLIC_REVIEW_INPUT_BYTES - PUBLIC_REVIEW_TRUNCATION_NOTICE.len();
-    let available = content_limit.saturating_sub(review_input.len());
-    if section.len() <= available {
-        review_input.push_str(&section);
-        return true;
-    }
-
-    let mut end = available.min(section.len());
-    while !section.is_char_boundary(end) {
-        end -= 1;
-    }
-    review_input.push_str(&section[..end]);
-    false
-}
-
 fn recent_notification_since(window: GitHubNotificationWindow) -> String {
     (Utc::now() - ChronoDuration::hours(i64::from(window.as_hours())))
         .to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -1316,13 +1238,6 @@ struct ApiPullRequest {
 #[derive(Debug, Deserialize)]
 struct ApiPullRequestBase {
     repo: ApiRepo,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiPullRequestFile {
-    filename: String,
-    status: String,
-    patch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -3,8 +3,8 @@ use crate::auto_review::{
     plan_auto_review,
 };
 use crate::domain::{
-    CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, Notification, PullRequest,
-    RepoSlug, ReviewState, WorkTarget,
+    CodexTask, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug, ReviewState,
+    WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -15,7 +15,7 @@ use crate::mention_thread::{
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
@@ -34,7 +34,6 @@ pub trait GithubClient: Send + Sync {
     }
     async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
-    async fn public_pull_request_review_input(&self, pr: &PullRequest) -> Result<String>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -647,21 +646,7 @@ where
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<TaskAssessment> {
         let observation = self.observe_auto_review_candidate(candidate).await?;
-        let action = plan_auto_review(observation);
-        let action = match (&candidate.source, action) {
-            (
-                AutoReviewSource::PublicAuthor { .. },
-                AutoReviewAction::StartTask { pr, mut task },
-            ) => {
-                task.origin = CodexTaskOrigin::PublicPullRequestOpened {
-                    author: pr.author.clone(),
-                    review_input: self.github.public_pull_request_review_input(&pr).await?,
-                };
-                AutoReviewAction::StartTask { pr, task }
-            }
-            (_, action) => action,
-        };
-        self.apply_auto_review_action(action, observed_pending_markers)
+        self.apply_auto_review_action(plan_auto_review(observation), observed_pending_markers)
             .await
     }
 
@@ -881,23 +866,9 @@ where
 
     async fn finish_auto_review_task(&self, pr: PullRequest, task: CodexTask) -> Result<()> {
         let target = WorkTarget::PullRequest(pr.clone());
-        let worktree = if task.is_untrusted_public_review() {
-            None
-        } else {
-            Some(self.worktrees.prepare(&target, &task).await?)
-        };
-        let isolated_dir = task
-            .is_untrusted_public_review()
-            .then(tempfile::tempdir)
-            .transpose()
-            .context("failed to create isolated public review directory")?;
-        let task_dir = match (&worktree, &isolated_dir) {
-            (Some(worktree), _) => worktree.path(),
-            (None, Some(isolated_dir)) => isolated_dir.path(),
-            (None, None) => unreachable!("auto-review task must have an execution directory"),
-        };
+        let worktree = self.worktrees.prepare(&target, &task).await?;
         let result = async {
-            let codex_run = self.codex.run(task_dir, &task).await?;
+            let codex_run = self.codex.run(worktree.path(), &task).await?;
 
             self.github
                 .post_pr_comment(&pr, &codex_run.response)
@@ -931,10 +902,7 @@ where
         }
         .await;
 
-        match worktree {
-            Some(worktree) => self.cleanup_worktree(worktree, result).await,
-            None => result,
-        }
+        self.cleanup_worktree(worktree, result).await
     }
 
     async fn cleanup_worktree(
@@ -1433,10 +1401,6 @@ mod tests {
                 .unwrap()
                 .push(author.to_string());
             Ok(self.public_pull_requests.lock().unwrap().clone())
-        }
-
-        async fn public_pull_request_review_input(&self, _pr: &PullRequest) -> Result<String> {
-            Ok("diff --git a/src/lib.rs b/src/lib.rs\n+public change".to_string())
         }
 
         async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
@@ -2095,7 +2059,7 @@ mod tests {
         let github = FakeGithub::default();
         *github.public_pull_requests.lock().unwrap() = vec![pr()];
         let worktrees = FakeWorktrees {
-            worktree,
+            worktree: worktree.clone(),
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
@@ -2125,12 +2089,15 @@ mod tests {
             vec!["dionysuzx"]
         );
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert!(worktrees.calls.lock().unwrap().is_empty());
-        assert!(matches!(
-            &codex.calls.lock().unwrap()[0].1.origin,
-            CodexTaskOrigin::PublicPullRequestOpened { author, review_input }
-                if author == "dionysuzx" && review_input.contains("+public change")
-        ));
+        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
+        let calls = codex.calls.lock().unwrap();
+        assert_eq!(calls[0].0, worktree);
+        assert_eq!(
+            calls[0].1.origin,
+            CodexTaskOrigin::PullRequestOpened {
+                author: "dionysuzx".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -2147,7 +2114,7 @@ mod tests {
 
         let report = Maid::new(
             github.clone(),
-            worktrees.clone(),
+            worktrees,
             codex,
             "maid-bot",
             ["dionysuzx"],
@@ -2165,7 +2132,6 @@ mod tests {
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert!(worktrees.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
