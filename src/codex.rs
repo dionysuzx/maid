@@ -15,6 +15,31 @@ use tracing::{info, warn};
 
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_EXIT_AFTER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const UNTRUSTED_PUBLIC_REVIEW_ARGS: &[&str] = &[
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--sandbox",
+    "read-only",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "apps",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "hooks",
+    "--config",
+    "web_search=\"disabled\"",
+    "--config",
+    "mcp_servers={}",
+    "--config",
+    "shell_environment_policy.inherit=\"none\"",
+];
 
 #[derive(Clone, Debug)]
 pub struct CodexCli {
@@ -64,6 +89,14 @@ impl CodexRunner for CodexCli {
         let output_path = output_file.path().to_path_buf();
 
         let prompt = task.prompt(&self.prompts)?;
+        let isolated_dir = task
+            .is_untrusted_public_review()
+            .then(tempfile::tempdir)
+            .transpose()
+            .context("failed to create tool-free public review directory")?;
+        let execution_dir = isolated_dir
+            .as_ref()
+            .map_or(worktree, |directory| directory.path());
 
         let mut command = Command::new(&self.bin);
         command.arg("--ask-for-approval").arg("never");
@@ -72,18 +105,21 @@ impl CodexRunner for CodexCli {
             "model_reasoning_effort",
             &self.reasoning_effort,
         ));
+        command.arg("exec");
+        if task.is_untrusted_public_review() {
+            command.args(UNTRUSTED_PUBLIC_REVIEW_ARGS);
+        } else {
+            command.arg("--sandbox").arg("danger-full-access");
+        }
         let mut child = command
-            .arg("exec")
             .arg("--color")
             .arg("never")
             .arg("--json")
             .arg("--skip-git-repo-check")
-            .arg("--sandbox")
-            .arg("danger-full-access")
             .arg("--output-last-message")
             .arg(&output_path)
             .arg("-")
-            .current_dir(worktree)
+            .current_dir(execution_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -187,7 +223,9 @@ impl CodexRunner for CodexCli {
 
         Ok(CodexRun {
             response,
-            session_id: json.session_id,
+            session_id: (!task.is_untrusted_public_review())
+                .then_some(json.session_id)
+                .flatten(),
         })
     }
 }
@@ -352,6 +390,27 @@ mod tests {
             codex_config_string("model_reasoning_effort", "high"),
             "model_reasoning_effort=\"high\""
         );
+    }
+
+    #[test]
+    fn untrusted_public_reviews_disable_agentic_tools_and_persistence() {
+        for required in [
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "read-only",
+            "shell_tool",
+            "apps",
+            "browser_use",
+            "computer_use",
+            "multi_agent",
+            "hooks",
+            "web_search=\"disabled\"",
+            "mcp_servers={}",
+            "shell_environment_policy.inherit=\"none\"",
+        ] {
+            assert!(UNTRUSTED_PUBLIC_REVIEW_ARGS.contains(&required));
+        }
     }
 
     #[tokio::test]

@@ -47,6 +47,13 @@ requests Maid should discover across GitHub. Maid ignores PRs into private base
 repositories. Repository-scoped review remains available through
 `auto_review_repos` and `auto_review_accounts`.
 
+Cross-repository reviews use a tool-free execution path: Maid fetches bounded
+file patches through the GitHub API, does not clone the public repository, and
+runs Codex ephemerally from an empty directory with shell, apps, MCP, hooks,
+web search, and user configuration disabled. This isolation applies only to
+`auto_review_public_accounts`; trusted repository-scoped and mention workflows
+keep their existing agentic behavior.
+
 ## Metrics
 
 Maid serves Prometheus metrics at `http://127.0.0.1:9464/metrics` by default.
