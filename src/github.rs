@@ -340,6 +340,20 @@ impl GithubClient for GitHubRestClient {
             let search = self
                 .get::<ApiIssueSearch>(&public_pull_request_search_url(author, page)?)
                 .await?;
+            if search.incomplete_results {
+                warn!(
+                    author,
+                    page, "GitHub returned incomplete public pull request search results"
+                );
+            }
+            if page == 1 && search.total_count > MAX_SEARCH_RESULTS {
+                warn!(
+                    author,
+                    total_count = search.total_count,
+                    max_results = MAX_SEARCH_RESULTS,
+                    "GitHub capped public pull request search results"
+                );
+            }
             let done = search.items.len() < SEARCH_PAGE_SIZE;
 
             for item in search.items {
@@ -726,17 +740,19 @@ mod tests {
     }
 
     #[test]
-    fn public_author_discovery_rejects_private_base_repositories() {
-        let private_repo = api_repo(true);
-        assert!(
-            GitHubRestClient::public_pull_request_from_search_item(
-                api_pull_request_search_item(),
-                &private_repo
-            )
-            .unwrap()
-            .is_none()
-        );
-        let public_repo = api_repo(false);
+    fn public_author_discovery_requires_explicitly_public_base_repository() {
+        for visibility in [None, Some(ApiRepoVisibility::NonPublic)] {
+            assert!(
+                GitHubRestClient::public_pull_request_from_search_item(
+                    api_pull_request_search_item(),
+                    &api_repo(visibility)
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+
+        let public_repo = api_repo(Some(ApiRepoVisibility::Public));
         assert_eq!(
             GitHubRestClient::public_pull_request_from_search_item(
                 api_pull_request_search_item(),
@@ -809,7 +825,7 @@ mod tests {
         }
     }
 
-    fn api_repo(private: bool) -> ApiRepo {
+    fn api_repo(visibility: Option<ApiRepoVisibility>) -> ApiRepo {
         ApiRepo {
             name: "r".to_string(),
             clone_url: "https://github.com/o/r.git".to_string(),
@@ -817,7 +833,7 @@ mod tests {
                 login: "o".to_string(),
             }),
             default_branch: Some("main".to_string()),
-            private,
+            visibility,
         }
     }
 }
@@ -963,7 +979,7 @@ impl GitHubRestClient {
         item: ApiIssue,
         repo: &ApiRepo,
     ) -> Result<Option<PullRequest>> {
-        if repo.private {
+        if repo.visibility != Some(ApiRepoVisibility::Public) {
             return Ok(None);
         }
 
@@ -1223,6 +1239,8 @@ struct ApiIssuePullRequest {
 
 #[derive(Debug, Deserialize)]
 struct ApiIssueSearch {
+    total_count: usize,
+    incomplete_results: bool,
     items: Vec<ApiIssue>,
 }
 
@@ -1246,7 +1264,15 @@ struct ApiRepo {
     clone_url: String,
     owner: Option<ApiUser>,
     default_branch: Option<String>,
-    private: bool,
+    visibility: Option<ApiRepoVisibility>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum ApiRepoVisibility {
+    Public,
+    #[serde(other)]
+    NonPublic,
 }
 
 #[derive(Debug, Serialize)]
