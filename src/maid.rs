@@ -18,7 +18,7 @@ use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -33,6 +33,7 @@ pub trait GithubClient: Send + Sync {
         Ok(self.mention_for(notification).await?.into_iter().collect())
     }
     async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>>;
+    async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -113,10 +114,56 @@ pub struct Maid<G, R, C> {
     bot_login: String,
     master_accounts: HashSet<String>,
     auto_review_accounts: HashSet<String>,
+    auto_review_public_accounts: HashSet<String>,
     auto_review_repos: Vec<RepoSlug>,
     task_starts: Arc<dyn TaskStartRecorder>,
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
     observed_notifications: Arc<dyn ObservedNotificationStore>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AutoReviewSource {
+    Repository,
+    PublicAuthor { login: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutoReviewCandidate {
+    pr: PullRequest,
+    source: AutoReviewSource,
+}
+
+impl AutoReviewCandidate {
+    fn repository(pr: PullRequest) -> Self {
+        Self {
+            pr,
+            source: AutoReviewSource::Repository,
+        }
+    }
+
+    fn public_author(pr: PullRequest, login: &str) -> Self {
+        Self {
+            pr,
+            source: AutoReviewSource::PublicAuthor {
+                login: login.to_string(),
+            },
+        }
+    }
+
+    fn has_allowed_author(
+        &self,
+        repository_accounts: &HashSet<String>,
+        public_accounts: &HashSet<String>,
+    ) -> bool {
+        match &self.source {
+            AutoReviewSource::Repository => {
+                repository_accounts.contains(&self.pr.author.to_ascii_lowercase())
+            }
+            AutoReviewSource::PublicAuthor { login } => {
+                public_accounts.contains(login) && self.pr.author.eq_ignore_ascii_case(login)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -151,11 +198,20 @@ where
             bot_login: bot_login.into(),
             master_accounts: normalized_logins(master_accounts),
             auto_review_accounts: normalized_logins(auto_review_accounts),
+            auto_review_public_accounts: HashSet::new(),
             auto_review_repos: auto_review_repos.into_iter().collect(),
             task_starts: Arc::new(NoTaskLimit),
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
         }
+    }
+
+    pub fn with_public_auto_review_accounts(
+        mut self,
+        accounts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.auto_review_public_accounts = normalized_logins(accounts);
+        self
     }
 
     pub fn with_task_start_recorder(
@@ -234,46 +290,43 @@ where
             }
         }
 
-        for repo in &self.auto_review_repos {
-            let pull_requests = self.github.open_pull_requests(repo).await?;
-            report.seen += pull_requests.len();
-
-            for pr in pull_requests {
-                match self
-                    .task_for_auto_review_pr(&pr, &mut observed_pending_markers)
-                    .await
-                {
-                    Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
-                        Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
-                            Ok(()) => report.responded += 1,
-                            Err(err) => {
-                                report.failed += 1;
-                                error!(
-                                    pr = %pr.html_url,
-                                    error = ?err,
-                                    "failed to handle auto-review pull request"
-                                );
-                            }
-                        },
-                        Ok(TaskStartOutcome::Skipped) => report.skipped += 1,
+        for candidate in self.auto_review_candidates().await? {
+            let pr = &candidate.pr;
+            report.seen += 1;
+            match self
+                .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
+                .await
+            {
+                Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
+                    Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
+                        Ok(()) => report.responded += 1,
                         Err(err) => {
                             report.failed += 1;
                             error!(
                                 pr = %pr.html_url,
                                 error = ?err,
-                                "failed to start auto-review pull request task"
+                                "failed to handle auto-review pull request"
                             );
                         }
                     },
-                    Ok(TaskAssessment::Skipped) => report.skipped += 1,
+                    Ok(TaskStartOutcome::Skipped) => report.skipped += 1,
                     Err(err) => {
                         report.failed += 1;
                         error!(
                             pr = %pr.html_url,
                             error = ?err,
-                            "failed to handle auto-review pull request"
+                            "failed to start auto-review pull request task"
                         );
                     }
+                },
+                Ok(TaskAssessment::Skipped) => report.skipped += 1,
+                Err(err) => {
+                    report.failed += 1;
+                    error!(
+                        pr = %pr.html_url,
+                        error = ?err,
+                        "failed to handle auto-review pull request"
+                    );
                 }
             }
         }
@@ -587,22 +640,28 @@ where
         ))
     }
 
-    async fn task_for_auto_review_pr(
+    async fn task_for_auto_review_candidate(
         &self,
-        pr: &PullRequest,
+        candidate: &AutoReviewCandidate,
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<TaskAssessment> {
-        let observation = self.observe_auto_review_pr(pr).await?;
+        let observation = self.observe_auto_review_candidate(candidate).await?;
         self.apply_auto_review_action(plan_auto_review(observation), observed_pending_markers)
             .await
     }
 
-    async fn observe_auto_review_pr(&self, pr: &PullRequest) -> Result<AutoReviewObservation> {
+    async fn observe_auto_review_candidate(
+        &self,
+        candidate: &AutoReviewCandidate,
+    ) -> Result<AutoReviewObservation> {
+        let pr = &candidate.pr;
         let author = classify_auto_review_author(
             pr,
             &self.bot_login,
-            self.auto_review_accounts
-                .contains(&pr.author.to_ascii_lowercase()),
+            candidate.has_allowed_author(
+                &self.auto_review_accounts,
+                &self.auto_review_public_accounts,
+            ),
         );
         if author != AutoReviewAuthor::Allowed {
             return Ok(AutoReviewObservation::new(pr.clone(), author, None, false));
@@ -617,6 +676,34 @@ where
             author,
             Some(state),
             has_pending_marker,
+        ))
+    }
+
+    async fn auto_review_candidates(&self) -> Result<Vec<AutoReviewCandidate>> {
+        let mut candidates = Vec::new();
+
+        for repo in &self.auto_review_repos {
+            for pr in self.github.open_pull_requests(repo).await? {
+                candidates.push(AutoReviewCandidate::repository(pr));
+            }
+        }
+
+        let mut authors = self.auto_review_public_accounts.iter().collect::<Vec<_>>();
+        authors.sort_unstable();
+        for author in authors {
+            for pr in self
+                .github
+                .open_public_pull_requests_by_author(author)
+                .await?
+            {
+                candidates.push(AutoReviewCandidate::public_author(pr, author));
+            }
+        }
+
+        Ok(deduplicate_auto_review_candidates(
+            candidates,
+            &self.auto_review_accounts,
+            &self.auto_review_public_accounts,
         ))
     }
 
@@ -921,34 +1008,31 @@ where
             }
         }
 
-        for repo in &self.maid.auto_review_repos {
-            let pull_requests = self.maid.github.open_pull_requests(repo).await?;
-            report.seen += pull_requests.len();
+        for candidate in self.maid.auto_review_candidates().await? {
+            let pr = &candidate.pr;
+            report.seen += 1;
+            let Some(reservation) = self.work.try_reserve(task_key_for_trigger(&pr.html_url))
+            else {
+                report.skipped += 1;
+                continue;
+            };
 
-            for pr in pull_requests {
-                let Some(reservation) = self.work.try_reserve(task_key_for_trigger(&pr.html_url))
-                else {
-                    report.skipped += 1;
-                    continue;
-                };
-
-                match self
-                    .maid
-                    .task_for_auto_review_pr(&pr, &mut observed_pending_markers)
-                    .await
-                {
-                    Ok(TaskAssessment::Ready(intent)) => {
-                        self.start_reserved(intent, reservation, &mut report).await;
-                    }
-                    Ok(TaskAssessment::Skipped) => report.skipped += 1,
-                    Err(err) => {
-                        report.failed += 1;
-                        error!(
-                            pr = %pr.html_url,
-                            error = ?err,
-                            "failed to handle auto-review pull request"
-                        );
-                    }
+            match self
+                .maid
+                .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
+                .await
+            {
+                Ok(TaskAssessment::Ready(intent)) => {
+                    self.start_reserved(intent, reservation, &mut report).await;
+                }
+                Ok(TaskAssessment::Skipped) => report.skipped += 1,
+                Err(err) => {
+                    report.failed += 1;
+                    error!(
+                        pr = %pr.html_url,
+                        error = ?err,
+                        "failed to handle auto-review pull request"
+                    );
                 }
             }
         }
@@ -1220,6 +1304,32 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
         .collect()
 }
 
+fn deduplicate_auto_review_candidates(
+    candidates: Vec<AutoReviewCandidate>,
+    repository_accounts: &HashSet<String>,
+    public_accounts: &HashSet<String>,
+) -> Vec<AutoReviewCandidate> {
+    let mut deduplicated = Vec::<AutoReviewCandidate>::new();
+    let mut index_by_url = HashMap::<String, usize>::new();
+
+    for candidate in candidates {
+        let key = candidate.pr.html_url.to_ascii_lowercase();
+        if let Some(index) = index_by_url.get(&key).copied() {
+            let existing = &deduplicated[index];
+            if !existing.has_allowed_author(repository_accounts, public_accounts)
+                && candidate.has_allowed_author(repository_accounts, public_accounts)
+            {
+                deduplicated[index] = candidate;
+            }
+        } else {
+            index_by_url.insert(key, deduplicated.len());
+            deduplicated.push(candidate);
+        }
+    }
+
+    deduplicated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,6 +1347,8 @@ mod tests {
         mention: Arc<StdMutex<FakeMentionResult>>,
         mentions: Arc<StdMutex<FakeMentionsResult>>,
         pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
+        public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
+        public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         posts: Arc<StdMutex<Vec<String>>>,
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
@@ -1278,6 +1390,17 @@ mod tests {
 
         async fn open_pull_requests(&self, _repo: &RepoSlug) -> Result<Vec<PullRequest>> {
             Ok(self.pull_requests.lock().unwrap().clone())
+        }
+
+        async fn open_public_pull_requests_by_author(
+            &self,
+            author: &str,
+        ) -> Result<Vec<PullRequest>> {
+            self.public_pull_request_authors
+                .lock()
+                .unwrap()
+                .push(author.to_string());
+            Ok(self.public_pull_requests.lock().unwrap().clone())
         }
 
         async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
@@ -1928,6 +2051,122 @@ mod tests {
                 author: "dionysuzx".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn responds_to_public_pr_discovered_by_author() {
+        let worktree = PathBuf::from("/tmp/maid-test-worktree");
+        let github = FakeGithub::default();
+        *github.public_pull_requests.lock().unwrap() = vec![pr()];
+        let worktrees = FakeWorktrees {
+            worktree: worktree.clone(),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = Maid::new(
+            github.clone(),
+            worktrees.clone(),
+            codex.clone(),
+            "maid-bot",
+            ["dionysuzx"],
+            Vec::<String>::new(),
+            [RepoSlug {
+                owner: "configured".to_string(),
+                repo: "repo".to_string(),
+            }],
+        )
+        .with_public_auto_review_accounts(["Dionysuzx"])
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.public_pull_request_authors.lock().unwrap(),
+            vec!["dionysuzx"]
+        );
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
+        let calls = codex.calls.lock().unwrap();
+        assert_eq!(calls[0].0, worktree);
+        assert_eq!(
+            calls[0].1.origin,
+            CodexTaskOrigin::PullRequestOpened {
+                author: "dionysuzx".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reviews_pr_discovered_by_repo_and_author_only_once() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        *github.public_pull_requests.lock().unwrap() = vec![pr()];
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/maid-test-worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = Maid::new(
+            github.clone(),
+            worktrees,
+            codex,
+            "maid-bot",
+            ["dionysuzx"],
+            Vec::<String>::new(),
+            [RepoSlug {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+            }],
+        )
+        .with_public_auto_review_accounts(["dionysuzx"])
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+    }
+
+    #[tokio::test]
+    async fn public_review_account_is_not_authorized_through_private_repo_discovery() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr_with_author("public-author")];
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = Maid::new(
+            github.clone(),
+            worktrees,
+            codex,
+            "maid-bot",
+            ["repo-author", "public-author"],
+            ["repo-author"],
+            [RepoSlug {
+                owner: "private".to_string(),
+                repo: "repo".to_string(),
+            }],
+        )
+        .with_public_auto_review_accounts(["public-author"])
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.skipped, 1);
+        assert!(github.public_pull_requests.lock().unwrap().is_empty());
+        assert!(github.pr_state_calls.lock().unwrap().is_empty());
+        assert!(github.posts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

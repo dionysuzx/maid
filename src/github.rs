@@ -5,9 +5,10 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
-use reqwest::{Client, Method, StatusCode, header::HeaderMap};
+use reqwest::{Client, Method, StatusCode, Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     net::IpAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -21,6 +22,8 @@ pub const DEFAULT_GITHUB_API_REQUESTS_PER_HOUR: u32 = 1_200;
 pub const DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS: u32 = 24;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const NOTIFICATION_PAGE_SIZE: usize = 50;
+const SEARCH_PAGE_SIZE: usize = 100;
+const MAX_SEARCH_RESULTS: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GitHubNotificationWindow {
@@ -327,6 +330,54 @@ impl GithubClient for GitHubRestClient {
             .into_iter()
             .map(Self::pull_request_from_api)
             .collect()
+    }
+
+    async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>> {
+        let mut pull_requests = Vec::new();
+        let mut repositories = HashMap::new();
+
+        for page in 1..=(MAX_SEARCH_RESULTS / SEARCH_PAGE_SIZE) {
+            let search = self
+                .get::<ApiIssueSearch>(&public_pull_request_search_url(author, page)?)
+                .await?;
+            if search.incomplete_results {
+                warn!(
+                    author,
+                    page, "GitHub returned incomplete public pull request search results"
+                );
+            }
+            if page == 1 && search.total_count > MAX_SEARCH_RESULTS {
+                warn!(
+                    author,
+                    total_count = search.total_count,
+                    max_results = MAX_SEARCH_RESULTS,
+                    "GitHub capped public pull request search results"
+                );
+            }
+            let done = search.items.len() < SEARCH_PAGE_SIZE;
+
+            for item in search.items {
+                let Some(repository_url) = item.repository_url.as_deref() else {
+                    continue;
+                };
+                if !repositories.contains_key(repository_url) {
+                    let repository = self.get::<ApiRepo>(repository_url).await?;
+                    repositories.insert(repository_url.to_string(), repository);
+                }
+                let repository = &repositories[repository_url];
+                if let Some(pull_request) =
+                    Self::public_pull_request_from_search_item(item, repository)?
+                {
+                    pull_requests.push(pull_request);
+                }
+            }
+
+            if done {
+                break;
+            }
+        }
+
+        Ok(pull_requests)
     }
 
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
@@ -665,6 +716,56 @@ mod tests {
     }
 
     #[test]
+    fn builds_public_pull_request_author_search_urls() {
+        let url = Url::parse(&public_pull_request_search_url("Dionysuzx", 2).unwrap()).unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(url.path(), "/search/issues");
+        assert_eq!(
+            query.get("q").map(|value| value.as_ref()),
+            Some("is:pr is:open author:Dionysuzx")
+        );
+        assert_eq!(
+            query.get("sort").map(|value| value.as_ref()),
+            Some("created")
+        );
+        assert_eq!(query.get("order").map(|value| value.as_ref()), Some("desc"));
+        assert_eq!(
+            query.get("per_page").map(|value| value.as_ref()),
+            Some("100")
+        );
+        assert_eq!(query.get("page").map(|value| value.as_ref()), Some("2"));
+    }
+
+    #[test]
+    fn public_author_discovery_requires_explicitly_public_base_repository() {
+        for visibility in [None, Some(ApiRepoVisibility::NonPublic)] {
+            assert!(
+                GitHubRestClient::public_pull_request_from_search_item(
+                    api_pull_request_search_item(),
+                    &api_repo(visibility)
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+
+        let public_repo = api_repo(Some(ApiRepoVisibility::Public));
+        assert_eq!(
+            GitHubRestClient::public_pull_request_from_search_item(
+                api_pull_request_search_item(),
+                &public_repo
+            )
+            .unwrap()
+            .unwrap()
+            .html_url,
+            "https://github.com/o/r/pull/1"
+        );
+    }
+
+    #[test]
     fn keeps_recent_comments_across_issue_and_review_comment_streams() {
         let mut comments = (0..21)
             .map(|index| {
@@ -706,6 +807,33 @@ mod tests {
             },
             issue_url: None,
             pull_request_url: Some("https://api.github.com/repos/o/r/pulls/1".to_string()),
+        }
+    }
+
+    fn api_pull_request_search_item() -> ApiIssue {
+        ApiIssue {
+            url: Some("https://api.github.com/repos/o/r/issues/1".to_string()),
+            html_url: Some("https://github.com/o/r/pull/1".to_string()),
+            repository_url: Some("https://api.github.com/repos/o/r".to_string()),
+            number: Some(1),
+            user: Some(ApiUser {
+                login: "dionysuzx".to_string(),
+            }),
+            pull_request: Some(ApiIssuePullRequest {
+                url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
+            }),
+        }
+    }
+
+    fn api_repo(visibility: Option<ApiRepoVisibility>) -> ApiRepo {
+        ApiRepo {
+            name: "r".to_string(),
+            clone_url: "https://github.com/o/r.git".to_string(),
+            owner: Some(ApiUser {
+                login: "o".to_string(),
+            }),
+            default_branch: Some("main".to_string()),
+            visibility,
         }
     }
 }
@@ -847,6 +975,39 @@ impl GitHubRestClient {
         })
     }
 
+    fn public_pull_request_from_search_item(
+        item: ApiIssue,
+        repo: &ApiRepo,
+    ) -> Result<Option<PullRequest>> {
+        if repo.visibility != Some(ApiRepoVisibility::Public) {
+            return Ok(None);
+        }
+
+        let owner = repo
+            .owner
+            .as_ref()
+            .ok_or_else(|| anyhow!("pull request base repo has no owner"))?;
+        Ok(Some(PullRequest {
+            owner: owner.login.clone(),
+            repo: repo.name.clone(),
+            number: item
+                .number
+                .ok_or_else(|| anyhow!("pull request search result has no number"))?,
+            author: item
+                .user
+                .ok_or_else(|| anyhow!("pull request search result has no author"))?
+                .login,
+            api_url: item
+                .pull_request
+                .ok_or_else(|| anyhow!("pull request search result has no pull request URL"))?
+                .url,
+            html_url: item
+                .html_url
+                .ok_or_else(|| anyhow!("pull request search result has no HTML URL"))?,
+            clone_url: repo.clone_url.clone(),
+        }))
+    }
+
     async fn issue_from_api(&self, issue: ApiIssue) -> Result<Issue> {
         let repository_url = issue
             .repository_url
@@ -955,6 +1116,17 @@ fn notification_page_url(since: &str, page: usize) -> String {
     format!(
         "https://api.github.com/notifications?participating=true&all=true&per_page={NOTIFICATION_PAGE_SIZE}&page={page}&since={since}"
     )
+}
+
+fn public_pull_request_search_url(author: &str, page: usize) -> Result<String> {
+    let mut url = Url::parse("https://api.github.com/search/issues")?;
+    url.query_pairs_mut()
+        .append_pair("q", &format!("is:pr is:open author:{author}"))
+        .append_pair("sort", "created")
+        .append_pair("order", "desc")
+        .append_pair("per_page", &SEARCH_PAGE_SIZE.to_string())
+        .append_pair("page", &page.to_string());
+    Ok(url.into())
 }
 
 fn recent_notification_since(window: GitHubNotificationWindow) -> String {
@@ -1066,6 +1238,13 @@ struct ApiIssuePullRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ApiIssueSearch {
+    total_count: usize,
+    incomplete_results: bool,
+    items: Vec<ApiIssue>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ApiPullRequest {
     url: String,
     html_url: String,
@@ -1085,6 +1264,15 @@ struct ApiRepo {
     clone_url: String,
     owner: Option<ApiUser>,
     default_branch: Option<String>,
+    visibility: Option<ApiRepoVisibility>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum ApiRepoVisibility {
+    Public,
+    #[serde(other)]
+    NonPublic,
 }
 
 #[derive(Debug, Serialize)]
