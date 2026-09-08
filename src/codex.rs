@@ -1,53 +1,84 @@
 use crate::{
-    domain::{CodexPromptTemplates, CodexTask},
+    domain::{CodexExecutionAccess, CodexPromptTemplates, CodexTask},
     maid::{CodexRun, CodexRunner},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 use tempfile::NamedTempFile;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_EXIT_AFTER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_STDOUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STDERR_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+pub const DEFAULT_WORKER_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 
 #[derive(Clone, Debug)]
 pub struct CodexCli {
     bin: String,
+    codex_home: PathBuf,
+    runtime_home: PathBuf,
+    worker_path: String,
     model: String,
     reasoning_effort: String,
     prompts: CodexPromptTemplates,
     exit_after_completion_timeout: Duration,
+    task_timeout: Duration,
 }
 
 impl CodexCli {
     pub fn new(
         bin: impl Into<String>,
+        codex_home: impl Into<PathBuf>,
+        runtime_home: impl Into<PathBuf>,
         model: impl Into<String>,
         reasoning_effort: impl Into<String>,
         prompts: CodexPromptTemplates,
     ) -> Self {
+        let bin = bin.into();
         Self {
-            bin: bin.into(),
+            bin: resolve_executable(&bin),
+            codex_home: codex_home.into(),
+            runtime_home: runtime_home.into(),
+            worker_path: DEFAULT_WORKER_PATH.to_string(),
             model: model.into(),
             reasoning_effort: reasoning_effort.into(),
             prompts,
             exit_after_completion_timeout: CODEX_EXIT_AFTER_COMPLETION_TIMEOUT,
+            task_timeout: CODEX_TASK_TIMEOUT,
         }
     }
 
     pub fn with_options(
         bin: impl Into<String>,
+        codex_home: impl Into<PathBuf>,
+        runtime_home: impl Into<PathBuf>,
         model: impl Into<String>,
         reasoning_effort: impl Into<String>,
         prompts: CodexPromptTemplates,
     ) -> Self {
-        Self::new(bin, model, reasoning_effort, prompts)
+        Self::new(
+            bin,
+            codex_home,
+            runtime_home,
+            model,
+            reasoning_effort,
+            prompts,
+        )
     }
 
     #[cfg(test)]
@@ -55,31 +86,40 @@ impl CodexCli {
         self.exit_after_completion_timeout = timeout;
         self
     }
+
+    #[cfg(test)]
+    fn with_task_timeout(mut self, timeout: Duration) -> Self {
+        self.task_timeout = timeout;
+        self
+    }
+
+    pub fn with_worker_path(mut self, worker_path: impl Into<String>) -> Self {
+        self.worker_path = worker_path.into();
+        self
+    }
 }
 
 #[async_trait]
 impl CodexRunner for CodexCli {
     async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
-        let output_file = NamedTempFile::new().context("failed to create Codex output file")?;
+        create_private_directory(&self.codex_home)?;
+        create_private_directory(&self.runtime_home)?;
+        let runtime_home = tempfile::tempdir_in(&self.runtime_home)
+            .context("failed to create isolated Codex runtime home")?;
+        let output_file = NamedTempFile::new_in(runtime_home.path())
+            .context("failed to create Codex output file")?;
         let output_path = output_file.path().to_path_buf();
 
         let prompt = task.prompt(&self.prompts)?;
 
         let mut command = Command::new(&self.bin);
-        command.arg("--ask-for-approval").arg("never");
-        command.arg("--model").arg(&self.model);
-        command.arg("--config").arg(codex_config_string(
-            "model_reasoning_effort",
-            &self.reasoning_effort,
-        ));
+        configure_command(&mut command, self, runtime_home.path(), worktree, task);
         let mut child = command
             .arg("exec")
             .arg("--color")
             .arg("never")
             .arg("--json")
             .arg("--skip-git-repo-check")
-            .arg("--sandbox")
-            .arg("danger-full-access")
             .arg("--output-last-message")
             .arg(&output_path)
             .arg("-")
@@ -87,8 +127,10 @@ impl CodexRunner for CodexCli {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to start {}", self.bin))?;
+        let mut process_group = ProcessGroupGuard::for_child(&child);
 
         let mut stdin = child
             .stdin
@@ -108,11 +150,8 @@ impl CodexRunner for CodexCli {
             .stderr
             .take()
             .ok_or_else(|| anyhow!("failed to open Codex stderr"))?;
-        let mut stderr_task = tokio::spawn(async move {
-            let mut stderr_bytes = Vec::new();
-            stderr.read_to_end(&mut stderr_bytes).await?;
-            Ok::<_, std::io::Error>(stderr_bytes)
-        });
+        let mut stderr_task =
+            tokio::spawn(async move { read_bounded(&mut stderr, MAX_STDERR_BYTES).await });
 
         let events = Arc::new(Mutex::new(CodexJsonEvents::default()));
         let (completed_tx, mut completed_rx) = watch::channel(false);
@@ -125,28 +164,33 @@ impl CodexRunner for CodexCli {
             task.trigger_url().to_string(),
             task.task_kind(),
         ));
-        let status = tokio::select! {
-            status = child.wait() => Some(status.context("Codex failed to run")?),
-            completed = async {
-                completed_rx
-                    .wait_for(|completed| *completed)
-                    .await
-                    .map(|_| ())
-            } => {
-                completed.context("Codex completion channel closed")?;
-                match timeout(self.exit_after_completion_timeout, child.wait()).await {
-                    Ok(status) => Some(status.context("Codex failed to run")?),
-                    Err(_) => {
-                        warn!("Codex process did not exit after task completion; terminating wrapper");
-                        child
-                            .start_kill()
-                            .context("failed to terminate completed Codex process")?;
-                        let _ = timeout(self.exit_after_completion_timeout, child.wait()).await;
-                        None
-                    }
-                }
+        let status = match timeout(
+            self.task_timeout,
+            wait_for_codex(
+                &mut child,
+                &mut completed_rx,
+                self.exit_after_completion_timeout,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                terminate_process_group(&mut child).await;
+                process_group.disarm();
+                stdout_task.abort();
+                stderr_task.abort();
+                bail!(
+                    "Codex task exceeded its {} second time limit",
+                    self.task_timeout.as_secs()
+                );
             }
         };
+        process_group.terminate();
+        if status.is_none() {
+            let _ = timeout(Duration::from_secs(5), child.wait()).await;
+        }
+        process_group.disarm();
         match timeout(PIPE_DRAIN_TIMEOUT, &mut stdout_task).await {
             Ok(result) => result.context("failed to join Codex stdout reader")??,
             Err(_) => {
@@ -157,7 +201,7 @@ impl CodexRunner for CodexCli {
         let stderr = match timeout(PIPE_DRAIN_TIMEOUT, &mut stderr_task).await {
             Ok(result) => result
                 .context("failed to join Codex stderr reader")?
-                .context("failed to read Codex stderr")?,
+                .context("failed to read bounded Codex stderr")?,
             Err(_) => {
                 stderr_task.abort();
                 warn!("Codex stderr did not close after process exit");
@@ -175,10 +219,10 @@ impl CodexRunner for CodexCli {
         }
 
         let json = events.lock().await.clone();
-        let response = match tokio::fs::read_to_string(&output_path).await {
-            Ok(response) if !response.trim().is_empty() => response,
-            Err(_) => json.last_message.unwrap_or_default(),
-            Ok(_) => json.last_message.unwrap_or_default(),
+        let file_response = read_small_output(&output_path).await?;
+        let response = match file_response {
+            response if !response.trim().is_empty() => response,
+            _ => json.last_message.unwrap_or_default(),
         };
         let response = response.trim().to_string();
         if response.is_empty() {
@@ -192,6 +236,273 @@ impl CodexRunner for CodexCli {
     }
 }
 
+fn resolve_executable(bin: &str) -> String {
+    if Path::new(bin).components().count() > 1 {
+        return bin.to_string();
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(bin))
+        .find(|candidate| candidate.is_file())
+        .map_or_else(
+            || bin.to_string(),
+            |path| path.to_string_lossy().to_string(),
+        )
+}
+
+fn configure_command(
+    command: &mut Command,
+    codex: &CodexCli,
+    runtime_home: &Path,
+    worktree: &Path,
+    task: &CodexTask,
+) {
+    let policy = CodexPolicy::for_access(task.execution_access());
+    command
+        .env_clear()
+        .env("PATH", &codex.worker_path)
+        .env("HOME", runtime_home)
+        .env("CODEX_HOME", &codex.codex_home)
+        .arg("--strict-config")
+        .arg("--model")
+        .arg(&codex.model)
+        .arg("--config")
+        .arg(codex_config_string(
+            "model_reasoning_effort",
+            &codex.reasoning_effort,
+        ))
+        .arg("--config")
+        .arg("shell_environment_policy.inherit=\"none\"")
+        .arg("--config")
+        .arg("allow_login_shell=false")
+        .arg("--config")
+        .arg("web_search=\"disabled\"")
+        .arg("--config")
+        .arg("project_doc_max_bytes=0")
+        .arg("--config")
+        .arg("default_permissions=\"maid-task\"")
+        .arg("--config")
+        .arg(policy.filesystem_config())
+        .arg("--config")
+        .arg("permissions.maid-task.network={ enabled = false }")
+        .arg("--config")
+        .arg(format!(
+            "projects.{}.trust_level=\"untrusted\"",
+            toml::Value::String(worktree.display().to_string())
+        ));
+    if policy.auto_review_approvals {
+        command.arg("--approve-for-me");
+    } else {
+        command
+            .arg("--sandbox")
+            .arg("read-only")
+            .arg("--ask-for-approval")
+            .arg("never");
+    }
+    configure_child_limits(command);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CodexPolicy {
+    workspace_access: &'static str,
+    auto_review_approvals: bool,
+}
+
+impl CodexPolicy {
+    fn for_access(access: CodexExecutionAccess) -> Self {
+        match access {
+            CodexExecutionAccess::Inspect => Self {
+                workspace_access: "read",
+                auto_review_approvals: false,
+            },
+            CodexExecutionAccess::Operate => Self {
+                workspace_access: "write",
+                auto_review_approvals: true,
+            },
+        }
+    }
+
+    fn filesystem_config(self) -> String {
+        format!(
+            "permissions.maid-task.filesystem={{ \":root\" = \"deny\", \":minimal\" = \"read\", \":tmpdir\" = \"deny\", \":slash_tmp\" = \"deny\", \":workspace_roots\" = {{ \".\" = \"{}\" }} }}",
+            self.workspace_access
+        )
+    }
+}
+
+async fn wait_for_codex(
+    child: &mut Child,
+    completed_rx: &mut watch::Receiver<bool>,
+    exit_timeout: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    tokio::select! {
+        status = child.wait() => Ok(Some(status.context("Codex failed to run")?)),
+        completed = async {
+            completed_rx.wait_for(|completed| *completed).await.map(|_| ())
+        } => {
+            completed.context("Codex completion channel closed")?;
+            match timeout(exit_timeout, child.wait()).await {
+                Ok(status) => Ok(Some(status.context("Codex failed to run")?)),
+                Err(_) => {
+                    warn!("Codex process group did not exit after task completion; terminating it");
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+async fn read_bounded(reader: &mut (impl AsyncRead + Unpin), limit: usize) -> io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut exceeded = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..read.min(remaining)]);
+        exceeded |= read > remaining;
+    }
+    if exceeded {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process output exceeded limit",
+        ));
+    }
+    Ok(captured)
+}
+
+async fn read_small_output(path: &Path) -> Result<String> {
+    let metadata = tokio::fs::metadata(path).await?;
+    if metadata.len() > MAX_OUTPUT_BYTES {
+        bail!("Codex final response exceeded output limit");
+    }
+    tokio::fs::read_to_string(path)
+        .await
+        .context("failed to read Codex final response")
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create private directory {}", path.display()))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect private directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "private directory must be a real directory: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure private directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_child_limits(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            set_resource_limit(libc::RLIMIT_CPU, 20 * 60)?;
+            #[cfg(not(target_os = "macos"))]
+            set_resource_limit(libc::RLIMIT_AS, 8 * 1024 * 1024 * 1024)?;
+            set_resource_limit(libc::RLIMIT_FSIZE, 1024 * 1024 * 1024)?;
+            set_resource_limit(libc::RLIMIT_NOFILE, 256)?;
+            set_resource_limit(libc::RLIMIT_CORE, 0)?;
+            Ok(())
+        });
+    }
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+
+#[cfg(unix)]
+#[cfg(not(target_os = "linux"))]
+type RlimitResource = libc::c_int;
+
+#[cfg(unix)]
+fn set_resource_limit(resource: RlimitResource, requested: libc::rlim_t) -> io::Result<()> {
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        if libc::getrlimit(resource, &mut current) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        current.rlim_cur = requested.min(current.rlim_max);
+        if libc::setrlimit(resource, &current) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_child_limits(_command: &mut Command) {}
+
+#[cfg(unix)]
+async fn terminate_process_group(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    let _ = timeout(Duration::from_secs(5), child.wait()).await;
+}
+
+#[cfg(not(unix))]
+async fn terminate_process_group(child: &mut Child) {
+    let _ = child.start_kill();
+    let _ = timeout(Duration::from_secs(5), child.wait()).await;
+}
+
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn for_child(child: &Child) -> Self {
+        Self {
+            #[cfg(unix)]
+            pid: child.id(),
+        }
+    }
+
+    fn terminate(&self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pid = None;
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 async fn read_codex_stdout(
     stdout: impl AsyncRead + Unpin,
     events: Arc<Mutex<CodexJsonEvents>>,
@@ -201,28 +512,86 @@ async fn read_codex_stdout(
     trigger_url: String,
     task_kind: &'static str,
 ) -> Result<()> {
-    let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .context("failed to read Codex stdout")?
-    {
-        let observed = events.lock().await.observe_line(&line);
-        if observed.completed {
-            let _ = completed.send(true);
+    let mut stdout = stdout;
+    let mut total: usize = 0;
+    let mut exceeded = false;
+    let mut pending = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = stdout
+            .read(&mut buffer)
+            .await
+            .context("failed to read Codex stdout")?;
+        if read == 0 {
+            break;
         }
-        if let Some(session_id) = observed.session_id {
-            info!(
-                pr = %pr_url,
-                trigger = %trigger_url,
+        total = total.saturating_add(read);
+        if total > MAX_STDOUT_BYTES {
+            exceeded = true;
+            continue;
+        }
+        pending.extend_from_slice(&buffer[..read]);
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=newline).collect::<Vec<_>>();
+            observe_stdout_line(
+                &line,
+                &events,
+                &completed,
+                &worktree,
+                &pr_url,
+                &trigger_url,
                 task_kind,
-                worktree,
-                codex_session_id = %session_id,
-                "codex session started"
-            );
+            )
+            .await;
         }
     }
+    if !pending.is_empty() {
+        observe_stdout_line(
+            &pending,
+            &events,
+            &completed,
+            &worktree,
+            &pr_url,
+            &trigger_url,
+            task_kind,
+        )
+        .await;
+    }
+    if exceeded {
+        bail!("Codex stdout exceeded capture limit");
+    }
     Ok(())
+}
+
+async fn observe_stdout_line(
+    line: &[u8],
+    events: &Arc<Mutex<CodexJsonEvents>>,
+    completed: &watch::Sender<bool>,
+    worktree: &str,
+    pr_url: &str,
+    trigger_url: &str,
+    task_kind: &'static str,
+) {
+    let Ok(line) = std::str::from_utf8(line) else {
+        return;
+    };
+    let observed = events
+        .lock()
+        .await
+        .observe_line(line.trim_end_matches(['\r', '\n']));
+    if observed.completed {
+        let _ = completed.send(true);
+    }
+    if let Some(session_id) = observed.session_id {
+        info!(
+            pr = %pr_url,
+            trigger = %trigger_url,
+            task_kind,
+            worktree,
+            codex_session_id = %session_id,
+            "codex session started"
+        );
+    }
 }
 
 fn codex_config_string(key: &str, value: &str) -> String {
@@ -354,6 +723,159 @@ mod tests {
         );
     }
 
+    #[test]
+    fn assigns_least_privilege_by_task_kind() {
+        assert_eq!(
+            CodexPolicy::for_access(CodexExecutionAccess::Inspect),
+            CodexPolicy {
+                workspace_access: "read",
+                auto_review_approvals: false,
+            }
+        );
+        assert_eq!(
+            CodexPolicy::for_access(CodexExecutionAccess::Operate),
+            CodexPolicy {
+                workspace_access: "write",
+                auto_review_approvals: true,
+            }
+        );
+    }
+
+    #[test]
+    fn configures_the_actual_worker_environment_and_approval_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex = CodexCli::new(
+            "codex",
+            temp.path().join("codex-home"),
+            temp.path().join("runtime-home"),
+            "test-model",
+            "low",
+            CodexPromptTemplates {
+                mention: "{{cleaned_text}}".to_string(),
+                pull_request_opened: "{{author}}".to_string(),
+                operator_mention: "{{request_text}}".to_string(),
+            },
+        );
+        let review = CodexTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: CodexTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot review".to_string(),
+                cleaned_text: "review".to_string(),
+            },
+        };
+        let operate = CodexTask {
+            pr_url: review.pr_url.clone(),
+            origin: CodexTaskOrigin::OperatorMention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-3".to_string(),
+                raw_body: "@maid-bot /operate fix".to_string(),
+                request_text: "fix".to_string(),
+                trigger_author: "operator".to_string(),
+                bot_login: "maid-bot".to_string(),
+            },
+        };
+
+        let mut review_command = Command::new("codex");
+        configure_command(
+            &mut review_command,
+            &codex,
+            temp.path().join("review-home").as_path(),
+            temp.path(),
+            &review,
+        );
+        let review_args = command_arguments(&review_command);
+        assert!(
+            review_args
+                .windows(2)
+                .any(|pair| pair == ["--sandbox", "read-only"])
+        );
+        assert!(
+            review_args
+                .windows(2)
+                .any(|pair| pair == ["--ask-for-approval", "never"])
+        );
+        assert!(
+            !review_args
+                .iter()
+                .any(|argument| argument == "--approve-for-me")
+        );
+        assert_eq!(review_command.as_std().get_envs().count(), 3);
+        assert!(
+            review_command
+                .as_std()
+                .get_envs()
+                .all(|(key, _)| { matches!(key.to_str(), Some("PATH" | "HOME" | "CODEX_HOME")) })
+        );
+
+        let mut operate_command = Command::new("codex");
+        configure_command(
+            &mut operate_command,
+            &codex,
+            temp.path().join("operate-home").as_path(),
+            temp.path(),
+            &operate,
+        );
+        let operate_args = command_arguments(&operate_command);
+        assert!(
+            operate_args
+                .iter()
+                .any(|argument| argument == "--approve-for-me")
+        );
+        assert!(
+            !operate_args
+                .iter()
+                .any(|argument| argument == "--ask-for-approval")
+        );
+        assert!(
+            operate_args
+                .iter()
+                .any(|argument| argument.contains("\":workspace_roots\" = { \".\" = \"write\" }"))
+        );
+    }
+
+    fn command_arguments(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn run_terminates_a_task_that_exceeds_its_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("fake-codex");
+        fs::write(&bin, "#!/bin/sh\ncat >/dev/null\nsleep 5\n").unwrap();
+        let mut permissions = fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&bin, permissions).unwrap();
+
+        let codex = CodexCli::new(
+            bin.display().to_string(),
+            temp.path().join("codex-home"),
+            temp.path().join("runtime-home"),
+            "test-model",
+            "low",
+            CodexPromptTemplates {
+                mention: "{{cleaned_text}}".to_string(),
+                pull_request_opened: "{{author}}".to_string(),
+                operator_mention: "{{request_text}}".to_string(),
+            },
+        )
+        .with_task_timeout(Duration::from_millis(100));
+        let task = CodexTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: CodexTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot test".to_string(),
+                cleaned_text: "test".to_string(),
+            },
+        };
+
+        let error = codex.run(temp.path(), &task).await.unwrap_err();
+        assert!(error.to_string().contains("time limit"));
+    }
+
     #[tokio::test]
     async fn run_finishes_when_child_leaves_stdout_open_after_exit() {
         let temp = tempfile::tempdir().unwrap();
@@ -385,6 +907,8 @@ exit 0
 
         let codex = CodexCli::new(
             bin.display().to_string(),
+            temp.path().join("codex-home"),
+            temp.path().join("runtime-home"),
             "test-model",
             "low",
             CodexPromptTemplates {
@@ -439,6 +963,8 @@ sleep 5
 
         let codex = CodexCli::new(
             bin.display().to_string(),
+            temp.path().join("codex-home"),
+            temp.path().join("runtime-home"),
             "test-model",
             "low",
             CodexPromptTemplates {
@@ -493,6 +1019,8 @@ python3 -c 'import sys, time; output_path = sys.argv[1]; print("{\"type\":\"thre
 
         let codex = CodexCli::new(
             bin.display().to_string(),
+            temp.path().join("codex-home"),
+            temp.path().join("runtime-home"),
             "test-model",
             "low",
             CodexPromptTemplates {

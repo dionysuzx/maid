@@ -315,6 +315,21 @@ impl CodexTask {
     pub fn task_kind(&self) -> &'static str {
         self.origin.task_kind()
     }
+
+    pub fn execution_access(&self) -> CodexExecutionAccess {
+        match self.origin {
+            CodexTaskOrigin::OperatorMention { .. } => CodexExecutionAccess::Operate,
+            CodexTaskOrigin::Mention { .. } | CodexTaskOrigin::PullRequestOpened { .. } => {
+                CodexExecutionAccess::Inspect
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexExecutionAccess {
+    Inspect,
+    Operate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

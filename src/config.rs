@@ -1,4 +1,5 @@
 use crate::{
+    codex::DEFAULT_WORKER_PATH,
     domain::{CodexPromptTemplates, RepoSlug},
     github::{
         DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
@@ -14,7 +15,7 @@ use std::{
     process::Command,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Config {
     pub github_token: String,
     pub bot_login: String,
@@ -32,6 +33,9 @@ pub struct Config {
     pub github_api_requests_per_hour: GitHubApiRequestRate,
     pub github_notification_window: GitHubNotificationWindow,
     pub codex_bin: String,
+    pub codex_home: PathBuf,
+    pub codex_runtime_home: PathBuf,
+    pub codex_worker_path: String,
     pub codex_model: String,
     pub codex_reasoning_effort: String,
     pub codex_prompts: CodexPromptTemplates,
@@ -91,6 +95,13 @@ impl Config {
                 .unwrap_or(DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS),
         )?;
         let codex_bin = normalize_command(non_empty(file.codex_bin))?;
+        let codex_home = non_empty(file.codex_home)
+            .map(|path| expand_home(&path))
+            .transpose()?
+            .map(absolute_path)
+            .transpose()?
+            .unwrap_or_else(|| maid_home.join("codex"));
+        let codex_worker_path = worker_path(file.codex_worker_path.as_deref())?;
         let codex_model = required_string(file.codex_model, "codex_model")
             .with_context(|| format!("codex_model is required in {}", config_path.display()))?;
         let codex_reasoning_effort =
@@ -109,12 +120,15 @@ impl Config {
             .transpose()
             .context("github_api_ip must be an IPv4 or IPv6 address")?;
         let github_token = gh_token_for(&bot_login)?;
-        let metrics_bind_address = file
+        let metrics_bind_address: SocketAddr = file
             .metrics_bind_address
             .as_deref()
             .unwrap_or("127.0.0.1:9464")
             .parse()
             .context("metrics_bind_address must be an IP address and port")?;
+        if !metrics_bind_address.ip().is_loopback() {
+            bail!("metrics_bind_address must use a loopback IP address");
+        }
 
         Ok(Self {
             github_token,
@@ -133,6 +147,9 @@ impl Config {
             github_api_requests_per_hour,
             github_notification_window,
             codex_bin,
+            codex_home,
+            codex_runtime_home: maid_home.join("runtime"),
+            codex_worker_path,
             codex_model,
             codex_reasoning_effort,
             codex_prompts,
@@ -155,6 +172,8 @@ struct ConfigFile {
     github_api_requests_per_hour: Option<u32>,
     github_notification_window_hours: Option<u32>,
     codex_bin: Option<String>,
+    codex_home: Option<String>,
+    codex_worker_path: Option<String>,
     codex_model: Option<String>,
     codex_reasoning_effort: Option<String>,
     codex_prompts: Option<CodexPromptsFile>,
@@ -323,6 +342,15 @@ fn normalize_command(command: Option<String>) -> Result<String> {
         .to_string())
 }
 
+fn worker_path(value: Option<&str>) -> Result<String> {
+    let value = value.unwrap_or(DEFAULT_WORKER_PATH);
+    let directories = env::split_paths(value).collect::<Vec<_>>();
+    if directories.is_empty() || directories.iter().any(|path| !path.is_absolute()) {
+        bail!("codex_worker_path must contain only absolute directories");
+    }
+    Ok(value.to_string())
+}
+
 fn gh_token_for(login: &str) -> Result<String> {
     let output = Command::new("gh")
         .args(["auth", "token", "--hostname", "github.com", "--user", login])
@@ -372,6 +400,8 @@ github_api_requests_per_hour = 1200
 github_notification_window_hours = 96
 metrics_bind_address = "127.0.0.1:9999"
 codex_bin = "codex-test"
+codex_home = "~/.maid/test-codex"
+codex_worker_path = "/usr/local/bin:/usr/bin:/bin"
 codex_model = "gpt-test"
 codex_reasoning_effort = "high"
 github_api_ip = "127.0.0.1"
@@ -410,6 +440,11 @@ operator_mention = "operator {{{{request_text}}}}"
             Some("127.0.0.1:9999")
         );
         assert_eq!(config.codex_bin.as_deref(), Some("codex-test"));
+        assert_eq!(config.codex_home.as_deref(), Some("~/.maid/test-codex"));
+        assert_eq!(
+            config.codex_worker_path.as_deref(),
+            Some("/usr/local/bin:/usr/bin:/bin")
+        );
         assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
         assert_eq!(config.codex_reasoning_effort.as_deref(), Some("high"));
         let codex_prompts = config.codex_prompts.unwrap();
@@ -638,5 +673,11 @@ operator_mention = "operator {{{{request_text}}}}"
                 .to_string_lossy()
                 .to_string()
         );
+    }
+
+    #[test]
+    fn worker_path_requires_absolute_directories() {
+        assert_eq!(worker_path(None).unwrap(), DEFAULT_WORKER_PATH);
+        assert!(worker_path(Some("/usr/bin:relative/bin")).is_err());
     }
 }

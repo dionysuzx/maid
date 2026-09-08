@@ -1,6 +1,7 @@
 use crate::{
     domain::{CommentMention, Issue, Notification, PullRequest, RepoSlug, ReviewState, WorkTarget},
     maid::GithubClient,
+    publication::GitHubComment,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -112,7 +113,9 @@ impl GitHubRestClient {
         request_rate: GitHubApiRequestRate,
         notification_window: GitHubNotificationWindow,
     ) -> Self {
-        let mut builder = Client::builder().timeout(Duration::from_secs(30));
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none());
         if let Some(api_ip) = api_ip {
             builder = builder.resolve("api.github.com", (api_ip, 443).into());
         }
@@ -159,13 +162,14 @@ impl GitHubRestClient {
         T: for<'de> Deserialize<'de>,
         B: Serialize + Sync + ?Sized,
     {
+        let api_url = GitHubApiUrl::parse(url)?;
         let method_for_error = method.clone();
         for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
             self.traffic.wait_for_turn().await;
 
             let mut request = self
                 .client
-                .request(method.clone(), url)
+                .request(method.clone(), api_url.as_url().clone())
                 .bearer_auth(&self.token)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
@@ -234,6 +238,29 @@ impl GitHubRestClient {
         Err(anyhow!(
             "{method_for_error} {url} still rate limited after {MAX_RATE_LIMIT_RETRIES} retries"
         ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitHubApiUrl(Url);
+
+impl GitHubApiUrl {
+    fn parse(value: &str) -> Result<Self> {
+        let url = Url::parse(value).with_context(|| format!("invalid GitHub API URL: {value}"))?;
+        let valid = url.scheme() == "https"
+            && url.host_str() == Some("api.github.com")
+            && url.port().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none();
+        if !valid {
+            bail!("refusing to send GitHub credentials to untrusted URL: {value}");
+        }
+        Ok(Self(url))
+    }
+
+    fn as_url(&self) -> &Url {
+        &self.0
     }
 }
 
@@ -380,17 +407,23 @@ impl GithubClient for GitHubRestClient {
         Ok(pull_requests)
     }
 
-    async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
+    async fn post_comment(&self, target: &WorkTarget, body: &GitHubComment) -> Result<()> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/issues/{}/comments",
             target.owner(),
             target.repo(),
             target.number()
         );
-        self.post_json(&url, &PostComment { body }).await
+        self.post_json(
+            &url,
+            &PostComment {
+                body: body.as_str(),
+            },
+        )
+        .await
     }
 
-    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
+    async fn post_pr_comment(&self, pr: &PullRequest, body: &GitHubComment) -> Result<()> {
         self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
             .await
     }
@@ -689,6 +722,22 @@ mod tests {
     #[test]
     fn request_rate_rejects_zero() {
         assert!(GitHubApiRequestRate::per_hour(0).is_err());
+    }
+
+    #[test]
+    fn only_accepts_urls_on_the_github_api_origin() {
+        assert!(GitHubApiUrl::parse("https://api.github.com/repos/o/r").is_ok());
+        assert!(GitHubApiUrl::parse("https://api.github.com/search?q=x").is_ok());
+
+        for url in [
+            "http://api.github.com/repos/o/r",
+            "https://api.github.com.evil.test/repos/o/r",
+            "https://user@api.github.com/repos/o/r",
+            "https://api.github.com:444/repos/o/r",
+            "https://api.github.com/repos/o/r#fragment",
+        ] {
+            assert!(GitHubApiUrl::parse(url).is_err(), "accepted {url}");
+        }
     }
 
     #[test]

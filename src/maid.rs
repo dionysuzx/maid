@@ -14,6 +14,7 @@ use crate::mention_thread::{
     MentionThreadPlan, MentionThreadRead, choose_mention_thread_read, plan_mention_thread,
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
+use crate::publication::GitHubComment;
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -34,8 +35,8 @@ pub trait GithubClient: Send + Sync {
     }
     async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
-    async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
-    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
+    async fn post_comment(&self, target: &WorkTarget, body: &GitHubComment) -> Result<()>;
+    async fn post_pr_comment(&self, pr: &PullRequest, body: &GitHubComment) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
     -> Result<ReviewState>;
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
@@ -62,30 +63,15 @@ pub trait CodexRunner: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedWorktree {
     path: PathBuf,
-    repo: Option<PathBuf>,
 }
 
 impl PreparedWorktree {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            repo: None,
-        }
-    }
-
-    pub fn git_worktree(repo: impl Into<PathBuf>, path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            repo: Some(repo.into()),
-        }
+        Self { path: path.into() }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    pub fn repo(&self) -> Option<&Path> {
-        self.repo.as_deref()
     }
 }
 
@@ -808,9 +794,8 @@ where
         let result = async {
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
-            self.github
-                .post_comment(&mention.target, &codex_run.response)
-                .await?;
+            let comment = GitHubComment::from_codex_response(&codex_run.response)?;
+            self.github.post_comment(&mention.target, &comment).await?;
             let marker = PendingHandledMarker::for_mention(&mention);
             self.pending_handled_markers.record(&marker)?;
             if let Err(err) = self.github.mark_mention_handled(&mention).await {
@@ -870,9 +855,8 @@ where
         let result = async {
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
-            self.github
-                .post_pr_comment(&pr, &codex_run.response)
-                .await?;
+            let comment = GitHubComment::from_codex_response(&codex_run.response)?;
+            self.github.post_pr_comment(&pr, &comment).await?;
             let marker = PendingHandledMarker::for_pull_request(&pr);
             self.pending_handled_markers.record(&marker)?;
             if let Err(err) = self.github.mark_pr_handled(&pr).await {
@@ -1341,6 +1325,14 @@ mod tests {
 
     type FakeMentionResult = Option<Result<Option<CommentMention>, String>>;
     type FakeMentionsResult = Option<Result<Vec<CommentMention>, String>>;
+
+    fn published_response() -> String {
+        GitHubComment::from_codex_response("codex response")
+            .unwrap()
+            .as_str()
+            .to_string()
+    }
+
     #[derive(Clone, Default)]
     struct FakeGithub {
         notifications: Arc<StdMutex<Vec<Notification>>>,
@@ -1403,16 +1395,16 @@ mod tests {
             Ok(self.public_pull_requests.lock().unwrap().clone())
         }
 
-        async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
+        async fn post_comment(&self, _target: &WorkTarget, body: &GitHubComment) -> Result<()> {
             self.events.lock().unwrap().push("post".to_string());
             if let Some(message) = self.post_error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
-            self.posts.lock().unwrap().push(body.to_string());
+            self.posts.lock().unwrap().push(body.as_str().to_string());
             Ok(())
         }
 
-        async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
+        async fn post_pr_comment(&self, pr: &PullRequest, body: &GitHubComment) -> Result<()> {
             self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
                 .await
         }
@@ -1884,7 +1876,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         assert!(github.marks.lock().unwrap().is_empty());
         assert_eq!(
             *github.events.lock().unwrap(),
@@ -1937,7 +1929,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
         assert_eq!(
@@ -1984,7 +1976,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         assert_eq!(
             *github.events.lock().unwrap(),
             vec!["start", "post", "handled"]
@@ -2024,7 +2016,7 @@ mod tests {
 
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         assert!(github.marks.lock().unwrap().is_empty());
         assert_eq!(
             *github.events.lock().unwrap(),
@@ -2088,7 +2080,7 @@ mod tests {
             *github.public_pull_request_authors.lock().unwrap(),
             vec!["dionysuzx"]
         );
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
@@ -2131,7 +2123,7 @@ mod tests {
 
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
     }
 
     #[tokio::test]
@@ -2200,7 +2192,7 @@ mod tests {
 
         release.notify_waiters();
         wait_until(|| github.posts.lock().unwrap().len() == 1).await;
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
     }
 
     #[tokio::test]
@@ -2619,7 +2611,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
     }
 
     #[tokio::test]
@@ -3005,7 +2997,7 @@ mod tests {
         assert_eq!(second_report.started, 0);
         assert_eq!(third_report.started, 0);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
             vec!["https://api.github.com/repos/o/r/issues/comments/2"]
@@ -3042,7 +3034,7 @@ mod tests {
         assert_eq!(first_report.responded, 1);
         assert_eq!(second_report.skipped, 1);
         assert_eq!(third_report.skipped, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
         assert_eq!(
             *github.started_prs.lock().unwrap(),
@@ -3203,7 +3195,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         assert!(github.marks.lock().unwrap().is_empty());
         assert!(github.handled_mentions.lock().unwrap().is_empty());
         assert_eq!(
@@ -3240,7 +3232,7 @@ mod tests {
         assert_eq!(first_report.responded, 1);
         assert_eq!(second_report.skipped, 1);
         assert_eq!(third_report.skipped, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
         assert_eq!(*github.marks.lock().unwrap(), vec!["n1", "n1"]);
         assert!(
@@ -3424,7 +3416,7 @@ mod tests {
 
         assert_eq!(first_report.responded, 1);
         assert_eq!(second_report.skipped, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
         assert!(
             github

@@ -16,6 +16,12 @@ auto_review_public_accounts = ["your-name"]
 # Optional. Defaults shown below.
 git_dir = "~/.maid/git"
 codex_bin = "codex"
+# Dedicated Codex auth directory. Run `CODEX_HOME=~/.maid/codex codex login`
+# before starting Maid. Worker tools cannot read this directory.
+codex_home = "~/.maid/codex"
+# Explicit command search path exposed to worker shells. Add language toolchain
+# directories here when operator tasks need them; relative entries are rejected.
+codex_worker_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 max_concurrent_requests = 1
 
 # Optional. This is the one global GitHub REST request-rate knob. Every GitHub
@@ -25,7 +31,7 @@ github_api_requests_per_hour = 1200
 # Optional. How far back each notification poll searches. Defaults to 24 hours.
 github_notification_window_hours = 24
 
-# Optional. Prometheus metrics are served at /metrics on this address.
+# Optional. Prometheus metrics are served at /metrics on this loopback address.
 metrics_bind_address = "127.0.0.1:9464"
 
 # Required. These values are passed to Codex.

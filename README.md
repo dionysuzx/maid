@@ -9,13 +9,23 @@ comment. It can also run automatic reviews for configured repositories or for
 configured accounts across all public repositories, and trusted users can
 request adhoc operator tasks with `/operate`.
 
-Each task runs in its own git worktree while sharing a cached bare repository
-for the source GitHub repo.
+Each task runs in a fresh disposable Git repository. Maid derives its fetch URL
+from the validated GitHub owner and repository, passes bot authentication only
+to that fetch, and never lets a worker-controlled Git directory cross back into
+a privileged parent Git command.
 
 ## Getting Started
 
 Maid expects Rust/Cargo, `git`, `gh`, `codex`, `just`, and `nvim` on `PATH`.
-Authenticate `gh` as the GitHub bot account before starting Maid.
+Authenticate `gh` as the GitHub bot account before starting Maid. Authenticate
+Codex separately in Maid's dedicated auth directory (the default is
+`~/.maid/codex`):
+
+```sh
+mkdir -p ~/.maid/codex
+chmod 700 ~/.maid/codex
+CODEX_HOME=~/.maid/codex codex login
+```
 
 Clone the repo, create your local config, edit it, then start the bot:
 
@@ -46,6 +56,29 @@ Set `auto_review_public_accounts` to trusted GitHub logins whose open pull
 requests Maid should discover across GitHub. Maid ignores PRs into private base
 repositories. Repository-scoped review remains available through
 `auto_review_repos` and `auto_review_accounts`.
+
+## Security model
+
+Review and automatic-review workers are read-only and cannot request
+escalation. Trusted `/operate` workers can write only their disposable task
+repository by default; requested escalations go through Codex's automatic
+approval reviewer. Automatic review is a policy decision, not unconditional
+approval.
+
+Workers receive a clean environment, a dedicated home and Codex auth home, no
+shell network access by default, an explicit command search path, and no
+user/project rules or user config. Maid
+also caps task wall time and captured output, applies Unix CPU, file-size,
+descriptor, and core-dump limits (plus address-space limits where supported),
+and kills the worker process group
+when a task ends or is cancelled. Published comments carry Maid provenance,
+neutralize GitHub mentions, and have a conservative size limit.
+
+These controls are not a VM or container boundary. Codex itself still needs
+network access to the model service, and `/operate` approvals may deliberately
+grant additional access. Deploy Maid under a separate OS account or container
+with outbound allowlisting and OS-level memory/process quotas when handling
+hostile repositories or when stronger isolation is required.
 
 ## Metrics
 

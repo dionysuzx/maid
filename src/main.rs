@@ -37,10 +37,13 @@ async fn main() -> Result<()> {
         GitWorktrees::new(config.git_dir.clone(), config.github_token.clone()),
         CodexCli::with_options(
             config.codex_bin.clone(),
+            config.codex_home.clone(),
+            config.codex_runtime_home.clone(),
             config.codex_model.clone(),
             config.codex_reasoning_effort.clone(),
             config.codex_prompts.clone(),
-        ),
+        )
+        .with_worker_path(config.codex_worker_path.clone()),
         config.bot_login.clone(),
         config.master_accounts.clone(),
         config.auto_review_accounts.clone(),
