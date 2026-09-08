@@ -283,22 +283,12 @@ fn configure_command(
         .arg("--config")
         .arg("default_permissions=\"maid-task\"")
         .arg("--config")
-        .arg(policy.filesystem_config())
-        .arg("--config")
-        .arg("permissions.maid-task.network={ enabled = false }")
-        .arg("--config")
         .arg(format!(
             "projects.{}.trust_level=\"untrusted\"",
             toml::Value::String(worktree.display().to_string())
         ));
-    if policy.auto_review_approvals {
-        command.arg("--approve-for-me");
-    } else {
-        command
-            .arg("--sandbox")
-            .arg("read-only")
-            .arg("--ask-for-approval")
-            .arg("never");
+    for config in policy.config_overrides() {
+        command.arg("--config").arg(config);
     }
     configure_child_limits(command);
 }
@@ -306,7 +296,8 @@ fn configure_command(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CodexPolicy {
     workspace_access: &'static str,
-    auto_review_approvals: bool,
+    approval_policy: &'static str,
+    approvals_reviewer: Option<&'static str>,
 }
 
 impl CodexPolicy {
@@ -314,13 +305,27 @@ impl CodexPolicy {
         match access {
             CodexExecutionAccess::Inspect => Self {
                 workspace_access: "read",
-                auto_review_approvals: false,
+                approval_policy: "never",
+                approvals_reviewer: None,
             },
             CodexExecutionAccess::Operate => Self {
                 workspace_access: "write",
-                auto_review_approvals: true,
+                approval_policy: "on-request",
+                approvals_reviewer: Some("auto_review"),
             },
         }
+    }
+
+    fn config_overrides(self) -> Vec<String> {
+        let mut overrides = vec![
+            self.filesystem_config(),
+            "permissions.maid-task.network={ enabled = false }".to_string(),
+            format!("approval_policy=\"{}\"", self.approval_policy),
+        ];
+        if let Some(reviewer) = self.approvals_reviewer {
+            overrides.push(format!("approvals_reviewer=\"{reviewer}\""));
+        }
+        overrides
     }
 
     fn filesystem_config(self) -> String {
@@ -729,14 +734,16 @@ mod tests {
             CodexPolicy::for_access(CodexExecutionAccess::Inspect),
             CodexPolicy {
                 workspace_access: "read",
-                auto_review_approvals: false,
+                approval_policy: "never",
+                approvals_reviewer: None,
             }
         );
         assert_eq!(
             CodexPolicy::for_access(CodexExecutionAccess::Operate),
             CodexPolicy {
                 workspace_access: "write",
-                auto_review_approvals: true,
+                approval_policy: "on-request",
+                approvals_reviewer: Some("auto_review"),
             }
         );
     }
@@ -786,18 +793,14 @@ mod tests {
         let review_args = command_arguments(&review_command);
         assert!(
             review_args
-                .windows(2)
-                .any(|pair| pair == ["--sandbox", "read-only"])
+                .iter()
+                .any(|argument| argument == "approval_policy=\"never\"")
         );
-        assert!(
-            review_args
-                .windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "never"])
-        );
+        assert!(!review_args.iter().any(|argument| argument == "--sandbox"));
         assert!(
             !review_args
                 .iter()
-                .any(|argument| argument == "--approve-for-me")
+                .any(|argument| argument == "--ask-for-approval")
         );
         assert_eq!(review_command.as_std().get_envs().count(), 3);
         assert!(
@@ -819,18 +822,85 @@ mod tests {
         assert!(
             operate_args
                 .iter()
-                .any(|argument| argument == "--approve-for-me")
+                .any(|argument| argument == "approval_policy=\"on-request\"")
         );
         assert!(
-            !operate_args
+            operate_args
                 .iter()
-                .any(|argument| argument == "--ask-for-approval")
+                .any(|argument| argument == "approvals_reviewer=\"auto_review\"")
         );
         assert!(
             operate_args
                 .iter()
                 .any(|argument| argument.contains("\":workspace_roots\" = { \".\" = \"write\" }"))
         );
+        assert!(
+            !operate_args
+                .iter()
+                .any(|argument| argument == "--approve-for-me")
+        );
+        assert!(!operate_args.iter().any(|argument| argument == "--sandbox"));
+    }
+
+    #[test]
+    #[ignore = "requires an installed Codex CLI and host sandbox support"]
+    fn real_codex_worker_profile_denies_non_workspace_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let codex_home = temp.path().join("codex-home");
+        let runtime_home = temp.path().join("runtime-home");
+        let host_directory = temp.path().join("host");
+        for directory in [&workspace, &codex_home, &runtime_home, &host_directory] {
+            fs::create_dir(directory).unwrap();
+        }
+
+        let workspace_marker = workspace.join("workspace-marker");
+        let codex_home_marker = codex_home.join("synthetic-codex-home-secret");
+        let host_marker = host_directory.join("synthetic-host-secret");
+        fs::write(&workspace_marker, "workspace marker").unwrap();
+        fs::write(&codex_home_marker, "synthetic secret").unwrap();
+        fs::write(&host_marker, "synthetic secret").unwrap();
+
+        let codex_bin =
+            std::env::var("MAID_CODEX_BIN").unwrap_or_else(|_| resolve_executable("codex"));
+        for access in [CodexExecutionAccess::Inspect, CodexExecutionAccess::Operate] {
+            let policy = CodexPolicy::for_access(access);
+            let mut command = std::process::Command::new(&codex_bin);
+            command
+                .env_clear()
+                .env("HOME", &runtime_home)
+                .env("CODEX_HOME", &codex_home);
+            for config in policy.config_overrides() {
+                command.arg("--config").arg(config);
+            }
+            let output = command
+                .arg("sandbox")
+                .arg("--permission-profile")
+                .arg("maid-task")
+                .arg("--cd")
+                .arg(&workspace)
+                .arg("--")
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(
+                    "/bin/cat \"$1\" >/dev/null 2>&1 && exit 11; \
+                     /bin/cat \"$2\" >/dev/null 2>&1 && exit 12; \
+                     /bin/cat \"$3\" >/dev/null 2>&1 || exit 13",
+                )
+                .arg("sandbox-probe")
+                .arg(&host_marker)
+                .arg(&codex_home_marker)
+                .arg(&workspace_marker)
+                .output()
+                .expect("failed to execute the installed Codex CLI sandbox probe");
+
+            assert!(
+                output.status.success(),
+                "Codex {access:?} sandbox probe failed with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     fn command_arguments(command: &Command) -> Vec<String> {
