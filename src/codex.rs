@@ -40,6 +40,9 @@ pub struct CodexCli {
     task_timeout: Duration,
 }
 
+#[derive(Clone, Debug)]
+pub struct VerifiedCodexCli(CodexCli);
+
 impl CodexCli {
     pub fn new(
         bin: impl Into<String>,
@@ -97,11 +100,124 @@ impl CodexCli {
         self.worker_path = worker_path.into();
         self
     }
+
+    pub fn verify(self) -> Result<VerifiedCodexCli> {
+        self.verify_worker_isolation()?;
+        Ok(VerifiedCodexCli(self))
+    }
+
+    fn verify_worker_isolation(&self) -> Result<()> {
+        create_private_directory(&self.codex_home)?;
+        create_private_directory(&self.runtime_home)?;
+
+        let runtime_home = tempfile::tempdir_in(&self.runtime_home)
+            .context("failed to create isolated Codex verification home")?;
+        let workspace = tempfile::tempdir_in(&self.runtime_home)
+            .context("failed to create Codex verification workspace")?;
+        let workspace_marker = NamedTempFile::new_in(workspace.path())
+            .context("failed to create Codex verification workspace marker")?;
+        let codex_home_marker = NamedTempFile::new_in(&self.codex_home)
+            .context("failed to create Codex home isolation marker")?;
+        let runtime_root_marker = NamedTempFile::new_in(&self.runtime_home)
+            .context("failed to create Codex runtime root isolation marker")?;
+        let runtime_home_marker = NamedTempFile::new_in(runtime_home.path())
+            .context("failed to create Codex runtime home isolation marker")?;
+        let slash_tmp =
+            tempfile::tempdir_in("/tmp").context("failed to create /tmp isolation fixture")?;
+        let slash_tmp_marker = NamedTempFile::new_in(slash_tmp.path())
+            .context("failed to create /tmp isolation marker")?;
+
+        let mut denied_markers = vec![
+            ("codex-home", codex_home_marker.path()),
+            ("runtime-root", runtime_root_marker.path()),
+            ("runtime-home", runtime_home_marker.path()),
+            ("slash-tmp", slash_tmp_marker.path()),
+        ];
+        #[cfg(target_os = "macos")]
+        let private_tmp = tempfile::tempdir_in("/private/tmp")
+            .context("failed to create /private/tmp isolation fixture")?;
+        #[cfg(target_os = "macos")]
+        let private_tmp_marker = NamedTempFile::new_in(private_tmp.path())
+            .context("failed to create /private/tmp isolation marker")?;
+        #[cfg(target_os = "macos")]
+        denied_markers.push(("private-tmp", private_tmp_marker.path()));
+
+        let mut failures = Vec::new();
+        for access in [CodexExecutionAccess::Inspect, CodexExecutionAccess::Operate] {
+            let policy = CodexPolicy::for_access(access);
+            let mut command = std::process::Command::new(&self.bin);
+            command
+                .env_clear()
+                .env("HOME", runtime_home.path())
+                .env("CODEX_HOME", &self.codex_home);
+            for config in policy.config_overrides() {
+                command.arg("--config").arg(config);
+            }
+            command
+                .arg("sandbox")
+                .arg("--permission-profile")
+                .arg("maid-task")
+                .arg("--cd")
+                .arg(workspace.path())
+                .arg("--")
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(
+                    "/bin/cat \"$1\" >/dev/null 2>&1 || exit 20; \
+                     shift; unsafe=0; \
+                     while [ \"$#\" -gt 0 ]; do \
+                       label=\"$1\"; path=\"$2\"; shift 2; \
+                       if /bin/cat \"$path\" >/dev/null 2>&1; then \
+                         printf '%s\\n' \"$label\" >&2; unsafe=1; \
+                       fi; \
+                     done; \
+                     exit \"$unsafe\"",
+                )
+                .arg("sandbox-probe")
+                .arg(workspace_marker.path());
+            for (label, path) in &denied_markers {
+                command.arg(label).arg(path);
+            }
+
+            let output = command
+                .output()
+                .context("failed to start Codex worker isolation probe")?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let exposed = denied_markers
+                .iter()
+                .map(|(label, _)| *label)
+                .filter(|label| stderr.lines().any(|line| line == *label))
+                .collect::<Vec<_>>();
+            if !exposed.is_empty() {
+                failures.push(format!(
+                    "Codex {access:?} worker sandbox could read denied synthetic fixtures: {}",
+                    exposed.join(", ")
+                ));
+            } else if !output.status.success() {
+                failures.push(format!(
+                    "could not verify Codex {access:?} worker isolation ({}): {}",
+                    output.status,
+                    stderr.trim()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(failures.join("; "))
+        }
+    }
 }
 
 #[async_trait]
-impl CodexRunner for CodexCli {
+impl CodexRunner for VerifiedCodexCli {
     async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
+        self.0.run_unverified(worktree, task).await
+    }
+}
+
+impl CodexCli {
+    async fn run_unverified(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
         create_private_directory(&self.codex_home)?;
         create_private_directory(&self.runtime_home)?;
         let runtime_home = tempfile::tempdir_in(&self.runtime_home)
@@ -844,63 +960,70 @@ mod tests {
 
     #[test]
     #[ignore = "requires an installed Codex CLI and host sandbox support"]
-    fn real_codex_worker_profile_denies_non_workspace_reads() {
+    fn real_codex_worker_isolation_is_verified_or_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let codex_home = temp.path().join("codex-home");
-        let runtime_home = temp.path().join("runtime-home");
-        let host_directory = temp.path().join("host");
-        for directory in [&workspace, &codex_home, &runtime_home, &host_directory] {
-            fs::create_dir(directory).unwrap();
-        }
-
-        let workspace_marker = workspace.join("workspace-marker");
-        let codex_home_marker = codex_home.join("synthetic-codex-home-secret");
-        let host_marker = host_directory.join("synthetic-host-secret");
-        fs::write(&workspace_marker, "workspace marker").unwrap();
-        fs::write(&codex_home_marker, "synthetic secret").unwrap();
-        fs::write(&host_marker, "synthetic secret").unwrap();
-
         let codex_bin =
             std::env::var("MAID_CODEX_BIN").unwrap_or_else(|_| resolve_executable("codex"));
-        for access in [CodexExecutionAccess::Inspect, CodexExecutionAccess::Operate] {
-            let policy = CodexPolicy::for_access(access);
-            let mut command = std::process::Command::new(&codex_bin);
-            command
-                .env_clear()
-                .env("HOME", &runtime_home)
-                .env("CODEX_HOME", &codex_home);
-            for config in policy.config_overrides() {
-                command.arg("--config").arg(config);
-            }
-            let output = command
-                .arg("sandbox")
-                .arg("--permission-profile")
-                .arg("maid-task")
-                .arg("--cd")
-                .arg(&workspace)
-                .arg("--")
-                .arg("/bin/sh")
-                .arg("-c")
-                .arg(
-                    "/bin/cat \"$1\" >/dev/null 2>&1 && exit 11; \
-                     /bin/cat \"$2\" >/dev/null 2>&1 && exit 12; \
-                     /bin/cat \"$3\" >/dev/null 2>&1 || exit 13",
-                )
-                .arg("sandbox-probe")
-                .arg(&host_marker)
-                .arg(&codex_home_marker)
-                .arg(&workspace_marker)
-                .output()
-                .expect("failed to execute the installed Codex CLI sandbox probe");
+        let codex = CodexCli::new(
+            codex_bin,
+            temp.path().join("codex-home"),
+            temp.path().join("runtime-home"),
+            "test-model",
+            "low",
+            CodexPromptTemplates {
+                mention: "{{cleaned_text}}".to_string(),
+                pull_request_opened: "{{author}}".to_string(),
+                operator_mention: "{{request_text}}".to_string(),
+            },
+        );
 
+        if let Err(error) = codex.verify_worker_isolation() {
+            let error = error.to_string();
             assert!(
-                output.status.success(),
-                "Codex {access:?} sandbox probe failed with {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
+                error.contains("could read denied synthetic fixtures"),
+                "{error}"
             );
+            assert!(error.contains("Codex Inspect"), "{error}");
+            assert!(error.contains("Codex Operate"), "{error}");
+            assert!(error.contains("slash-tmp"), "{error}");
+            #[cfg(target_os = "macos")]
+            assert!(error.contains("private-tmp"), "{error}");
+            eprintln!("{error}");
         }
+    }
+
+    #[test]
+    fn verification_rejects_a_worker_that_can_read_denied_fixtures() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("fake-codex");
+        fs::write(
+            &bin,
+            "#!/bin/sh\nprintf 'codex-home\\nruntime-home\\nslash-tmp\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&bin, permissions).unwrap();
+        let codex = CodexCli::new(
+            bin.display().to_string(),
+            temp.path().join("codex-home"),
+            temp.path().join("runtime-home"),
+            "test-model",
+            "low",
+            CodexPromptTemplates {
+                mention: "{{cleaned_text}}".to_string(),
+                pull_request_opened: "{{author}}".to_string(),
+                operator_mention: "{{request_text}}".to_string(),
+            },
+        );
+
+        let error = codex.verify().unwrap_err().to_string();
+        assert!(error.contains("Codex Inspect"));
+        assert!(error.contains("Codex Operate"));
+        assert!(error.contains("could read denied synthetic fixtures"));
+        assert!(error.contains("codex-home"));
+        assert!(error.contains("runtime-home"));
+        assert!(error.contains("slash-tmp"));
     }
 
     fn command_arguments(command: &Command) -> Vec<String> {
@@ -942,7 +1065,7 @@ mod tests {
             },
         };
 
-        let error = codex.run(temp.path(), &task).await.unwrap_err();
+        let error = codex.run_unverified(temp.path(), &task).await.unwrap_err();
         assert!(error.to_string().contains("time limit"));
     }
 
@@ -996,10 +1119,13 @@ exit 0
             },
         };
 
-        let run = timeout(Duration::from_secs(3), codex.run(temp.path(), &task))
-            .await
-            .expect("Codex run should not wait for inherited stdout forever")
-            .unwrap();
+        let run = timeout(
+            Duration::from_secs(3),
+            codex.run_unverified(temp.path(), &task),
+        )
+        .await
+        .expect("Codex run should not wait for inherited stdout forever")
+        .unwrap();
 
         assert_eq!(run.response, "file final");
         assert_eq!(run.session_id.as_deref(), Some("session-1"));
@@ -1053,10 +1179,13 @@ sleep 5
             },
         };
 
-        let run = timeout(Duration::from_secs(6), codex.run(temp.path(), &task))
-            .await
-            .expect("Codex run should not wait forever after task completion")
-            .unwrap();
+        let run = timeout(
+            Duration::from_secs(6),
+            codex.run_unverified(temp.path(), &task),
+        )
+        .await
+        .expect("Codex run should not wait forever after task completion")
+        .unwrap();
 
         assert_eq!(run.response, "file final");
         assert_eq!(run.session_id.as_deref(), Some("session-1"));
@@ -1109,10 +1238,13 @@ python3 -c 'import sys, time; output_path = sys.argv[1]; print("{\"type\":\"thre
             },
         };
 
-        let run = timeout(Duration::from_secs(3), codex.run(temp.path(), &task))
-            .await
-            .expect("Codex run should wait for ordinary graceful exit after completion")
-            .unwrap();
+        let run = timeout(
+            Duration::from_secs(3),
+            codex.run_unverified(temp.path(), &task),
+        )
+        .await
+        .expect("Codex run should wait for ordinary graceful exit after completion")
+        .unwrap();
 
         assert_eq!(run.response, "file final after graceful exit");
         assert_eq!(run.session_id.as_deref(), Some("session-1"));

@@ -43,7 +43,8 @@ async fn main() -> Result<()> {
             config.codex_reasoning_effort.clone(),
             config.codex_prompts.clone(),
         )
-        .with_worker_path(config.codex_worker_path.clone()),
+        .with_worker_path(config.codex_worker_path.clone())
+        .verify()?,
         config.bot_login.clone(),
         config.master_accounts.clone(),
         config.auto_review_accounts.clone(),

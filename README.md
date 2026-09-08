@@ -67,7 +67,10 @@ approval.
 
 Workers receive a clean environment, a dedicated home and Codex auth home, no
 shell network access by default, an explicit command search path, and no
-user/project rules or user config. Maid
+user/project rules or user config. At startup, Maid runs the configured Codex
+sandbox against synthetic markers in its auth/runtime directories and the host
+temporary directories (`/tmp` and `/private/tmp` on macOS); it refuses to start
+unless both review and operator profiles deny those reads. Maid
 also caps task wall time and captured output, applies Unix CPU, file-size,
 descriptor, and core-dump limits (plus address-space limits where supported),
 and kills the worker process group
