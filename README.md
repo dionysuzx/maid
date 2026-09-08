@@ -3,7 +3,7 @@
 Maid is a smol bot that runs local Codex on GitHub events.
 
 It watches for opened PRs and issue or PR mentions to your configured GitHub bot account
-(a "maid), checks that the request came from a trusted master account, prepares
+(a "maid"), checks that the request came from a trusted master account, prepares
 an isolated worktree, runs `codex`, and posts Codex's final answer back as a
 comment. It can also run automatic reviews for configured repositories or for
 configured accounts across all public repositories, and trusted users can
@@ -52,7 +52,21 @@ just update
 Runtime config lives at `~/.maid/config.toml`. Run `just config` to edit it, and
 use [config.example.toml](config.example.toml) as the configuration reference.
 
-Set `auto_review_public_accounts` to trusted GitHub logins whose open pull
+Trusted masters must be configured with their immutable numeric GitHub user ID:
+
+```toml
+master_accounts = [{ login = "your-name", id = 123456789 }]
+```
+
+Find the ID with `gh api users/your-name --jq .id`. If upgrading from the old
+string-list format, replace every login string with a `{ login, id }` record
+before restarting Maid. Maid refuses missing, zero, duplicate, or conflicting
+trusted identities. Authorization uses only the ID returned on each GitHub
+comment or pull request, so renames remain trusted while a reclaimed login does
+not inherit authority. The configured login remains a display and public-PR
+discovery hint; update it after a rename without changing the ID.
+
+Set `auto_review_public_accounts` to master-account logins whose open pull
 requests Maid should discover across GitHub. Maid ignores PRs into private base
 repositories. Repository-scoped review remains available through
 `auto_review_repos` and `auto_review_accounts`.

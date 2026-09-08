@@ -3,8 +3,8 @@ use crate::auto_review::{
     plan_auto_review,
 };
 use crate::domain::{
-    CodexTask, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug, ReviewState,
-    WorkTarget,
+    CodexTask, CommentMention, GitHubUserId, MentionRequest, Notification, PullRequest, RepoSlug,
+    ReviewState, TrustedAccount, WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -98,9 +98,9 @@ pub struct Maid<G, R, C> {
     worktrees: R,
     codex: C,
     bot_login: String,
-    master_accounts: HashSet<String>,
-    auto_review_accounts: HashSet<String>,
-    auto_review_public_accounts: HashSet<String>,
+    master_account_ids: HashSet<GitHubUserId>,
+    auto_review_account_ids: HashSet<GitHubUserId>,
+    auto_review_public_accounts: Vec<TrustedAccount>,
     auto_review_repos: Vec<RepoSlug>,
     task_starts: Arc<dyn TaskStartRecorder>,
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
@@ -110,7 +110,7 @@ pub struct Maid<G, R, C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AutoReviewSource {
     Repository,
-    PublicAuthor { login: String },
+    PublicAuthor { account: TrustedAccount },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,27 +127,19 @@ impl AutoReviewCandidate {
         }
     }
 
-    fn public_author(pr: PullRequest, login: &str) -> Self {
+    fn public_author(pr: PullRequest, account: &TrustedAccount) -> Self {
         Self {
             pr,
             source: AutoReviewSource::PublicAuthor {
-                login: login.to_string(),
+                account: account.clone(),
             },
         }
     }
 
-    fn has_allowed_author(
-        &self,
-        repository_accounts: &HashSet<String>,
-        public_accounts: &HashSet<String>,
-    ) -> bool {
+    fn has_allowed_author(&self, repository_account_ids: &HashSet<GitHubUserId>) -> bool {
         match &self.source {
-            AutoReviewSource::Repository => {
-                repository_accounts.contains(&self.pr.author.to_ascii_lowercase())
-            }
-            AutoReviewSource::PublicAuthor { login } => {
-                public_accounts.contains(login) && self.pr.author.eq_ignore_ascii_case(login)
-            }
+            AutoReviewSource::Repository => repository_account_ids.contains(&self.pr.author_id),
+            AutoReviewSource::PublicAuthor { account } => account.id == self.pr.author_id,
         }
     }
 }
@@ -173,8 +165,8 @@ where
         worktrees: R,
         codex: C,
         bot_login: impl Into<String>,
-        master_accounts: impl IntoIterator<Item = impl Into<String>>,
-        auto_review_accounts: impl IntoIterator<Item = impl Into<String>>,
+        master_accounts: impl IntoIterator<Item = TrustedAccount>,
+        auto_review_accounts: impl IntoIterator<Item = TrustedAccount>,
         auto_review_repos: impl IntoIterator<Item = RepoSlug>,
     ) -> Self {
         Self {
@@ -182,9 +174,9 @@ where
             worktrees,
             codex,
             bot_login: bot_login.into(),
-            master_accounts: normalized_logins(master_accounts),
-            auto_review_accounts: normalized_logins(auto_review_accounts),
-            auto_review_public_accounts: HashSet::new(),
+            master_account_ids: account_ids(master_accounts),
+            auto_review_account_ids: account_ids(auto_review_accounts),
+            auto_review_public_accounts: Vec::new(),
             auto_review_repos: auto_review_repos.into_iter().collect(),
             task_starts: Arc::new(NoTaskLimit),
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
@@ -194,9 +186,9 @@ where
 
     pub fn with_public_auto_review_accounts(
         mut self,
-        accounts: impl IntoIterator<Item = impl Into<String>>,
+        accounts: impl IntoIterator<Item = TrustedAccount>,
     ) -> Self {
-        self.auto_review_public_accounts = normalized_logins(accounts);
+        self.auto_review_public_accounts = accounts.into_iter().collect();
         self
     }
 
@@ -482,10 +474,7 @@ where
             return Ok(None);
         }
 
-        if !self
-            .master_accounts
-            .contains(&mention.author.to_ascii_lowercase())
-        {
+        if !self.master_account_ids.contains(&mention.author_id) {
             info!(
                 notification_id = notification.id,
                 mention = %mention.html_url,
@@ -596,10 +585,7 @@ where
         &self,
         latest: &CommentMention,
     ) -> Result<MentionThreadRead> {
-        if !self
-            .master_accounts
-            .contains(&latest.author.to_ascii_lowercase())
-        {
+        if !self.master_account_ids.contains(&latest.author_id) {
             return Ok(choose_mention_thread_read(
                 latest,
                 None,
@@ -644,10 +630,7 @@ where
         let author = classify_auto_review_author(
             pr,
             &self.bot_login,
-            candidate.has_allowed_author(
-                &self.auto_review_accounts,
-                &self.auto_review_public_accounts,
-            ),
+            candidate.has_allowed_author(&self.auto_review_account_ids),
         );
         if author != AutoReviewAuthor::Allowed {
             return Ok(AutoReviewObservation::new(pr.clone(), author, None, false));
@@ -674,22 +657,21 @@ where
             }
         }
 
-        let mut authors = self.auto_review_public_accounts.iter().collect::<Vec<_>>();
-        authors.sort_unstable();
-        for author in authors {
+        let mut accounts = self.auto_review_public_accounts.iter().collect::<Vec<_>>();
+        accounts.sort_unstable_by(|left, right| left.login.cmp(&right.login));
+        for account in accounts {
             for pr in self
                 .github
-                .open_public_pull_requests_by_author(author)
+                .open_public_pull_requests_by_author(&account.login)
                 .await?
             {
-                candidates.push(AutoReviewCandidate::public_author(pr, author));
+                candidates.push(AutoReviewCandidate::public_author(pr, account));
             }
         }
 
         Ok(deduplicate_auto_review_candidates(
             candidates,
-            &self.auto_review_accounts,
-            &self.auto_review_public_accounts,
+            &self.auto_review_account_ids,
         ))
     }
 
@@ -1280,18 +1262,13 @@ fn is_permanent_pending_marker_error(err: &anyhow::Error) -> bool {
     })
 }
 
-fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> HashSet<String> {
-    logins
-        .into_iter()
-        .map(|login| login.into().trim().to_ascii_lowercase())
-        .filter(|login| !login.is_empty())
-        .collect()
+fn account_ids(accounts: impl IntoIterator<Item = TrustedAccount>) -> HashSet<GitHubUserId> {
+    accounts.into_iter().map(|account| account.id).collect()
 }
 
 fn deduplicate_auto_review_candidates(
     candidates: Vec<AutoReviewCandidate>,
-    repository_accounts: &HashSet<String>,
-    public_accounts: &HashSet<String>,
+    repository_account_ids: &HashSet<GitHubUserId>,
 ) -> Vec<AutoReviewCandidate> {
     let mut deduplicated = Vec::<AutoReviewCandidate>::new();
     let mut index_by_url = HashMap::<String, usize>::new();
@@ -1300,8 +1277,8 @@ fn deduplicate_auto_review_candidates(
         let key = candidate.pr.html_url.to_ascii_lowercase();
         if let Some(index) = index_by_url.get(&key).copied() {
             let existing = &deduplicated[index];
-            if !existing.has_allowed_author(repository_accounts, public_accounts)
-                && candidate.has_allowed_author(repository_accounts, public_accounts)
+            if !existing.has_allowed_author(repository_account_ids)
+                && candidate.has_allowed_author(repository_account_ids)
             {
                 deduplicated[index] = candidate;
             }
@@ -1710,6 +1687,7 @@ mod tests {
             repo: "r".to_string(),
             number,
             author: author.to_string(),
+            author_id: test_user_id(author),
             api_url: format!("https://api.github.com/repos/o/r/pulls/{number}"),
             html_url: format!("https://github.com/o/r/pull/{number}"),
             clone_url: "https://github.com/o/r.git".to_string(),
@@ -1722,6 +1700,7 @@ mod tests {
             repo: "r".to_string(),
             number: 322,
             author: "external".to_string(),
+            author_id: test_user_id("external"),
             api_url: "https://api.github.com/repos/o/r/issues/322".to_string(),
             html_url: "https://github.com/o/r/issues/322".to_string(),
             clone_url: "https://github.com/o/r.git".to_string(),
@@ -1736,6 +1715,7 @@ mod tests {
     fn mention_with_comment(author: &str, body: &str, comment_id: &str) -> CommentMention {
         CommentMention {
             author: author.to_string(),
+            author_id: test_user_id(author),
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
             html_url: format!("https://github.com/o/r/pull/1#issuecomment-{comment_id}"),
@@ -1746,6 +1726,7 @@ mod tests {
     fn issue_mention(author: &str, body: &str, comment_id: &str) -> CommentMention {
         CommentMention {
             author: author.to_string(),
+            author_id: test_user_id(author),
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
             html_url: format!("https://github.com/o/r/issues/322#issuecomment-{comment_id}"),
@@ -1756,10 +1737,28 @@ mod tests {
     fn review_mention(author: &str, body: &str, comment_id: &str) -> CommentMention {
         CommentMention {
             author: author.to_string(),
+            author_id: test_user_id(author),
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/pulls/comments/{comment_id}"),
             html_url: format!("https://github.com/o/r/pull/1#discussion_r{comment_id}"),
             target: WorkTarget::PullRequest(pr()),
+        }
+    }
+
+    fn test_user_id(login: &str) -> GitHubUserId {
+        let value = login
+            .to_ascii_lowercase()
+            .bytes()
+            .fold(1_u64, |value, byte| {
+                value.wrapping_mul(31).wrapping_add(u64::from(byte))
+            });
+        GitHubUserId::new(value).unwrap()
+    }
+
+    fn trusted_account(login: &str) -> TrustedAccount {
+        TrustedAccount {
+            login: login.to_ascii_lowercase(),
+            id: test_user_id(login),
         }
     }
 
@@ -1776,8 +1775,8 @@ mod tests {
             worktrees,
             codex,
             "maid-bot",
-            ["dionysuzx"],
-            ["dionysuzx"],
+            [trusted_account("dionysuzx")],
+            [trusted_account("dionysuzx")],
             [RepoSlug {
                 owner: "o".to_string(),
                 repo: "r".to_string(),
@@ -2046,6 +2045,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_review_authorization_survives_login_rename() {
+        let github = FakeGithub::default();
+        let mut renamed = pr_with_author("renamed-master");
+        renamed.author_id = test_user_id("dionysuzx");
+        *github.pull_requests.lock().unwrap() = vec![renamed];
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/maid-test-worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+
+        let report = maid(github.clone(), worktrees, FakeCodex::default())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
+    }
+
+    #[tokio::test]
+    async fn auto_review_rejects_reclaimed_login_with_different_id() {
+        let github = FakeGithub::default();
+        let mut reclaimed = pr();
+        reclaimed.author_id = test_user_id("attacker");
+        *github.pull_requests.lock().unwrap() = vec![reclaimed];
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.pr_state_calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn responds_to_public_pr_discovered_by_author() {
         let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
@@ -2062,14 +2106,14 @@ mod tests {
             worktrees.clone(),
             codex.clone(),
             "maid-bot",
-            ["dionysuzx"],
-            Vec::<String>::new(),
+            [trusted_account("dionysuzx")],
+            Vec::<TrustedAccount>::new(),
             [RepoSlug {
                 owner: "configured".to_string(),
                 repo: "repo".to_string(),
             }],
         )
-        .with_public_auto_review_accounts(["Dionysuzx"])
+        .with_public_auto_review_accounts([trusted_account("Dionysuzx")])
         .run_once()
         .await
         .unwrap();
@@ -2093,6 +2137,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_discovery_does_not_trust_a_reclaimed_login() {
+        let github = FakeGithub::default();
+        let mut reclaimed = pr();
+        reclaimed.author_id = test_user_id("attacker");
+        *github.public_pull_requests.lock().unwrap() = vec![reclaimed];
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = Maid::new(
+            github.clone(),
+            worktrees.clone(),
+            codex.clone(),
+            "maid-bot",
+            [trusted_account("dionysuzx")],
+            Vec::<TrustedAccount>::new(),
+            Vec::<RepoSlug>::new(),
+        )
+        .with_public_auto_review_accounts([trusted_account("dionysuzx")])
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.pr_state_calls.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn reviews_pr_discovered_by_repo_and_author_only_once() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
@@ -2109,14 +2186,14 @@ mod tests {
             worktrees,
             codex,
             "maid-bot",
-            ["dionysuzx"],
-            Vec::<String>::new(),
+            [trusted_account("dionysuzx")],
+            Vec::<TrustedAccount>::new(),
             [RepoSlug {
                 owner: "o".to_string(),
                 repo: "r".to_string(),
             }],
         )
-        .with_public_auto_review_accounts(["dionysuzx"])
+        .with_public_auto_review_accounts([trusted_account("dionysuzx")])
         .run_once()
         .await
         .unwrap();
@@ -2142,14 +2219,17 @@ mod tests {
             worktrees,
             codex,
             "maid-bot",
-            ["repo-author", "public-author"],
-            ["repo-author"],
+            [
+                trusted_account("repo-author"),
+                trusted_account("public-author"),
+            ],
+            [trusted_account("repo-author")],
             [RepoSlug {
                 owner: "private".to_string(),
                 repo: "repo".to_string(),
             }],
         )
-        .with_public_auto_review_accounts(["public-author"])
+        .with_public_auto_review_accounts([trusted_account("public-author")])
         .run_once()
         .await
         .unwrap();
@@ -2594,10 +2674,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn master_account_matching_is_case_insensitive() {
+    async fn renamed_master_account_keeps_authority_by_id() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() = Some(Ok(Some(mention("Dionysuzx", "@maid-bot review"))));
+        let mut request = mention("renamed-master", "@maid-bot /operate inspect");
+        request.author_id = test_user_id("dionysuzx");
+        *github.mention.lock().unwrap() = Some(Ok(Some(request)));
         let worktrees = FakeWorktrees {
             worktree: PathBuf::from("/tmp/worktree"),
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -2612,6 +2694,31 @@ mod tests {
 
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
+    }
+
+    #[tokio::test]
+    async fn reclaimed_master_login_does_not_inherit_authority() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        let mut request = mention("dionysuzx", "@maid-bot /operate inspect");
+        request.author_id = test_user_id("attacker");
+        *github.mention.lock().unwrap() = Some(Ok(Some(request)));
+        let worktrees = FakeWorktrees {
+            worktree: PathBuf::from("/tmp/unused"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
+        };
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert!(worktrees.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

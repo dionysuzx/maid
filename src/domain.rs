@@ -3,6 +3,28 @@ use std::fmt;
 
 pub const OPERATOR_TRIGGER: &str = "/operate";
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GitHubUserId(u64);
+
+impl GitHubUserId {
+    pub fn new(value: u64) -> Result<Self> {
+        if value == 0 {
+            return Err(anyhow!("GitHub user ID must be greater than zero"));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TrustedAccount {
+    pub login: String,
+    pub id: GitHubUserId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Notification {
     pub id: String,
@@ -65,6 +87,7 @@ pub struct PullRequest {
     pub repo: String,
     pub number: u64,
     pub author: String,
+    pub author_id: GitHubUserId,
     pub api_url: String,
     pub html_url: String,
     pub clone_url: String,
@@ -82,6 +105,7 @@ pub struct Issue {
     pub repo: String,
     pub number: u64,
     pub author: String,
+    pub author_id: GitHubUserId,
     pub api_url: String,
     pub html_url: String,
     pub clone_url: String,
@@ -158,6 +182,7 @@ impl WorkTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommentMention {
     pub author: String,
+    pub author_id: GitHubUserId,
     pub body: String,
     pub api_url: String,
     pub html_url: String,

@@ -1,6 +1,8 @@
 # Required.
 bot_login = "maid-bot"
-master_accounts = ["your-name"]
+# Numeric IDs are the authority boundary; login is only a display/discovery hint.
+# Find an ID with: gh api users/your-name --jq .id. Zero is rejected.
+master_accounts = [{ login = "your-name", id = 0 }]
 
 # Optional. Defaults to master_accounts when omitted.
 auto_review_accounts = ["your-name"]

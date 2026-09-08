@@ -173,7 +173,7 @@ fn mention_task_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{PullRequest, WorkTarget};
+    use crate::domain::{GitHubUserId, PullRequest, WorkTarget};
 
     #[test]
     fn handled_latest_trusted_request_does_not_scan_old_comments() {
@@ -288,6 +288,7 @@ mod tests {
     fn mention(author: &str, body: &str, comment_id: &str) -> CommentMention {
         CommentMention {
             author: author.to_string(),
+            author_id: GitHubUserId::new(1).unwrap(),
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
             html_url: format!("https://github.com/o/r/pull/1#issuecomment-{comment_id}"),
@@ -296,6 +297,7 @@ mod tests {
                 repo: "r".to_string(),
                 number: 1,
                 author: "contributor".to_string(),
+                author_id: GitHubUserId::new(2).unwrap(),
                 api_url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
                 html_url: "https://github.com/o/r/pull/1".to_string(),
                 clone_url: "https://github.com/o/r.git".to_string(),

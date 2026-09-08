@@ -1,6 +1,6 @@
 use crate::{
     codex::DEFAULT_WORKER_PATH,
-    domain::{CodexPromptTemplates, RepoSlug},
+    domain::{CodexPromptTemplates, GitHubUserId, RepoSlug, TrustedAccount},
     github::{
         DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
         GitHubApiRequestRate, GitHubNotificationWindow,
@@ -19,9 +19,9 @@ use std::{
 pub struct Config {
     pub github_token: String,
     pub bot_login: String,
-    pub master_accounts: Vec<String>,
-    pub auto_review_accounts: Vec<String>,
-    pub auto_review_public_accounts: Vec<String>,
+    pub master_accounts: Vec<TrustedAccount>,
+    pub auto_review_accounts: Vec<TrustedAccount>,
+    pub auto_review_public_accounts: Vec<TrustedAccount>,
     pub auto_review_repos: Vec<RepoSlug>,
     pub git_dir: PathBuf,
     pub daemon_pid_path: PathBuf,
@@ -54,26 +54,23 @@ impl Config {
                 config_path.display()
             )
         })?;
-        let master_accounts = required_logins(file.master_accounts, "master_accounts")
+        let master_accounts = required_accounts(file.master_accounts, "master_accounts")
             .with_context(|| format!("master_accounts is required in {}", config_path.display()))?;
-        let auto_review_accounts =
-            optional_logins(file.auto_review_accounts, "auto_review_accounts")?
-                .unwrap_or_else(|| master_accounts.clone());
-        require_subset(
-            &auto_review_accounts,
+        let auto_review_accounts = select_accounts(
+            optional_logins(file.auto_review_accounts, "auto_review_accounts")?,
             &master_accounts,
             "auto_review_accounts",
-        )?;
-        let auto_review_public_accounts = optional_logins(
-            file.auto_review_public_accounts,
+        )?
+        .unwrap_or_else(|| master_accounts.clone());
+        let auto_review_public_accounts = select_accounts(
+            optional_logins(
+                file.auto_review_public_accounts,
+                "auto_review_public_accounts",
+            )?,
+            &master_accounts,
             "auto_review_public_accounts",
         )?
         .unwrap_or_default();
-        require_subset(
-            &auto_review_public_accounts,
-            &master_accounts,
-            "auto_review_public_accounts",
-        )?;
         let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
         let git_dir = non_empty(file.git_dir)
             .map(|path| expand_home(&path))
@@ -162,7 +159,7 @@ impl Config {
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     bot_login: Option<String>,
-    master_accounts: Option<Vec<String>>,
+    master_accounts: Option<Vec<TrustedAccountFile>>,
     auto_review_accounts: Option<Vec<String>>,
     auto_review_public_accounts: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
@@ -179,6 +176,12 @@ struct ConfigFile {
     codex_prompts: Option<CodexPromptsFile>,
     github_api_ip: Option<String>,
     metrics_bind_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+struct TrustedAccountFile {
+    login: String,
+    id: u64,
 }
 
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
@@ -223,17 +226,37 @@ fn required_string(value: Option<String>, key: &str) -> Result<String> {
     non_empty(value).ok_or_else(|| anyhow!("{key} must not be empty"))
 }
 
-fn required_logins(value: Option<Vec<String>>, key: &str) -> Result<Vec<String>> {
-    let Some(raw_logins) = value else {
-        bail!("{key} must list at least one GitHub login");
+fn required_accounts(
+    value: Option<Vec<TrustedAccountFile>>,
+    key: &str,
+) -> Result<Vec<TrustedAccount>> {
+    let Some(raw_accounts) = value else {
+        bail!("{key} must list at least one {{ login, id }} GitHub identity");
     };
-
-    let logins = normalize_logins(raw_logins, key)?;
-    if logins.is_empty() {
-        bail!("{key} must list at least one GitHub login");
+    if raw_accounts.is_empty() {
+        bail!("{key} must list at least one {{ login, id }} GitHub identity");
     }
 
-    Ok(logins)
+    let mut accounts = Vec::new();
+    for account in raw_accounts {
+        let login = account.login.trim().to_ascii_lowercase();
+        if login.is_empty() {
+            bail!("{key} cannot contain an empty GitHub login");
+        }
+        let id = GitHubUserId::new(account.id).with_context(|| format!("invalid {key} ID"))?;
+        if let Some(existing) = accounts
+            .iter()
+            .find(|existing: &&TrustedAccount| existing.login == login || existing.id == id)
+        {
+            bail!(
+                "{key} contains a duplicate or conflicting GitHub identity: {} ({})",
+                existing.login,
+                existing.id.get()
+            );
+        }
+        accounts.push(TrustedAccount { login, id });
+    }
+    Ok(accounts)
 }
 
 fn optional_logins(value: Option<Vec<String>>, key: &str) -> Result<Option<Vec<String>>> {
@@ -257,13 +280,25 @@ fn optional_repos(value: Option<Vec<String>>, key: &str) -> Result<Vec<RepoSlug>
     Ok(repos)
 }
 
-fn require_subset(logins: &[String], trusted_logins: &[String], key: &str) -> Result<()> {
+fn select_accounts(
+    logins: Option<Vec<String>>,
+    trusted_accounts: &[TrustedAccount],
+    key: &str,
+) -> Result<Option<Vec<TrustedAccount>>> {
+    let Some(logins) = logins else {
+        return Ok(None);
+    };
+    let mut selected = Vec::new();
     for login in logins {
-        if !trusted_logins.contains(login) {
+        let Some(account) = trusted_accounts
+            .iter()
+            .find(|account| account.login == login)
+        else {
             bail!("{key} must be a subset of master_accounts: {login}");
-        }
+        };
+        selected.push(account.clone());
     }
-    Ok(())
+    Ok(Some(selected))
 }
 
 fn required_codex_prompts(value: Option<CodexPromptsFile>) -> Result<CodexPromptTemplates> {
@@ -389,7 +424,7 @@ mod tests {
             file,
             r#"
 bot_login = "maid-bot"
-master_accounts = ["dionysuzx"]
+master_accounts = [{{ login = "dionysuzx", id = 1234 }}]
 auto_review_accounts = ["dionysuzx"]
 auto_review_public_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
@@ -417,7 +452,13 @@ operator_mention = "operator {{{{request_text}}}}"
         let config = ConfigFile::read(file.path()).unwrap();
 
         assert_eq!(config.bot_login.as_deref(), Some("maid-bot"));
-        assert_eq!(config.master_accounts, Some(vec!["dionysuzx".to_string()]));
+        assert_eq!(
+            config.master_accounts,
+            Some(vec![TrustedAccountFile {
+                login: "dionysuzx".to_string(),
+                id: 1234,
+            }])
+        );
         assert_eq!(
             config.auto_review_accounts,
             Some(vec!["dionysuzx".to_string()])
@@ -543,23 +584,118 @@ operator_mention = "operator {{{{request_text}}}}"
     }
 
     #[test]
-    fn validates_required_login_lists() {
+    fn validates_required_trusted_accounts() {
         assert_eq!(
-            required_logins(
+            required_accounts(
                 Some(vec![
-                    "  Dionysuzx  ".to_string(),
-                    "dionysuzx".to_string(),
-                    "mayushii-admin".to_string()
+                    TrustedAccountFile {
+                        login: "  Dionysuzx  ".to_string(),
+                        id: 1234,
+                    },
+                    TrustedAccountFile {
+                        login: "mayushii-admin".to_string(),
+                        id: 5678,
+                    },
                 ]),
                 "master_accounts"
             )
             .unwrap(),
-            vec!["dionysuzx".to_string(), "mayushii-admin".to_string()]
+            vec![
+                TrustedAccount {
+                    login: "dionysuzx".to_string(),
+                    id: GitHubUserId::new(1234).unwrap(),
+                },
+                TrustedAccount {
+                    login: "mayushii-admin".to_string(),
+                    id: GitHubUserId::new(5678).unwrap(),
+                },
+            ]
         );
 
-        assert!(required_logins(None, "master_accounts").is_err());
-        assert!(required_logins(Some(Vec::new()), "master_accounts").is_err());
-        assert!(required_logins(Some(vec![" ".to_string()]), "master_accounts").is_err());
+        assert!(required_accounts(None, "master_accounts").is_err());
+        assert!(required_accounts(Some(Vec::new()), "master_accounts").is_err());
+        assert!(
+            required_accounts(
+                Some(vec![TrustedAccountFile {
+                    login: " ".to_string(),
+                    id: 1,
+                }]),
+                "master_accounts"
+            )
+            .is_err()
+        );
+        assert!(
+            required_accounts(
+                Some(vec![TrustedAccountFile {
+                    login: "trusted".to_string(),
+                    id: 0,
+                }]),
+                "master_accounts"
+            )
+            .is_err()
+        );
+        assert!(
+            required_accounts(
+                Some(vec![
+                    TrustedAccountFile {
+                        login: "trusted".to_string(),
+                        id: 1,
+                    },
+                    TrustedAccountFile {
+                        login: "trusted".to_string(),
+                        id: 2,
+                    },
+                ]),
+                "master_accounts"
+            )
+            .is_err()
+        );
+        assert!(
+            required_accounts(
+                Some(vec![
+                    TrustedAccountFile {
+                        login: "trusted".to_string(),
+                        id: 1,
+                    },
+                    TrustedAccountFile {
+                        login: "trusted".to_string(),
+                        id: 1,
+                    },
+                ]),
+                "master_accounts"
+            )
+            .is_err()
+        );
+        assert!(
+            required_accounts(
+                Some(vec![
+                    TrustedAccountFile {
+                        login: "trusted".to_string(),
+                        id: 1,
+                    },
+                    TrustedAccountFile {
+                        login: "other".to_string(),
+                        id: 1,
+                    },
+                ]),
+                "master_accounts"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn trusted_identity_is_explicit_and_stable_across_config_reloads() {
+        let source = r#"master_accounts = [{ login = "OldLogin", id = 1234 }]"#;
+
+        let first: ConfigFile = toml::from_str(source).unwrap();
+        let second: ConfigFile = toml::from_str(source).unwrap();
+        let first = required_accounts(first.master_accounts, "master_accounts").unwrap();
+        let second = required_accounts(second.master_accounts, "master_accounts").unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first[0].id, GitHubUserId::new(1234).unwrap());
+        assert!(toml::from_str::<ConfigFile>(r#"master_accounts = ["old-login"]"#).is_err());
     }
 
     #[test]
@@ -609,19 +745,22 @@ operator_mention = "operator {{{{request_text}}}}"
 
     #[test]
     fn auto_review_accounts_must_be_trusted() {
-        let masters = vec!["dionysuzx".to_string()];
+        let masters = vec![TrustedAccount {
+            login: "dionysuzx".to_string(),
+            id: GitHubUserId::new(1234).unwrap(),
+        }];
 
         assert!(
-            require_subset(
-                &["dionysuzx".to_string()],
+            select_accounts(
+                Some(vec!["dionysuzx".to_string()]),
                 &masters,
                 "auto_review_public_accounts"
             )
             .is_ok()
         );
         assert_eq!(
-            require_subset(
-                &["untrusted".to_string()],
+            select_accounts(
+                Some(vec!["untrusted".to_string()]),
                 &masters,
                 "auto_review_public_accounts"
             )

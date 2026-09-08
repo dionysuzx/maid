@@ -281,7 +281,7 @@ fn stable_hash(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Issue, PullRequest};
+    use crate::domain::{GitHubUserId, Issue, PullRequest};
     use std::process::Command as StdCommand;
 
     fn pr(owner: &str, repo: &str) -> PullRequest {
@@ -290,6 +290,7 @@ mod tests {
             repo: repo.to_string(),
             number: 46,
             author: "author".to_string(),
+            author_id: GitHubUserId::new(1).unwrap(),
             api_url: "https://api.github.com/repos/o/r/pulls/46".to_string(),
             html_url: "https://github.com/o/r/pull/46".to_string(),
             clone_url: "https://untrusted.invalid/repo.git".to_string(),
@@ -302,6 +303,7 @@ mod tests {
             repo: repo.to_string(),
             number: 322,
             author: "author".to_string(),
+            author_id: GitHubUserId::new(1).unwrap(),
             api_url: "https://api.github.com/repos/o/r/issues/322".to_string(),
             html_url: "https://github.com/o/r/issues/322".to_string(),
             clone_url: "https://untrusted.invalid/repo.git".to_string(),
