@@ -1,6 +1,6 @@
 use anyhow::Result;
 use maid::{
-    codex::CodexCli,
+    codex::CodexWorker,
     config::Config,
     daemon_lock::DaemonLock,
     github::GitHubRestClient,
@@ -35,16 +35,12 @@ async fn main() -> Result<()> {
             config.github_notification_window,
         ),
         GitWorktrees::new(config.git_dir.clone(), config.github_token.clone()),
-        CodexCli::with_options(
-            config.codex_bin.clone(),
+        CodexWorker::new(
             config.codex_home.clone(),
-            config.codex_runtime_home.clone(),
             config.codex_model.clone(),
             config.codex_reasoning_effort.clone(),
             config.codex_prompts.clone(),
-        )
-        .with_worker_path(config.codex_worker_path.clone())
-        .verify()?,
+        ),
         config.bot_login.clone(),
         config.master_accounts.clone(),
         config.auto_review_accounts.clone(),

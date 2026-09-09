@@ -1,3 +1,4 @@
 /target
+.worker-fixture.*
 .env
 .env.*

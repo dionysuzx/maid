@@ -20,6 +20,24 @@ test:
 
 check: fmt clippy test
 
+worker-image:
+    docker build --file Dockerfile.worker --tag maid-codex-worker:0.153.4 .
+
+worker-login: worker-image
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{maid_home}}/codex"
+    chmod 700 "{{maid_home}}/codex"
+    docker run --rm --interactive --tty --read-only \
+      --user "$(id -u):$(id -g)" \
+      --env HOME=/tmp --env CODEX_HOME=/run/maid/codex \
+      --mount "type=bind,src={{maid_home}}/codex,dst=/run/maid/codex" \
+      --tmpfs "/tmp:rw,nosuid,nodev,noexec,size=16m,uid=$(id -u),gid=$(id -g),mode=700" \
+      maid-codex-worker:0.153.4 login
+
+verify-worker: worker-image
+    bash scripts/verify-worker-isolation.sh maid-codex-worker:0.153.4
+
 init:
     #!/usr/bin/env bash
     set -euo pipefail

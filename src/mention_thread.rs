@@ -91,6 +91,9 @@ pub enum MentionThreadAction {
         mention: CommentMention,
         task: CodexTask,
     },
+    RejectUnsupportedOperation {
+        mention: CommentMention,
+    },
     MarkHandled {
         mention: CommentMention,
         marker: PendingHandledMarker,
@@ -101,11 +104,11 @@ pub enum MentionThreadAction {
     },
 }
 
-pub fn plan_mention_thread(thread: MentionThread, bot_login: &str) -> MentionThreadPlan {
+pub fn plan_mention_thread(thread: MentionThread, _bot_login: &str) -> MentionThreadPlan {
     let actions = thread
         .observations
         .into_iter()
-        .map(|observation| mention_action_for(observation, bot_login))
+        .map(mention_action_for)
         .collect::<Vec<_>>();
     let notification = if actions
         .iter()
@@ -122,7 +125,7 @@ pub fn plan_mention_thread(thread: MentionThread, bot_login: &str) -> MentionThr
     }
 }
 
-fn mention_action_for(observation: MentionObservation, bot_login: &str) -> MentionThreadAction {
+fn mention_action_for(observation: MentionObservation) -> MentionThreadAction {
     match observation.disposition() {
         MentionDisposition::AlreadyHandled => {
             let marker = PendingHandledMarker::for_mention(&observation.mention);
@@ -138,31 +141,24 @@ fn mention_action_for(observation: MentionObservation, bot_login: &str) -> Menti
                 marker,
             }
         }
+        MentionDisposition::PendingRequest
+            if observation.request.requests_unsupported_operation() =>
+        {
+            MentionThreadAction::RejectUnsupportedOperation {
+                mention: observation.mention,
+            }
+        }
         MentionDisposition::PendingRequest => MentionThreadAction::StartTask {
             task: CodexTask {
                 pr_url: observation.mention.target.html_url().to_string(),
-                origin: mention_task_origin(&observation.mention, observation.request, bot_login),
+                origin: mention_task_origin(&observation.mention, observation.request),
             },
             mention: observation.mention,
         },
     }
 }
 
-fn mention_task_origin(
-    mention: &CommentMention,
-    request: MentionRequest,
-    bot_login: &str,
-) -> CodexTaskOrigin {
-    if let Some(operator_text) = request.operator_text() {
-        return CodexTaskOrigin::OperatorMention {
-            mention_url: mention.html_url.clone(),
-            raw_body: request.raw_body,
-            request_text: operator_text,
-            trigger_author: mention.author.clone(),
-            bot_login: bot_login.to_string(),
-        };
-    }
-
+fn mention_task_origin(mention: &CommentMention, request: MentionRequest) -> CodexTaskOrigin {
     CodexTaskOrigin::Mention {
         mention_url: mention.html_url.clone(),
         raw_body: request.raw_body,

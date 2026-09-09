@@ -1,5 +1,4 @@
 use crate::{
-    codex::DEFAULT_WORKER_PATH,
     domain::{CodexPromptTemplates, GitHubUserId, RepoSlug, TrustedAccount},
     github::{
         DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
@@ -32,10 +31,7 @@ pub struct Config {
     pub max_concurrent_requests: usize,
     pub github_api_requests_per_hour: GitHubApiRequestRate,
     pub github_notification_window: GitHubNotificationWindow,
-    pub codex_bin: String,
     pub codex_home: PathBuf,
-    pub codex_runtime_home: PathBuf,
-    pub codex_worker_path: String,
     pub codex_model: String,
     pub codex_reasoning_effort: String,
     pub codex_prompts: CodexPromptTemplates,
@@ -91,14 +87,12 @@ impl Config {
             file.github_notification_window_hours
                 .unwrap_or(DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS),
         )?;
-        let codex_bin = normalize_command(non_empty(file.codex_bin))?;
         let codex_home = non_empty(file.codex_home)
             .map(|path| expand_home(&path))
             .transpose()?
             .map(absolute_path)
             .transpose()?
             .unwrap_or_else(|| maid_home.join("codex"));
-        let codex_worker_path = worker_path(file.codex_worker_path.as_deref())?;
         let codex_model = required_string(file.codex_model, "codex_model")
             .with_context(|| format!("codex_model is required in {}", config_path.display()))?;
         let codex_reasoning_effort =
@@ -143,10 +137,7 @@ impl Config {
             max_concurrent_requests,
             github_api_requests_per_hour,
             github_notification_window,
-            codex_bin,
             codex_home,
-            codex_runtime_home: maid_home.join("runtime"),
-            codex_worker_path,
             codex_model,
             codex_reasoning_effort,
             codex_prompts,
@@ -157,6 +148,7 @@ impl Config {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigFile {
     bot_login: Option<String>,
     master_accounts: Option<Vec<TrustedAccountFile>>,
@@ -168,9 +160,7 @@ struct ConfigFile {
     max_concurrent_requests: Option<usize>,
     github_api_requests_per_hour: Option<u32>,
     github_notification_window_hours: Option<u32>,
-    codex_bin: Option<String>,
     codex_home: Option<String>,
-    codex_worker_path: Option<String>,
     codex_model: Option<String>,
     codex_reasoning_effort: Option<String>,
     codex_prompts: Option<CodexPromptsFile>,
@@ -185,10 +175,10 @@ struct TrustedAccountFile {
 }
 
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 struct CodexPromptsFile {
     mention: Option<String>,
     pull_request_opened: Option<String>,
-    operator_mention: Option<String>,
 }
 
 impl ConfigFile {
@@ -303,22 +293,16 @@ fn select_accounts(
 
 fn required_codex_prompts(value: Option<CodexPromptsFile>) -> Result<CodexPromptTemplates> {
     let Some(prompts) = value else {
-        bail!(
-            "codex_prompts must include mention, pull_request_opened, and operator_mention templates"
-        );
+        bail!("codex_prompts must include mention and pull_request_opened templates");
     };
 
     let mention = non_empty(prompts.mention)
         .ok_or_else(|| anyhow!("codex_prompts.mention must not be empty"))?;
     let pull_request_opened = non_empty(prompts.pull_request_opened)
         .ok_or_else(|| anyhow!("codex_prompts.pull_request_opened must not be empty"))?;
-    let operator_mention = non_empty(prompts.operator_mention)
-        .ok_or_else(|| anyhow!("codex_prompts.operator_mention must not be empty"))?;
-
     Ok(CodexPromptTemplates {
         mention,
         pull_request_opened,
-        operator_mention,
     })
 }
 
@@ -361,29 +345,6 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
     Ok(env::current_dir()
         .context("failed to resolve the current directory")?
         .join(path))
-}
-
-fn normalize_command(command: Option<String>) -> Result<String> {
-    let Some(command) = command else {
-        return Ok("codex".to_string());
-    };
-
-    if !command.contains('/') {
-        return Ok(command);
-    }
-
-    Ok(absolute_path(expand_home(&command)?)?
-        .to_string_lossy()
-        .to_string())
-}
-
-fn worker_path(value: Option<&str>) -> Result<String> {
-    let value = value.unwrap_or(DEFAULT_WORKER_PATH);
-    let directories = env::split_paths(value).collect::<Vec<_>>();
-    if directories.is_empty() || directories.iter().any(|path| !path.is_absolute()) {
-        bail!("codex_worker_path must contain only absolute directories");
-    }
-    Ok(value.to_string())
 }
 
 fn gh_token_for(login: &str) -> Result<String> {
@@ -434,9 +395,7 @@ max_concurrent_requests = 3
 github_api_requests_per_hour = 1200
 github_notification_window_hours = 96
 metrics_bind_address = "127.0.0.1:9999"
-codex_bin = "codex-test"
 codex_home = "~/.maid/test-codex"
-codex_worker_path = "/usr/local/bin:/usr/bin:/bin"
 codex_model = "gpt-test"
 codex_reasoning_effort = "high"
 github_api_ip = "127.0.0.1"
@@ -444,7 +403,6 @@ github_api_ip = "127.0.0.1"
 [codex_prompts]
 mention = "mention {{{{cleaned_text}}}}"
 pull_request_opened = "review {{{{pr_url}}}}"
-operator_mention = "operator {{{{request_text}}}}"
 "#
         )
         .unwrap();
@@ -480,12 +438,7 @@ operator_mention = "operator {{{{request_text}}}}"
             config.metrics_bind_address.as_deref(),
             Some("127.0.0.1:9999")
         );
-        assert_eq!(config.codex_bin.as_deref(), Some("codex-test"));
         assert_eq!(config.codex_home.as_deref(), Some("~/.maid/test-codex"));
-        assert_eq!(
-            config.codex_worker_path.as_deref(),
-            Some("/usr/local/bin:/usr/bin:/bin")
-        );
         assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
         assert_eq!(config.codex_reasoning_effort.as_deref(), Some("high"));
         let codex_prompts = config.codex_prompts.unwrap();
@@ -496,10 +449,6 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(
             codex_prompts.pull_request_opened.as_deref(),
             Some("review {{pr_url}}")
-        );
-        assert_eq!(
-            codex_prompts.operator_mention.as_deref(),
-            Some("operator {{request_text}}")
         );
         assert_eq!(config.github_api_ip.as_deref(), Some("127.0.0.1"));
     }
@@ -528,7 +477,6 @@ operator_mention = "operator {{{{request_text}}}}"
             required_codex_prompts(Some(CodexPromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: None,
-                operator_mention: Some("operate".to_string()),
             }))
             .is_err()
         );
@@ -536,15 +484,6 @@ operator_mention = "operator {{{{request_text}}}}"
             required_codex_prompts(Some(CodexPromptsFile {
                 mention: Some(" ".to_string()),
                 pull_request_opened: Some("review".to_string()),
-                operator_mention: Some("operate".to_string()),
-            }))
-            .is_err()
-        );
-        assert!(
-            required_codex_prompts(Some(CodexPromptsFile {
-                mention: Some("mention".to_string()),
-                pull_request_opened: Some("review".to_string()),
-                operator_mention: Some(" ".to_string()),
             }))
             .is_err()
         );
@@ -553,13 +492,11 @@ operator_mention = "operator {{{{request_text}}}}"
             required_codex_prompts(Some(CodexPromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: Some("review".to_string()),
-                operator_mention: Some("operate".to_string()),
             }))
             .unwrap(),
             CodexPromptTemplates {
                 mention: "mention".to_string(),
                 pull_request_opened: "review".to_string(),
-                operator_mention: "operate".to_string(),
             }
         );
     }
@@ -794,29 +731,5 @@ operator_mention = "operator {{{{request_text}}}}"
             absolute_path(PathBuf::from("/tmp/maid")).unwrap(),
             PathBuf::from("/tmp/maid")
         );
-    }
-
-    #[test]
-    fn absolutizes_path_like_codex_commands() {
-        let current_dir = env::current_dir().unwrap();
-
-        assert_eq!(normalize_command(None).unwrap(), "codex");
-        assert_eq!(
-            normalize_command(Some("codex-test".to_string())).unwrap(),
-            "codex-test"
-        );
-        assert_eq!(
-            normalize_command(Some("./bin/codex-test".to_string())).unwrap(),
-            current_dir
-                .join("./bin/codex-test")
-                .to_string_lossy()
-                .to_string()
-        );
-    }
-
-    #[test]
-    fn worker_path_requires_absolute_directories() {
-        assert_eq!(worker_path(None).unwrap(), DEFAULT_WORKER_PATH);
-        assert!(worker_path(Some("/usr/bin:relative/bin")).is_err());
     }
 }

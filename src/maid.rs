@@ -78,18 +78,6 @@ impl PreparedWorktree {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexRun {
     pub response: String,
-    pub session_id: Option<String>,
-}
-
-impl CodexRun {
-    pub fn resume_command(&self) -> Option<(&str, String)> {
-        self.session_id.as_deref().map(|session_id| {
-            (
-                session_id,
-                format!("codex resume --include-non-interactive --all {session_id}"),
-            )
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -517,6 +505,21 @@ where
                         task,
                     })));
                 }
+                MentionThreadAction::RejectUnsupportedOperation { mention } => {
+                    let comment = GitHubComment::unsupported_operation();
+                    self.github.post_comment(&mention.target, &comment).await?;
+                    let marker = PendingHandledMarker::for_mention(&mention);
+                    self.pending_handled_markers.record(&marker)?;
+                    if let Err(err) = self.github.mark_mention_handled(&mention).await {
+                        error!(
+                            notification_id = notification.id,
+                            mention = %mention.html_url,
+                            error = ?err,
+                            "failed to mark unsupported operation handled"
+                        );
+                    }
+                    assessments.push(TaskAssessment::Skipped);
+                }
                 MentionThreadAction::MarkHandled { mention, marker } => {
                     observed_pending_markers.insert(marker);
                     self.github.mark_mention_handled(&mention).await?;
@@ -789,23 +792,12 @@ where
                     "failed to mark mention handled after posting response"
                 );
             }
-            if let Some((session_id, resume_command)) = codex_run.resume_command() {
-                info!(
-                    notification_id = notification.id,
-                    target = %mention.target.html_url(),
-                    mention = %mention.html_url,
-                    codex_session_id = %session_id,
-                    codex_resume = %resume_command,
-                    "responded to mention"
-                );
-            } else {
-                info!(
-                    notification_id = notification.id,
-                    target = %mention.target.html_url(),
-                    mention = %mention.html_url,
-                    "responded to mention"
-                );
-            }
+            info!(
+                notification_id = notification.id,
+                target = %mention.target.html_url(),
+                mention = %mention.html_url,
+                "responded to mention"
+            );
             Ok(())
         }
         .await;
@@ -849,21 +841,7 @@ where
                 );
             }
 
-            if let Some((session_id, resume_command)) = codex_run.resume_command() {
-                info!(
-                    pr = %pr.html_url,
-                    author = %pr.author,
-                    codex_session_id = %session_id,
-                    codex_resume = %resume_command,
-                    "responded to auto-review pull request"
-                );
-            } else {
-                info!(
-                    pr = %pr.html_url,
-                    author = %pr.author,
-                    "responded to auto-review pull request"
-                );
-            }
+            info!(pr = %pr.html_url, author = %pr.author, "responded to auto-review pull request");
             Ok(())
         }
         .await;
@@ -1552,7 +1530,6 @@ mod tests {
             }
             Ok(CodexRun {
                 response: "codex response".to_string(),
-                session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
             })
         }
     }
@@ -1585,7 +1562,6 @@ mod tests {
             self.release.notified().await;
             Ok(CodexRun {
                 response: "codex response".to_string(),
-                session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
             })
         }
     }
@@ -1805,23 +1781,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_codex_resume_command_from_session_id() {
-        let run = CodexRun {
-            response: "done".to_string(),
-            session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
-        };
-
-        assert_eq!(
-            run.resume_command(),
-            Some((
-                "019e64fd-8369-7453-9cdc-4b14b388f618",
-                "codex resume --include-non-interactive --all 019e64fd-8369-7453-9cdc-4b14b388f618"
-                    .to_string()
-            ))
-        );
-    }
-
-    #[test]
     fn task_keys_allow_distinct_mentions_on_the_same_pull_request() {
         let first_mention = mention_with_comment("dionysuzx", "@maid-bot first", "2");
         let second_mention = mention_with_comment("dionysuzx", "@maid-bot second", "3");
@@ -1907,7 +1866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trusted_operate_mention_uses_operator_task_origin() {
+    async fn removed_operate_command_is_rejected_without_a_worker() {
         let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
@@ -1927,33 +1886,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
-        let calls = codex.calls.lock().unwrap();
-        assert_eq!(calls[0].0, worktree);
-        assert_eq!(
-            calls[0].1.origin,
-            CodexTaskOrigin::OperatorMention {
-                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
-                raw_body: "@maid-bot /operate implement and push".to_string(),
-                request_text: "implement and push".to_string(),
-                trigger_author: "dionysuzx".to_string(),
-                bot_login: "maid-bot".to_string(),
-            }
-        );
-        let templates = crate::domain::CodexPromptTemplates {
-            mention: String::new(),
-            pull_request_opened: String::new(),
-            operator_mention: "operate {{request_text}} for {{trigger_author}}".to_string(),
-        };
-        assert_eq!(
-            calls[0].1.prompt(&templates).unwrap(),
-            "operate implement and push for dionysuzx"
-        );
+        assert_eq!(report.responded, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(worktrees.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
+        let posts = github.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert!(posts[0].contains("`/operate` is no longer supported"));
     }
 
     #[tokio::test]
-    async fn trusted_issue_operate_mention_runs_on_issue_target() {
+    async fn removed_operate_command_is_rejected_on_an_issue() {
         let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![issue_notification("n1", "2")];
@@ -1974,26 +1917,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec![published_response()]);
+        assert_eq!(report.responded, 0);
+        assert_eq!(report.skipped, 1);
         assert_eq!(
             *github.events.lock().unwrap(),
-            vec!["start", "post", "handled"]
+            vec!["post", "handled", "mark"]
         );
-        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
-        let calls = codex.calls.lock().unwrap();
-        assert_eq!(calls[0].0, worktree);
-        assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/issues/322");
-        assert_eq!(
-            calls[0].1.origin,
-            CodexTaskOrigin::OperatorMention {
-                mention_url: "https://github.com/o/r/issues/322#issuecomment-2".to_string(),
-                raw_body: "@maid-bot /operate fix this issue".to_string(),
-                request_text: "fix this issue".to_string(),
-                trigger_author: "dionysuzx".to_string(),
-                bot_login: "maid-bot".to_string(),
-            }
-        );
+        assert!(worktrees.calls.lock().unwrap().is_empty());
+        assert!(codex.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2677,7 +2608,7 @@ mod tests {
     async fn renamed_master_account_keeps_authority_by_id() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
-        let mut request = mention("renamed-master", "@maid-bot /operate inspect");
+        let mut request = mention("renamed-master", "@maid-bot inspect");
         request.author_id = test_user_id("dionysuzx");
         *github.mention.lock().unwrap() = Some(Ok(Some(request)));
         let worktrees = FakeWorktrees {
