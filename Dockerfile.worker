@@ -1,0 +1,12 @@
+FROM node:22.20.0-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates git ripgrep \
+    && npm install --global @openai/codex@0.153.4 \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/worker-entrypoint.sh /usr/local/bin/maid-codex-worker
+RUN chmod 0755 /usr/local/bin/maid-codex-worker
+
+ENTRYPOINT ["maid-codex-worker"]

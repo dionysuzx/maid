@@ -1,6 +1,8 @@
 # Required.
 bot_login = "maid-bot"
-master_accounts = ["your-name"]
+# Numeric IDs are the authority boundary; login is only a display/discovery hint.
+# Find an ID with: gh api users/your-name --jq .id. Zero is rejected.
+master_accounts = [{ login = "your-name", id = 0 }]
 
 # Optional. Defaults to master_accounts when omitted.
 auto_review_accounts = ["your-name"]
@@ -15,7 +17,10 @@ auto_review_public_accounts = ["your-name"]
 
 # Optional. Defaults shown below.
 git_dir = "~/.maid/git"
-codex_bin = "codex"
+# Dedicated host Codex auth directory. Run `just worker-login` before starting Maid.
+# Only auth.json is copied from its read-only worker mount into disposable runtime
+# storage; worker shell policy denies reading both locations.
+codex_home = "~/.maid/codex"
 max_concurrent_requests = 1
 
 # Optional. This is the one global GitHub REST request-rate knob. Every GitHub
@@ -25,7 +30,7 @@ github_api_requests_per_hour = 1200
 # Optional. How far back each notification poll searches. Defaults to 24 hours.
 github_notification_window_hours = 24
 
-# Optional. Prometheus metrics are served at /metrics on this address.
+# Optional. Prometheus metrics are served at /metrics on this loopback address.
 metrics_bind_address = "127.0.0.1:9464"
 
 # Required. These values are passed to Codex.
@@ -43,9 +48,6 @@ codex_reasoning_effort = "high"
 # {{mention_url}}, {{target_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
 # Supported pull_request_opened placeholders:
 # {{pr_url}}, {{author}}
-# Supported operator_mention placeholders:
-# {{bot_login}}, {{trigger_author}}, {{mention_url}}, {{target_url}}, {{pr_url}},
-# {{raw_body}}, {{request_text}}, {{operator_trigger}}
 [codex_prompts]
 mention = """
 You are responding to a GitHub mention.
@@ -79,20 +81,4 @@ Opened by:
 
 Review request:
 please review
-"""
-operator_mention = """
-You are handling a trusted Maid operator request.
-
-You may use git, gh, and local tools to complete the request, including editing files, committing, pushing, or opening pull requests when the request calls for it.
-
-Context:
-- Bot login: {{bot_login}}
-- Trigger author: {{trigger_author}}
-- Mention URL: {{mention_url}}
-- Target URL: {{target_url}}
-
-Operator request:
-{{request_text}}
-
-When finished, return only a concise final status for the calling process to use. Do not publish that status yourself or include tool logs or wrappers.
 """

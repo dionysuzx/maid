@@ -20,6 +20,25 @@ test:
 
 check: fmt clippy test
 
+worker-image:
+    docker build --file Dockerfile.worker --tag maid-codex-worker:0.153.4 .
+
+worker-login: worker-image
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{maid_home}}/codex"
+    chmod 700 "{{maid_home}}/codex"
+    docker run --rm --interactive --tty --read-only \
+      --user "$(id -u):$(id -g)" \
+      --entrypoint codex \
+      --env HOME=/tmp --env CODEX_HOME=/run/maid/codex-auth \
+      --mount "type=bind,src={{maid_home}}/codex,dst=/run/maid/codex-auth" \
+      --tmpfs "/tmp:rw,nosuid,nodev,noexec,size=16m,uid=$(id -u),gid=$(id -g),mode=700" \
+      maid-codex-worker:0.153.4 login
+
+verify-worker: worker-image
+    bash scripts/verify-worker-isolation.sh maid-codex-worker:0.153.4
+
 init:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -35,7 +54,7 @@ init:
     perl -0pi -e 's/^bot_login = "maid-bot"/bot_login = ""/m; s/your-name/dionysuzx/g' "{{config_file}}"
 
     echo "created {{config_file}}"
-    echo "edit bot_login and master_accounts, then run: just start"
+    echo "edit bot_login and set each master_accounts login and immutable GitHub ID, then run: just start"
     echo
     echo "optional config reference:"
     cat "{{ justfile_directory() }}/config.example.toml"

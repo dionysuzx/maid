@@ -1,6 +1,10 @@
 use crate::{
-    domain::{CommentMention, Issue, Notification, PullRequest, RepoSlug, ReviewState, WorkTarget},
+    domain::{
+        CommentMention, GitHubUserId, Issue, Notification, PullRequest, RepoSlug, ReviewState,
+        WorkTarget,
+    },
     maid::GithubClient,
+    publication::GitHubComment,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -112,7 +116,9 @@ impl GitHubRestClient {
         request_rate: GitHubApiRequestRate,
         notification_window: GitHubNotificationWindow,
     ) -> Self {
-        let mut builder = Client::builder().timeout(Duration::from_secs(30));
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none());
         if let Some(api_ip) = api_ip {
             builder = builder.resolve("api.github.com", (api_ip, 443).into());
         }
@@ -159,13 +165,14 @@ impl GitHubRestClient {
         T: for<'de> Deserialize<'de>,
         B: Serialize + Sync + ?Sized,
     {
+        let api_url = GitHubApiUrl::parse(url)?;
         let method_for_error = method.clone();
         for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
             self.traffic.wait_for_turn().await;
 
             let mut request = self
                 .client
-                .request(method.clone(), url)
+                .request(method.clone(), api_url.as_url().clone())
                 .bearer_auth(&self.token)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
@@ -237,6 +244,29 @@ impl GitHubRestClient {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitHubApiUrl(Url);
+
+impl GitHubApiUrl {
+    fn parse(value: &str) -> Result<Self> {
+        let url = Url::parse(value).with_context(|| format!("invalid GitHub API URL: {value}"))?;
+        let valid = url.scheme() == "https"
+            && url.host_str() == Some("api.github.com")
+            && url.port().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none();
+        if !valid {
+            bail!("refusing to send GitHub credentials to untrusted URL: {value}");
+        }
+        Ok(Self(url))
+    }
+
+    fn as_url(&self) -> &Url {
+        &self.0
+    }
+}
+
 #[async_trait]
 impl GithubClient for GitHubRestClient {
     async fn notifications(&self) -> Result<Vec<Notification>> {
@@ -293,6 +323,7 @@ impl GithubClient for GitHubRestClient {
 
         Ok(Some(CommentMention {
             author: comment.user.login,
+            author_id: GitHubUserId::new(comment.user.id).context("comment has invalid user ID")?,
             body: comment.body,
             api_url: comment_url.to_string(),
             html_url: comment.html_url,
@@ -314,10 +345,10 @@ impl GithubClient for GitHubRestClient {
             WorkTarget::Issue(issue) => self.issue_comments_for_issue(issue).await?,
         };
 
-        Ok(recent_comments(comments, 20)
+        recent_comments(comments, 20)
             .into_iter()
             .map(|comment| comment_mention(comment, &target))
-            .collect())
+            .collect()
     }
 
     async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>> {
@@ -380,17 +411,23 @@ impl GithubClient for GitHubRestClient {
         Ok(pull_requests)
     }
 
-    async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
+    async fn post_comment(&self, target: &WorkTarget, body: &GitHubComment) -> Result<()> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/issues/{}/comments",
             target.owner(),
             target.repo(),
             target.number()
         );
-        self.post_json(&url, &PostComment { body }).await
+        self.post_json(
+            &url,
+            &PostComment {
+                body: body.as_str(),
+            },
+        )
+        .await
     }
 
-    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
+    async fn post_pr_comment(&self, pr: &PullRequest, body: &GitHubComment) -> Result<()> {
         self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
             .await
     }
@@ -692,6 +729,22 @@ mod tests {
     }
 
     #[test]
+    fn only_accepts_urls_on_the_github_api_origin() {
+        assert!(GitHubApiUrl::parse("https://api.github.com/repos/o/r").is_ok());
+        assert!(GitHubApiUrl::parse("https://api.github.com/search?q=x").is_ok());
+
+        for url in [
+            "http://api.github.com/repos/o/r",
+            "https://api.github.com.evil.test/repos/o/r",
+            "https://user@api.github.com/repos/o/r",
+            "https://api.github.com:444/repos/o/r",
+            "https://api.github.com/repos/o/r#fragment",
+        ] {
+            assert!(GitHubApiUrl::parse(url).is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
     fn secondary_backoff_is_bounded_exponential() {
         assert_eq!(secondary_backoff(0), Duration::from_secs(60));
         assert_eq!(secondary_backoff(1), Duration::from_secs(120));
@@ -796,6 +849,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn github_users_require_a_valid_numeric_identity() {
+        assert!(serde_json::from_str::<ApiUser>(r#"{"login":"trusted"}"#).is_err());
+
+        let mut comment = api_comment(
+            "https://api.github.com/repos/o/r/issues/comments/1",
+            "https://github.com/o/r/issues/1#issuecomment-1",
+            "2026-06-08T00:00:00Z",
+        );
+        comment.user.id = 0;
+        assert!(comment_mention(comment, &WorkTarget::PullRequest(test_pull_request())).is_err());
+    }
+
+    fn test_pull_request() -> PullRequest {
+        PullRequest {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 1,
+            author: "author".to_string(),
+            author_id: GitHubUserId::new(3).unwrap(),
+            api_url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
+            html_url: "https://github.com/o/r/pull/1".to_string(),
+            clone_url: "https://github.com/o/r.git".to_string(),
+        }
+    }
+
     fn api_comment(url: &str, html_url: &str, created_at: &str) -> ApiComment {
         ApiComment {
             url: url.to_string(),
@@ -804,6 +883,7 @@ mod tests {
             created_at: created_at.to_string(),
             user: ApiUser {
                 login: "dionysuzx".to_string(),
+                id: 1,
             },
             issue_url: None,
             pull_request_url: Some("https://api.github.com/repos/o/r/pulls/1".to_string()),
@@ -818,6 +898,7 @@ mod tests {
             number: Some(1),
             user: Some(ApiUser {
                 login: "dionysuzx".to_string(),
+                id: 1,
             }),
             pull_request: Some(ApiIssuePullRequest {
                 url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
@@ -831,6 +912,7 @@ mod tests {
             clone_url: "https://github.com/o/r.git".to_string(),
             owner: Some(ApiUser {
                 login: "o".to_string(),
+                id: 2,
             }),
             default_branch: Some("main".to_string()),
             visibility,
@@ -969,6 +1051,8 @@ impl GitHubRestClient {
             repo: pr.base.repo.name,
             number: pr.number,
             author: pr.user.login,
+            author_id: GitHubUserId::new(pr.user.id)
+                .context("pull request has invalid author ID")?,
             api_url: pr.url,
             html_url: pr.html_url,
             clone_url: pr.base.repo.clone_url,
@@ -987,16 +1071,18 @@ impl GitHubRestClient {
             .owner
             .as_ref()
             .ok_or_else(|| anyhow!("pull request base repo has no owner"))?;
+        let author = item
+            .user
+            .ok_or_else(|| anyhow!("pull request search result has no author"))?;
         Ok(Some(PullRequest {
             owner: owner.login.clone(),
             repo: repo.name.clone(),
             number: item
                 .number
                 .ok_or_else(|| anyhow!("pull request search result has no number"))?,
-            author: item
-                .user
-                .ok_or_else(|| anyhow!("pull request search result has no author"))?
-                .login,
+            author: author.login,
+            author_id: GitHubUserId::new(author.id)
+                .context("pull request search result has invalid author ID")?,
             api_url: item
                 .pull_request
                 .ok_or_else(|| anyhow!("pull request search result has no pull request URL"))?
@@ -1020,14 +1106,13 @@ impl GitHubRestClient {
             .default_branch
             .ok_or_else(|| anyhow!("issue repository has no default branch"))?;
 
+        let author = issue.user.ok_or_else(|| anyhow!("issue has no author"))?;
         Ok(Issue {
             owner: owner.login,
             repo: repo.name,
             number: issue.number.ok_or_else(|| anyhow!("issue has no number"))?,
-            author: issue
-                .user
-                .ok_or_else(|| anyhow!("issue has no author"))?
-                .login,
+            author: author.login,
+            author_id: GitHubUserId::new(author.id).context("issue has invalid author ID")?,
             api_url: issue.url.ok_or_else(|| anyhow!("issue has no URL"))?,
             html_url: issue
                 .html_url
@@ -1144,14 +1229,15 @@ fn recent_comments(mut comments: Vec<ApiComment>, limit: usize) -> Vec<ApiCommen
     comments.into_iter().skip(start).collect()
 }
 
-fn comment_mention(comment: ApiComment, target: &WorkTarget) -> CommentMention {
-    CommentMention {
+fn comment_mention(comment: ApiComment, target: &WorkTarget) -> Result<CommentMention> {
+    Ok(CommentMention {
         author: comment.user.login,
+        author_id: GitHubUserId::new(comment.user.id).context("comment has invalid user ID")?,
         body: comment.body,
         api_url: comment.url,
         html_url: comment.html_url,
         target: target.clone(),
-    }
+    })
 }
 
 fn parse_pull_request_html_url(html_url: &str) -> Result<(&str, &str, u64)> {
@@ -1214,6 +1300,7 @@ struct ApiComment {
 #[derive(Debug, Deserialize)]
 struct ApiUser {
     login: String,
+    id: u64,
 }
 
 #[derive(Debug, Deserialize)]

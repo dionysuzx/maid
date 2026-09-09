@@ -161,6 +161,7 @@ mod tests {
             repo: "r".to_string(),
             number: 1,
             author: author.to_string(),
+            author_id: crate::domain::GitHubUserId::new(1).unwrap(),
             api_url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
             html_url: "https://github.com/o/r/pull/1".to_string(),
             clone_url: "https://github.com/o/r.git".to_string(),
