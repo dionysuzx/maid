@@ -30,8 +30,9 @@ worker-login: worker-image
     chmod 700 "{{maid_home}}/codex"
     docker run --rm --interactive --tty --read-only \
       --user "$(id -u):$(id -g)" \
-      --env HOME=/tmp --env CODEX_HOME=/run/maid/codex \
-      --mount "type=bind,src={{maid_home}}/codex,dst=/run/maid/codex" \
+      --entrypoint codex \
+      --env HOME=/tmp --env CODEX_HOME=/run/maid/codex-auth \
+      --mount "type=bind,src={{maid_home}}/codex,dst=/run/maid/codex-auth" \
       --tmpfs "/tmp:rw,nosuid,nodev,noexec,size=16m,uid=$(id -u),gid=$(id -g),mode=700" \
       maid-codex-worker:0.153.4 login
 

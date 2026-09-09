@@ -31,6 +31,7 @@ const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_STDOUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+const CODEX_AUTH_IN_WORKER: &str = "/run/maid/codex-auth";
 const CODEX_HOME_IN_WORKER: &str = "/run/maid/codex";
 const WORKSPACE_IN_WORKER: &str = "/workspace";
 const REVIEW_PROFILE: &str = "maid-review";
@@ -38,7 +39,8 @@ static CONTAINER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Runs each review in a disposable, resource-bounded Linux container.
 /// GitHub credentials remain in Maid; the worker receives only a read-only
-/// repository and a dedicated Codex authentication directory.
+/// repository and a read-only Codex authentication source. The image copies
+/// only auth.json into a private, disposable CODEX_HOME.
 #[derive(Clone, Debug)]
 pub struct CodexWorker {
     runtime_bin: String,
@@ -99,6 +101,7 @@ impl CodexWorker {
             .args([
                 "run",
                 "--rm",
+                "--interactive",
                 "--init",
                 "--name",
                 container_name,
@@ -123,7 +126,11 @@ impl CodexWorker {
                 "--mount",
                 &format!("type=bind,src={worktree},dst={WORKSPACE_IN_WORKER},readonly"),
                 "--mount",
-                &format!("type=bind,src={codex_home},dst={CODEX_HOME_IN_WORKER},readonly"),
+                &format!("type=bind,src={codex_home},dst={CODEX_AUTH_IN_WORKER},readonly"),
+                "--tmpfs",
+                &format!(
+                    "{CODEX_HOME_IN_WORKER}:rw,nosuid,nodev,noexec,size=64m,uid={uid},gid={gid},mode=700"
+                ),
                 "--tmpfs",
                 &format!("/tmp:rw,nosuid,nodev,noexec,size=64m,uid={uid},gid={gid},mode=700"),
                 &self.image,
@@ -284,7 +291,7 @@ impl CodexRunner for CodexWorker {
 
 fn review_filesystem_policy() -> String {
     format!(
-        "permissions.{REVIEW_PROFILE}.filesystem={{ \":root\" = \"deny\", \":minimal\" = \"read\", \":tmpdir\" = \"deny\", \":slash_tmp\" = \"deny\", \":workspace_roots\" = {{ \".\" = \"read\" }} }}"
+        "permissions.{REVIEW_PROFILE}.filesystem={{ \":root\" = \"deny\", \":minimal\" = \"read\", \":tmpdir\" = \"deny\", \":slash_tmp\" = \"deny\", \"{CODEX_AUTH_IN_WORKER}\" = \"deny\", \"{CODEX_HOME_IN_WORKER}\" = \"deny\", \":workspace_roots\" = {{ \".\" = \"read\" }} }}"
     )
 }
 
@@ -621,6 +628,7 @@ mod tests {
             .collect::<Vec<_>>();
         for required in [
             "--read-only",
+            "--interactive",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--security-opt=seccomp=unconfined",
@@ -633,6 +641,8 @@ mod tests {
         }
         assert!(args.iter().any(|arg| arg.contains("maid-review.filesystem")
             && arg.contains("\":root\" = \"deny\"")
+            && arg.contains("\"/run/maid/codex-auth\" = \"deny\"")
+            && arg.contains("\"/run/maid/codex\" = \"deny\"")
             && arg.contains("\".\" = \"read\"")));
         assert!(
             args.iter()
@@ -642,6 +652,15 @@ mod tests {
             args.iter()
                 .any(|arg| arg.ends_with("dst=/workspace,readonly")
                     && arg.contains(worktree.to_string_lossy().as_ref()))
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.ends_with("dst=/run/maid/codex-auth,readonly")
+                    && arg.contains(codex_home.to_string_lossy().as_ref()))
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("/run/maid/codex:rw,") && arg.contains("mode=700"))
         );
         assert!(!args.iter().any(|arg| arg.contains("github")));
         assert_eq!(command.as_std().get_envs().count(), 1);

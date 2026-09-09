@@ -17,9 +17,9 @@ auto_review_public_accounts = ["your-name"]
 
 # Optional. Defaults shown below.
 git_dir = "~/.maid/git"
-# Dedicated Codex auth directory. Run `just worker-login` before starting Maid.
-# It is mounted read-only into the disposable worker;
-# Codex can authenticate from it, while worker shell policy denies reading it.
+# Dedicated host Codex auth directory. Run `just worker-login` before starting Maid.
+# Only auth.json is copied from its read-only worker mount into disposable runtime
+# storage; worker shell policy denies reading both locations.
 codex_home = "~/.maid/codex"
 max_concurrent_requests = 1
 

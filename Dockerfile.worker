@@ -6,4 +6,7 @@ RUN apt-get update \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 
-ENTRYPOINT ["codex"]
+COPY scripts/worker-entrypoint.sh /usr/local/bin/maid-codex-worker
+RUN chmod 0755 /usr/local/bin/maid-codex-worker
+
+ENTRYPOINT ["maid-codex-worker"]

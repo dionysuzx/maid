@@ -25,7 +25,7 @@ cd maid
 ```
 
 Build the pinned worker image,
-then authenticate Codex into Maid's dedicated auth directory (the default is
+then authenticate Codex into Maid's dedicated host auth directory (the default is
 `~/.maid/codex`):
 
 ```sh
@@ -33,6 +33,9 @@ mkdir -p ~/.maid/codex
 chmod 700 ~/.maid/codex
 just worker-login
 ```
+
+`worker-login` is the only image invocation that mounts this host directory
+writable. Review workers mount it read-only and copy only `auth.json`.
 
 Verify the worker boundary before starting Maid:
 
@@ -86,8 +89,11 @@ repositories. Repository-scoped review remains available through
 
 Each review runs in the pinned `maid-codex-worker:0.153.4` Linux image. Docker
 mounts only the disposable repository and the dedicated Codex authentication
-directory; the GitHub token remains in the controller. The repository, auth
-mount, and container root are read-only. The container drops capabilities,
+directory; the GitHub token remains in the controller. The image copies only
+`auth.json` from that read-only mount into a private `CODEX_HOME` tmpfs. Both
+credential locations are denied to model-generated commands, and the tmpfs is
+discarded with the container. The repository, auth mount, and container root
+are read-only. The container drops capabilities,
 forbids privilege gain, and sets fixed memory, CPU, PID, and temporary-storage
 limits. Docker's outer seccomp filter is disabled because Codex's nested Linux
 sandbox needs user namespaces; the non-root worker still has no capabilities,
