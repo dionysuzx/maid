@@ -1,10 +1,10 @@
 use crate::auto_review::{
-    AutoReviewAction, AutoReviewAuthor, AutoReviewObservation, classify_auto_review_author,
-    plan_auto_review,
+    AutoReviewAction, AutoReviewAuthor, AutoReviewObservation, authorizing_team,
+    classify_auto_review_author, plan_auto_review,
 };
 use crate::domain::{
-    CodexTask, CommentMention, MentionRequest, Notification, PullRequest, RepoSlug, ReviewState,
-    WorkTarget,
+    CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
+    PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -17,6 +17,7 @@ use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNoti
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -32,7 +33,11 @@ pub trait GithubClient: Send + Sync {
     async fn mentions_for(&self, notification: &Notification) -> Result<Vec<CommentMention>> {
         Ok(self.mention_for(notification).await?.into_iter().collect())
     }
-    async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>>;
+    async fn open_pull_requests(
+        &self,
+        repo: &RepoSlug,
+        order: OpenPullRequestOrder,
+    ) -> Result<Vec<OpenPullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
@@ -116,6 +121,8 @@ pub struct Maid<G, R, C> {
     auto_review_accounts: HashSet<String>,
     auto_review_public_accounts: HashSet<String>,
     auto_review_repos: Vec<RepoSlug>,
+    auto_review_teams: Vec<TeamSlug>,
+    team_review_window: ChronoDuration,
     task_starts: Arc<dyn TaskStartRecorder>,
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
     observed_notifications: Arc<dyn ObservedNotificationStore>,
@@ -124,6 +131,7 @@ pub struct Maid<G, R, C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AutoReviewSource {
     Repository,
+    TeamActivity,
     PublicAuthor { login: String },
 }
 
@@ -131,13 +139,26 @@ enum AutoReviewSource {
 struct AutoReviewCandidate {
     pr: PullRequest,
     source: AutoReviewSource,
+    requested_teams: Vec<TeamSlug>,
+    updated_at: Option<DateTime<Utc>>,
 }
 
 impl AutoReviewCandidate {
-    fn repository(pr: PullRequest) -> Self {
+    fn repository(open: OpenPullRequest) -> Self {
         Self {
-            pr,
+            pr: open.pull_request,
             source: AutoReviewSource::Repository,
+            requested_teams: open.requested_teams,
+            updated_at: open.updated_at,
+        }
+    }
+
+    fn team_activity(open: OpenPullRequest) -> Self {
+        Self {
+            pr: open.pull_request,
+            source: AutoReviewSource::TeamActivity,
+            requested_teams: open.requested_teams,
+            updated_at: open.updated_at,
         }
     }
 
@@ -147,6 +168,8 @@ impl AutoReviewCandidate {
             source: AutoReviewSource::PublicAuthor {
                 login: login.to_string(),
             },
+            requested_teams: Vec::new(),
+            updated_at: None,
         }
     }
 
@@ -159,6 +182,7 @@ impl AutoReviewCandidate {
             AutoReviewSource::Repository => {
                 repository_accounts.contains(&self.pr.author.to_ascii_lowercase())
             }
+            AutoReviewSource::TeamActivity => false,
             AutoReviewSource::PublicAuthor { login } => {
                 public_accounts.contains(login) && self.pr.author.eq_ignore_ascii_case(login)
             }
@@ -200,6 +224,8 @@ where
             auto_review_accounts: normalized_logins(auto_review_accounts),
             auto_review_public_accounts: HashSet::new(),
             auto_review_repos: auto_review_repos.into_iter().collect(),
+            auto_review_teams: Vec::new(),
+            team_review_window: ChronoDuration::hours(24),
             task_starts: Arc::new(NoTaskLimit),
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
@@ -211,6 +237,16 @@ where
         accounts: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.auto_review_public_accounts = normalized_logins(accounts);
+        self
+    }
+
+    pub fn with_auto_review_teams(mut self, teams: impl IntoIterator<Item = TeamSlug>) -> Self {
+        self.auto_review_teams = teams.into_iter().collect();
+        self
+    }
+
+    pub fn with_team_review_window_hours(mut self, hours: u32) -> Self {
+        self.team_review_window = ChronoDuration::hours(i64::from(hours));
         self
     }
 
@@ -655,14 +691,20 @@ where
         candidate: &AutoReviewCandidate,
     ) -> Result<AutoReviewObservation> {
         let pr = &candidate.pr;
-        let author = classify_auto_review_author(
-            pr,
-            &self.bot_login,
-            candidate.has_allowed_author(
-                &self.auto_review_accounts,
-                &self.auto_review_public_accounts,
-            ),
+        let author_allowed = candidate.has_allowed_author(
+            &self.auto_review_accounts,
+            &self.auto_review_public_accounts,
         );
+        let team_authorized = authorizing_team(
+            &candidate.requested_teams,
+            &self.auto_review_teams,
+            candidate.updated_at,
+            Utc::now(),
+            self.team_review_window,
+        )
+        .is_some();
+        let author =
+            classify_auto_review_author(pr, &self.bot_login, author_allowed || team_authorized);
         if author != AutoReviewAuthor::Allowed {
             return Ok(AutoReviewObservation::new(pr.clone(), author, None, false));
         }
@@ -683,8 +725,21 @@ where
         let mut candidates = Vec::new();
 
         for repo in &self.auto_review_repos {
-            for pr in self.github.open_pull_requests(repo).await? {
-                candidates.push(AutoReviewCandidate::repository(pr));
+            for open in self
+                .github
+                .open_pull_requests(repo, OpenPullRequestOrder::NewestCreated)
+                .await?
+            {
+                candidates.push(AutoReviewCandidate::repository(open));
+            }
+            if !self.auto_review_teams.is_empty() {
+                for open in self
+                    .github
+                    .open_pull_requests(repo, OpenPullRequestOrder::RecentlyUpdated)
+                    .await?
+                {
+                    candidates.push(AutoReviewCandidate::team_activity(open));
+                }
             }
         }
 
@@ -1333,8 +1388,10 @@ fn deduplicate_auto_review_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CodexTaskOrigin, Issue};
+    use crate::domain::{CodexTaskOrigin, Issue, TeamSlug};
     use anyhow::{Result, anyhow};
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
     use tokio::sync::{Barrier, Notify};
@@ -1347,6 +1404,11 @@ mod tests {
         mention: Arc<StdMutex<FakeMentionResult>>,
         mentions: Arc<StdMutex<FakeMentionsResult>>,
         pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
+        list_orders: Arc<StdMutex<Vec<OpenPullRequestOrder>>>,
+        recently_updated_pull_requests: Arc<StdMutex<Option<Vec<PullRequest>>>>,
+        requested_teams: Arc<StdMutex<HashMap<String, Vec<TeamSlug>>>>,
+        pull_created_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
+        pull_updated_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         posts: Arc<StdMutex<Vec<String>>>,
@@ -1388,8 +1450,36 @@ mod tests {
             Ok(self.take_mention()?.into_iter().collect())
         }
 
-        async fn open_pull_requests(&self, _repo: &RepoSlug) -> Result<Vec<PullRequest>> {
-            Ok(self.pull_requests.lock().unwrap().clone())
+        async fn open_pull_requests(
+            &self,
+            _repo: &RepoSlug,
+            order: OpenPullRequestOrder,
+        ) -> Result<Vec<OpenPullRequest>> {
+            self.list_orders.lock().unwrap().push(order);
+            let created = self.pull_requests.lock().unwrap().clone();
+            let updated = self.recently_updated_pull_requests.lock().unwrap().clone();
+            let pull_requests = match order {
+                OpenPullRequestOrder::NewestCreated => created,
+                OpenPullRequestOrder::RecentlyUpdated => updated.unwrap_or(created),
+            };
+            let requested_teams = self.requested_teams.lock().unwrap().clone();
+            let created_at = self.pull_created_at.lock().unwrap().clone();
+            let updated_at = self.pull_updated_at.lock().unwrap().clone();
+            Ok(pull_requests
+                .into_iter()
+                .map(|pull_request| {
+                    let teams = requested_teams
+                        .get(&pull_request.html_url)
+                        .cloned()
+                        .unwrap_or_default();
+                    OpenPullRequest {
+                        requested_teams: teams,
+                        created_at: created_at.get(&pull_request.html_url).copied(),
+                        updated_at: updated_at.get(&pull_request.html_url).copied(),
+                        pull_request,
+                    }
+                })
+                .collect())
         }
 
         async fn open_public_pull_requests_by_author(
@@ -1721,6 +1811,39 @@ mod tests {
             api_url: format!("https://api.github.com/repos/o/r/pulls/{number}"),
             html_url: format!("https://github.com/o/r/pull/{number}"),
             clone_url: "https://github.com/o/r.git".to_string(),
+        }
+    }
+
+    fn team_slug(value: &str) -> TeamSlug {
+        TeamSlug::parse(value).unwrap()
+    }
+
+    fn request_team(github: &FakeGithub, pr: &PullRequest, updated_at: DateTime<Utc>) {
+        github
+            .requested_teams
+            .lock()
+            .unwrap()
+            .insert(pr.html_url.clone(), vec![team_slug("some-org/eng-infra")]);
+        github
+            .pull_updated_at
+            .lock()
+            .unwrap()
+            .insert(pr.html_url.clone(), updated_at);
+    }
+
+    fn recent_pr_time() -> DateTime<Utc> {
+        Utc::now() - ChronoDuration::minutes(1)
+    }
+
+    fn old_pr_time() -> DateTime<Utc> {
+        Utc::now() - ChronoDuration::hours(48)
+    }
+
+    fn idle_worktrees() -> FakeWorktrees {
+        FakeWorktrees {
+            worktree: PathBuf::from("/tmp/maid-test-worktree"),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            error: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -2329,6 +2452,354 @@ mod tests {
         assert!(github.events.lock().unwrap().is_empty());
         assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reviews_recent_pr_when_configured_team_is_requested() {
+        let github = FakeGithub::default();
+        let pull_request = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        request_team(&github, &pull_request, recent_pr_time());
+        let worktrees = idle_worktrees();
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
+            .with_auto_review_teams([team_slug("Some-Org/Eng-Infra")])
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["start_pr", "post", "handled_pr"]
+        );
+        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
+        let calls = codex.calls.lock().unwrap();
+        assert_eq!(
+            calls[0].1.origin,
+            CodexTaskOrigin::PullRequestOpened {
+                author: "contributor".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_review_a_team_request_twice() {
+        let github = FakeGithub::default();
+        let pull_request = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        request_team(&github, &pull_request, recent_pr_time());
+        let maid = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")]);
+
+        let first = maid.run_once().await.unwrap();
+        let second = maid.run_once().await.unwrap();
+
+        assert_eq!(first.responded, 1);
+        assert_eq!(second.responded, 0);
+        assert_eq!(second.skipped, 1);
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reviews_author_and_team_requested_pr_once() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        *github.public_pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        request_team(&github, &pull_request, recent_pr_time());
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_public_auto_review_accounts(["dionysuzx"])
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.responded, 1);
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn skips_team_requested_pr_outside_the_lookback_and_keeps_author_review() {
+        let github = FakeGithub::default();
+        let old_team_pr = pr_with_author_and_number("contributor", 1);
+        let recent_team_pr = pr_with_author_and_number("contributor", 2);
+        let old_author_pr = pr_with_author_and_number("dionysuzx", 3);
+        *github.pull_requests.lock().unwrap() = vec![
+            old_team_pr.clone(),
+            recent_team_pr.clone(),
+            old_author_pr.clone(),
+        ];
+        request_team(&github, &old_team_pr, old_pr_time());
+        request_team(&github, &recent_team_pr, recent_pr_time());
+        github
+            .pull_updated_at
+            .lock()
+            .unwrap()
+            .insert(old_author_pr.html_url.clone(), old_pr_time());
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 2);
+        let urls = codex
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, task)| task.pr_url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/r/pull/2".to_string(),
+                "https://github.com/o/r/pull/3".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reviews_team_request_when_an_old_draft_is_marked_ready() {
+        let github = FakeGithub::default();
+        let draft = pr_with_author_and_number("contributor", 9);
+        let author_pr = pr_with_author_and_number("dionysuzx", 3);
+        let author_only_on_updated = pr_with_author_and_number("dionysuzx", 4);
+        *github.pull_requests.lock().unwrap() = vec![author_pr.clone()];
+        *github.recently_updated_pull_requests.lock().unwrap() =
+            Some(vec![draft.clone(), author_only_on_updated.clone()]);
+        github
+            .pull_created_at
+            .lock()
+            .unwrap()
+            .insert(draft.html_url.clone(), Utc::now() - ChronoDuration::days(5));
+        request_team(&github, &draft, recent_pr_time());
+        github
+            .pull_updated_at
+            .lock()
+            .unwrap()
+            .insert(author_pr.html_url.clone(), old_pr_time());
+        github
+            .pull_updated_at
+            .lock()
+            .unwrap()
+            .insert(author_only_on_updated.html_url.clone(), recent_pr_time());
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 3);
+        assert_eq!(report.responded, 2);
+        assert_eq!(report.skipped, 1);
+        let urls = codex
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, task)| task.pr_url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/r/pull/3".to_string(),
+                "https://github.com/o/r/pull/9".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_team_review_when_the_request_is_absent() {
+        let github = FakeGithub::default();
+        let removed = pr_with_author_and_number("contributor", 1);
+        let other_team = pr_with_author_and_number("contributor", 2);
+        *github.pull_requests.lock().unwrap() = vec![removed.clone(), other_team.clone()];
+        github
+            .pull_updated_at
+            .lock()
+            .unwrap()
+            .insert(removed.html_url.clone(), recent_pr_time());
+        github.requested_teams.lock().unwrap().insert(
+            other_team.html_url.clone(),
+            vec![team_slug("other-org/docs")],
+        );
+        github
+            .pull_updated_at
+            .lock()
+            .unwrap()
+            .insert(other_team.html_url.clone(), recent_pr_time());
+
+        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 2);
+        assert_eq!(report.skipped, 2);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert!(github.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn team_review_off_lists_only_the_newest_created_page() {
+        let github = FakeGithub::default();
+        let author_pr = pr_with_author_and_number("dionysuzx", 3);
+        let team_pr = pr_with_author_and_number("contributor", 9);
+        *github.pull_requests.lock().unwrap() = vec![author_pr.clone(), team_pr.clone()];
+        request_team(&github, &team_pr, recent_pr_time());
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *github.list_orders.lock().unwrap(),
+            vec![OpenPullRequestOrder::NewestCreated]
+        );
+        assert_eq!(report.responded, 1);
+        let urls = codex
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, task)| task.pr_url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(urls, vec!["https://github.com/o/r/pull/3".to_string()]);
+        assert_eq!(
+            *github.pr_state_calls.lock().unwrap(),
+            vec!["https://github.com/o/r/pull/3".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_requested_teams_when_team_review_is_not_configured() {
+        let github = FakeGithub::default();
+        let pull_request = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        request_team(&github, &pull_request, recent_pr_time());
+
+        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert!(github.pr_state_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn does_not_team_review_outside_watched_repos_or_its_own_prs() {
+        let github = FakeGithub::default();
+        let own = pr_with_author("maid-bot");
+        *github.pull_requests.lock().unwrap() = vec![own.clone()];
+        request_team(&github, &own, recent_pr_time());
+        let worktrees = idle_worktrees();
+        let codex = FakeCodex::default();
+
+        let own_report = maid(github.clone(), worktrees.clone(), codex.clone())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(own_report.skipped, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+
+        let unwatched = Maid::new(
+            github.clone(),
+            worktrees,
+            codex,
+            "maid-bot",
+            ["dionysuzx"],
+            ["dionysuzx"],
+            Vec::<RepoSlug>::new(),
+        )
+        .with_auto_review_teams([team_slug("some-org/eng-infra")]);
+        let contributor = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![contributor.clone()];
+        request_team(&github, &contributor, recent_pr_time());
+
+        let unwatched_report = unwatched.run_once().await.unwrap();
+
+        assert_eq!(unwatched_report.seen, 0);
+        assert!(github.posts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn leaves_team_review_pending_when_task_limit_is_reached() {
+        let github = FakeGithub::default();
+        let pull_request = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        request_team(&github, &pull_request, recent_pr_time());
+        let task_starts = at_limit_recorder();
+
+        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_task_start_recorder(task_starts.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(*task_starts.calls.lock().unwrap(), 1);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert!(github.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_requested_notification_stays_mark_read_and_is_not_the_review_trigger() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() =
+            vec![notification_with_reason("n1", "2", "review_requested")];
+        let pull_request = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        request_team(&github, &pull_request, recent_pr_time());
+
+        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(*github.marks.lock().unwrap(), vec!["n1"]);
+        assert_eq!(report.responded, 1);
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+
+        let notification_only = FakeGithub::default();
+        *notification_only.notifications.lock().unwrap() =
+            vec![notification_with_reason("n2", "3", "review_requested")];
+
+        let without_pull_request = maid(
+            notification_only.clone(),
+            idle_worktrees(),
+            FakeCodex::default(),
+        )
+        .with_auto_review_teams([team_slug("some-org/eng-infra")])
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(without_pull_request.responded, 0);
+        assert_eq!(*notification_only.marks.lock().unwrap(), vec!["n2"]);
+        assert!(notification_only.posts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
