@@ -25,23 +25,24 @@ pub fn classify_auto_review_author(
 
 /// The configured team that authorizes review of this pull request, if any.
 ///
-/// Authorization requires a configured team that is still in `requested_teams`
-/// and a `created_at` inside `window` measured from `now` (a future timestamp
-/// counts as inside). Pull requests older than the window are left alone, so
-/// enabling team review does not drain an existing backlog. A missing
+/// `updated_at` is the pull request's last activity. Requesting a team and
+/// marking a draft ready both move it, so a request is eligible when it
+/// happens rather than when the pull request was opened. Activity outside
+/// `window` (measured from `now`; a future timestamp counts as inside)
+/// authorizes nothing, which leaves an untouched backlog alone. A missing
 /// timestamp, an empty team list, or a non-positive window authorizes nothing.
 pub fn authorizing_team<'a>(
     requested_teams: &[TeamSlug],
     configured_teams: &'a [TeamSlug],
-    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
     window: Duration,
 ) -> Option<&'a TeamSlug> {
     if window <= Duration::zero() {
         return None;
     }
-    let created_at = created_at?;
-    if now.signed_duration_since(created_at) > window {
+    let updated_at = updated_at?;
+    if now.signed_duration_since(updated_at) > window {
         return None;
     }
 

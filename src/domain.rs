@@ -140,16 +140,30 @@ impl fmt::Display for TeamSlug {
     }
 }
 
+/// Which page of open pull requests to list.
+///
+/// Author auto-review uses [`OpenPullRequestOrder::NewestCreated`]. Team review
+/// uses [`OpenPullRequestOrder::RecentlyUpdated`], because a team is often
+/// requested days after creation, when a draft is marked ready.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenPullRequestOrder {
+    NewestCreated,
+    RecentlyUpdated,
+}
+
 /// One open pull request from GitHub's list endpoint.
 ///
-/// `requested_teams` is who was still requested on that read. `created_at` is
-/// absent when the timestamp cannot be parsed: author auto-review can still
-/// proceed, and team review will not.
+/// `requested_teams` is who was still requested on that read. `updated_at` is
+/// the pull request's last activity and is the team-review backlog bound:
+/// requesting reviewers, or marking a draft ready, moves it. `created_at` is
+/// not that bound. Either timestamp is absent when it cannot be parsed; author
+/// auto-review still proceeds, and team review does not without `updated_at`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenPullRequest {
     pub pull_request: PullRequest,
     pub requested_teams: Vec<TeamSlug>,
     pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

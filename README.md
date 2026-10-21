@@ -56,14 +56,22 @@ for trusted authors, including the same prompt, one comment, and the same
 handled reaction and local marker, so a pull request is reviewed at most once.
 Empty or omitted leaves team review off.
 
-Maid does not walk an existing backlog. It reads the newest 50 open pull
-requests in each watched repository and starts a team review only when the
-pull request was created within `github_notification_window_hours` (24 by
-default). A team request that GitHub has already removed by that read is not
-reviewed. Author auto-review does not use this window. `review_requested`
-notifications are not the trigger: GitHub rewrites notification reasons, and
-the bot only receives them when it is on the team. The pull request's
-`requested_teams` is the signal, read from that same open-pull-request list.
+Maid does not walk an existing backlog. Author auto-review reads the 50
+newest open pull requests by creation time in each watched repository.
+Team review, only when `auto_review_teams` is set, reads a second page: the
+50 most recently updated open pull requests
+(`sort=updated&direction=desc`). A team review starts when `updated_at` is
+inside `github_notification_window_hours` (24 by default) and that team is
+still requested on the read. GitHub moves `updated_at` when a draft is marked
+ready or a reviewer is requested, and also when someone later comments or
+pushes on a pull request that still requests the team. Untouched older pull
+requests stay out of the page. The list has no request timestamp, and the
+timeline is a separate oldest-first history, so the bound is last activity.
+A team request already removed by that read is skipped. Author auto-review
+does not use this window or the recently-updated page, so the pull requests
+it sees are unchanged. `review_requested` notifications are not the trigger:
+GitHub rewrites notification reasons, and the bot only receives them when it
+is on the team. The pull request's `requested_teams` is the signal.
 
 ## Metrics
 

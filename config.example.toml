@@ -15,11 +15,14 @@ auto_review_public_accounts = ["your-name"]
 
 # Optional. Reviews an open pull request in auto_review_repos when one of these
 # teams is still requested. Entries are org/team-slug. Any author is eligible
-# except the bot. Empty or omitted disables team reviews. Only pull requests
-# created within github_notification_window_hours, and only the newest 50 open
-# pull requests per watched repository, are considered, so an existing backlog
-# is not reviewed. Each pull request is reviewed at most once. A team request
-# removed before that read is skipped.
+# except the bot. Empty or omitted disables team reviews. Team review reads the
+# 50 most recently updated open pull requests per watched repository and starts
+# only when updated_at is inside github_notification_window_hours, so an
+# untouched backlog is not reviewed. Activity such as a comment or push inside
+# that window can still qualify a pull request that still requests the team.
+# Author auto-review keeps reading the 50 newest by creation time. Each pull
+# request is reviewed at most once. A team request removed before that read is
+# skipped.
 auto_review_teams = ["Some-Org/eng-infra"]
 
 # Optional. Defaults shown below.

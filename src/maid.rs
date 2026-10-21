@@ -3,8 +3,8 @@ use crate::auto_review::{
     classify_auto_review_author, plan_auto_review,
 };
 use crate::domain::{
-    CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, PullRequest,
-    RepoSlug, ReviewState, TeamSlug, WorkTarget,
+    CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
+    PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -33,7 +33,11 @@ pub trait GithubClient: Send + Sync {
     async fn mentions_for(&self, notification: &Notification) -> Result<Vec<CommentMention>> {
         Ok(self.mention_for(notification).await?.into_iter().collect())
     }
-    async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<OpenPullRequest>>;
+    async fn open_pull_requests(
+        &self,
+        repo: &RepoSlug,
+        order: OpenPullRequestOrder,
+    ) -> Result<Vec<OpenPullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
@@ -127,7 +131,12 @@ pub struct Maid<G, R, C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AutoReviewSource {
     Repository,
-    PublicAuthor { login: String },
+    /// The recently-updated page. It authorizes a team request only; author
+    /// auto-review still comes from the newest-created page.
+    TeamActivity,
+    PublicAuthor {
+        login: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,7 +144,7 @@ struct AutoReviewCandidate {
     pr: PullRequest,
     source: AutoReviewSource,
     requested_teams: Vec<TeamSlug>,
-    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
 }
 
 impl AutoReviewCandidate {
@@ -144,7 +153,16 @@ impl AutoReviewCandidate {
             pr: open.pull_request,
             source: AutoReviewSource::Repository,
             requested_teams: open.requested_teams,
-            created_at: open.created_at,
+            updated_at: open.updated_at,
+        }
+    }
+
+    fn team_activity(open: OpenPullRequest) -> Self {
+        Self {
+            pr: open.pull_request,
+            source: AutoReviewSource::TeamActivity,
+            requested_teams: open.requested_teams,
+            updated_at: open.updated_at,
         }
     }
 
@@ -155,7 +173,7 @@ impl AutoReviewCandidate {
                 login: login.to_string(),
             },
             requested_teams: Vec::new(),
-            created_at: None,
+            updated_at: None,
         }
     }
 
@@ -168,6 +186,7 @@ impl AutoReviewCandidate {
             AutoReviewSource::Repository => {
                 repository_accounts.contains(&self.pr.author.to_ascii_lowercase())
             }
+            AutoReviewSource::TeamActivity => false,
             AutoReviewSource::PublicAuthor { login } => {
                 public_accounts.contains(login) && self.pr.author.eq_ignore_ascii_case(login)
             }
@@ -683,7 +702,7 @@ where
         let team_authorized = authorizing_team(
             &candidate.requested_teams,
             &self.auto_review_teams,
-            candidate.created_at,
+            candidate.updated_at,
             Utc::now(),
             self.team_review_window,
         )
@@ -710,8 +729,21 @@ where
         let mut candidates = Vec::new();
 
         for repo in &self.auto_review_repos {
-            for open in self.github.open_pull_requests(repo).await? {
+            for open in self
+                .github
+                .open_pull_requests(repo, OpenPullRequestOrder::NewestCreated)
+                .await?
+            {
                 candidates.push(AutoReviewCandidate::repository(open));
+            }
+            if !self.auto_review_teams.is_empty() {
+                for open in self
+                    .github
+                    .open_pull_requests(repo, OpenPullRequestOrder::RecentlyUpdated)
+                    .await?
+                {
+                    candidates.push(AutoReviewCandidate::team_activity(open));
+                }
             }
         }
 
@@ -1376,8 +1408,10 @@ mod tests {
         mention: Arc<StdMutex<FakeMentionResult>>,
         mentions: Arc<StdMutex<FakeMentionsResult>>,
         pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
+        recently_updated_pull_requests: Arc<StdMutex<Option<Vec<PullRequest>>>>,
         requested_teams: Arc<StdMutex<HashMap<String, Vec<TeamSlug>>>>,
         pull_created_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
+        pull_updated_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         posts: Arc<StdMutex<Vec<String>>>,
@@ -1419,10 +1453,20 @@ mod tests {
             Ok(self.take_mention()?.into_iter().collect())
         }
 
-        async fn open_pull_requests(&self, _repo: &RepoSlug) -> Result<Vec<OpenPullRequest>> {
-            let pull_requests = self.pull_requests.lock().unwrap().clone();
+        async fn open_pull_requests(
+            &self,
+            _repo: &RepoSlug,
+            order: OpenPullRequestOrder,
+        ) -> Result<Vec<OpenPullRequest>> {
+            let created = self.pull_requests.lock().unwrap().clone();
+            let updated = self.recently_updated_pull_requests.lock().unwrap().clone();
+            let pull_requests = match order {
+                OpenPullRequestOrder::NewestCreated => created,
+                OpenPullRequestOrder::RecentlyUpdated => updated.unwrap_or(created),
+            };
             let requested_teams = self.requested_teams.lock().unwrap().clone();
             let created_at = self.pull_created_at.lock().unwrap().clone();
+            let updated_at = self.pull_updated_at.lock().unwrap().clone();
             Ok(pull_requests
                 .into_iter()
                 .map(|pull_request| {
@@ -1430,11 +1474,11 @@ mod tests {
                         .get(&pull_request.html_url)
                         .cloned()
                         .unwrap_or_default();
-                    let created_at = created_at.get(&pull_request.html_url).copied();
                     OpenPullRequest {
-                        pull_request,
                         requested_teams: teams,
-                        created_at,
+                        created_at: created_at.get(&pull_request.html_url).copied(),
+                        updated_at: updated_at.get(&pull_request.html_url).copied(),
+                        pull_request,
                     }
                 })
                 .collect())
@@ -1776,17 +1820,17 @@ mod tests {
         TeamSlug::parse(value).unwrap()
     }
 
-    fn request_team(github: &FakeGithub, pr: &PullRequest, created_at: DateTime<Utc>) {
+    fn request_team(github: &FakeGithub, pr: &PullRequest, updated_at: DateTime<Utc>) {
         github
             .requested_teams
             .lock()
             .unwrap()
             .insert(pr.html_url.clone(), vec![team_slug("some-org/eng-infra")]);
         github
-            .pull_created_at
+            .pull_updated_at
             .lock()
             .unwrap()
-            .insert(pr.html_url.clone(), created_at);
+            .insert(pr.html_url.clone(), updated_at);
     }
 
     fn recent_pr_time() -> DateTime<Utc> {
@@ -2498,7 +2542,7 @@ mod tests {
         request_team(&github, &old_team_pr, old_pr_time());
         request_team(&github, &recent_team_pr, recent_pr_time());
         github
-            .pull_created_at
+            .pull_updated_at
             .lock()
             .unwrap()
             .insert(old_author_pr.html_url.clone(), old_pr_time());
@@ -2528,13 +2572,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reviews_team_request_when_an_old_draft_is_marked_ready() {
+        let github = FakeGithub::default();
+        let draft = pr_with_author_and_number("contributor", 9);
+        let author_pr = pr_with_author_and_number("dionysuzx", 3);
+        let author_only_on_updated = pr_with_author_and_number("dionysuzx", 4);
+        *github.pull_requests.lock().unwrap() = vec![author_pr.clone()];
+        *github.recently_updated_pull_requests.lock().unwrap() =
+            Some(vec![draft.clone(), author_only_on_updated.clone()]);
+        github
+            .pull_created_at
+            .lock()
+            .unwrap()
+            .insert(draft.html_url.clone(), Utc::now() - ChronoDuration::days(5));
+        request_team(&github, &draft, recent_pr_time());
+        github
+            .pull_updated_at
+            .lock()
+            .unwrap()
+            .insert(author_pr.html_url.clone(), old_pr_time());
+        github
+            .pull_updated_at
+            .lock()
+            .unwrap()
+            .insert(author_only_on_updated.html_url.clone(), recent_pr_time());
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 3);
+        assert_eq!(report.responded, 2);
+        assert_eq!(report.skipped, 1);
+        let urls = codex
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, task)| task.pr_url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/r/pull/3".to_string(),
+                "https://github.com/o/r/pull/9".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn skips_team_review_when_the_request_is_absent() {
         let github = FakeGithub::default();
         let removed = pr_with_author_and_number("contributor", 1);
         let other_team = pr_with_author_and_number("contributor", 2);
         *github.pull_requests.lock().unwrap() = vec![removed.clone(), other_team.clone()];
         github
-            .pull_created_at
+            .pull_updated_at
             .lock()
             .unwrap()
             .insert(removed.html_url.clone(), recent_pr_time());
@@ -2543,7 +2639,7 @@ mod tests {
             vec![team_slug("other-org/docs")],
         );
         github
-            .pull_created_at
+            .pull_updated_at
             .lock()
             .unwrap()
             .insert(other_team.html_url.clone(), recent_pr_time());
