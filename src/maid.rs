@@ -1404,6 +1404,7 @@ mod tests {
         mention: Arc<StdMutex<FakeMentionResult>>,
         mentions: Arc<StdMutex<FakeMentionsResult>>,
         pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
+        list_orders: Arc<StdMutex<Vec<OpenPullRequestOrder>>>,
         recently_updated_pull_requests: Arc<StdMutex<Option<Vec<PullRequest>>>>,
         requested_teams: Arc<StdMutex<HashMap<String, Vec<TeamSlug>>>>,
         pull_created_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
@@ -1454,6 +1455,7 @@ mod tests {
             _repo: &RepoSlug,
             order: OpenPullRequestOrder,
         ) -> Result<Vec<OpenPullRequest>> {
+            self.list_orders.lock().unwrap().push(order);
             let created = self.pull_requests.lock().unwrap().clone();
             let updated = self.recently_updated_pull_requests.lock().unwrap().clone();
             let pull_requests = match order {
@@ -2650,6 +2652,39 @@ mod tests {
         assert_eq!(report.skipped, 2);
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn team_review_off_lists_only_the_newest_created_page() {
+        let github = FakeGithub::default();
+        let author_pr = pr_with_author_and_number("dionysuzx", 3);
+        let team_pr = pr_with_author_and_number("contributor", 9);
+        *github.pull_requests.lock().unwrap() = vec![author_pr.clone(), team_pr.clone()];
+        request_team(&github, &team_pr, recent_pr_time());
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *github.list_orders.lock().unwrap(),
+            vec![OpenPullRequestOrder::NewestCreated]
+        );
+        assert_eq!(report.responded, 1);
+        let urls = codex
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, task)| task.pr_url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(urls, vec!["https://github.com/o/r/pull/3".to_string()]);
+        assert_eq!(
+            *github.pr_state_calls.lock().unwrap(),
+            vec!["https://github.com/o/r/pull/3".to_string()]
+        );
     }
 
     #[tokio::test]
