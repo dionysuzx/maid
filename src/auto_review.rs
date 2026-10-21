@@ -1,5 +1,6 @@
-use crate::domain::{CodexTask, CodexTaskOrigin, PullRequest, ReviewState};
+use crate::domain::{CodexTask, CodexTaskOrigin, PullRequest, ReviewState, TeamSlug};
 use crate::handled_marker::PendingHandledMarker;
+use chrono::{DateTime, Duration, Utc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutoReviewAuthor {
@@ -11,15 +12,42 @@ pub enum AutoReviewAuthor {
 pub fn classify_auto_review_author(
     pr: &PullRequest,
     bot_login: &str,
-    is_allowed_author: bool,
+    is_authorized: bool,
 ) -> AutoReviewAuthor {
     if pr.author.eq_ignore_ascii_case(bot_login) {
         AutoReviewAuthor::Bot
-    } else if is_allowed_author {
+    } else if is_authorized {
         AutoReviewAuthor::Allowed
     } else {
         AutoReviewAuthor::NotAllowed
     }
+}
+
+/// The configured team that authorizes review of this pull request, if any.
+///
+/// Authorization requires a configured team that is still in `requested_teams`
+/// and a `created_at` inside `window` measured from `now` (a future timestamp
+/// counts as inside). Pull requests older than the window are left alone, so
+/// enabling team review does not drain an existing backlog. A missing
+/// timestamp, an empty team list, or a non-positive window authorizes nothing.
+pub fn authorizing_team<'a>(
+    requested_teams: &[TeamSlug],
+    configured_teams: &'a [TeamSlug],
+    created_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    window: Duration,
+) -> Option<&'a TeamSlug> {
+    if window <= Duration::zero() {
+        return None;
+    }
+    let created_at = created_at?;
+    if now.signed_duration_since(created_at) > window {
+        return None;
+    }
+
+    configured_teams
+        .iter()
+        .find(|team| requested_teams.contains(*team))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +181,65 @@ mod tests {
                     && task.pr_url == "https://github.com/o/r/pull/1"
                     && matches!(task.origin, CodexTaskOrigin::PullRequestOpened { .. })
         ));
+    }
+
+    #[test]
+    fn team_review_authorizes_only_a_configured_team_inside_the_window() {
+        let now = DateTime::parse_from_rfc3339("2026-10-21T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let window = Duration::hours(24);
+        let configured = [
+            TeamSlug::parse("some-org/docs").unwrap(),
+            TeamSlug::parse("Some-Org/eng-infra").unwrap(),
+        ];
+        let requested = [
+            TeamSlug::parse("some-org/eng-infra").unwrap(),
+            TeamSlug::parse("some-org/docs").unwrap(),
+        ];
+
+        assert_eq!(
+            authorizing_team(&requested, &configured, Some(now - window), now, window)
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("some-org/docs")
+        );
+        assert!(
+            authorizing_team(
+                &requested,
+                &configured,
+                Some(now - window - Duration::seconds(1)),
+                now,
+                window,
+            )
+            .is_none()
+        );
+        assert!(authorizing_team(&requested, &configured, None, now, window).is_none());
+        assert!(authorizing_team(&[], &configured, Some(now), now, window).is_none());
+        assert!(authorizing_team(&requested, &[], Some(now), now, window).is_none());
+        assert!(
+            authorizing_team(
+                &[TeamSlug::parse("other-org/eng-infra").unwrap()],
+                &configured,
+                Some(now),
+                now,
+                window,
+            )
+            .is_none()
+        );
+        assert!(
+            authorizing_team(
+                &requested,
+                &configured,
+                Some(now + Duration::minutes(5)),
+                now,
+                window,
+            )
+            .is_some()
+        );
+        assert!(
+            authorizing_team(&requested, &configured, Some(now), now, Duration::zero()).is_none()
+        );
     }
 
     fn pr(author: &str) -> PullRequest {

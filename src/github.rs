@@ -1,10 +1,13 @@
 use crate::{
-    domain::{CommentMention, Issue, Notification, PullRequest, RepoSlug, ReviewState, WorkTarget},
+    domain::{
+        CommentMention, Issue, Notification, OpenPullRequest, PullRequest, RepoSlug, ReviewState,
+        TeamSlug, WorkTarget,
+    },
     maid::GithubClient,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use reqwest::{Client, Method, StatusCode, Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -320,15 +323,13 @@ impl GithubClient for GitHubRestClient {
             .collect())
     }
 
-    async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<PullRequest>> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/pulls?state=open&sort=created&direction=desc&per_page=50",
-            repo.owner, repo.repo
-        );
-        let pull_requests = self.get::<Vec<ApiPullRequest>>(&url).await?;
+    async fn open_pull_requests(&self, repo: &RepoSlug) -> Result<Vec<OpenPullRequest>> {
+        let pull_requests = self
+            .get::<Vec<ApiPullRequest>>(&open_pull_requests_url(repo))
+            .await?;
         pull_requests
             .into_iter()
-            .map(Self::pull_request_from_api)
+            .map(Self::open_pull_request_from_api)
             .collect()
     }
 
@@ -716,6 +717,62 @@ mod tests {
     }
 
     #[test]
+    fn lists_the_newest_open_pull_requests_on_a_single_page() {
+        assert_eq!(
+            open_pull_requests_url(&RepoSlug {
+                owner: "some-org".to_string(),
+                repo: "maid".to_string(),
+            }),
+            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=created&direction=desc&per_page=50"
+        );
+    }
+
+    #[test]
+    fn reads_requested_teams_from_a_pull_request_list_payload() {
+        let open = GitHubRestClient::open_pull_request_from_api(
+            serde_json::from_str(PULL_REQUEST_WITH_TEAM_FIXTURE).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(open.pull_request.author, "octocat");
+        assert_eq!(open.pull_request.number, 7);
+        assert_eq!(
+            open.requested_teams,
+            vec![TeamSlug::parse("some-org/eng-infra").unwrap()]
+        );
+        assert_eq!(
+            open.created_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-10-21T18:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+
+        let missing_teams = GitHubRestClient::open_pull_request_from_api(
+            serde_json::from_str(PULL_REQUEST_WITHOUT_TEAMS_FIXTURE).unwrap(),
+        )
+        .unwrap();
+        assert!(missing_teams.requested_teams.is_empty());
+
+        let null_teams = GitHubRestClient::open_pull_request_from_api(
+            serde_json::from_str(PULL_REQUEST_WITH_NULL_TEAMS_FIXTURE).unwrap(),
+        )
+        .unwrap();
+        assert!(null_teams.requested_teams.is_empty());
+
+        let dropped = GitHubRestClient::open_pull_request_from_api(
+            serde_json::from_str(PULL_REQUEST_WITH_UNUSABLE_TEAM_FIXTURE).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            dropped.requested_teams,
+            vec![TeamSlug::parse("some-org/docs").unwrap()]
+        );
+        assert!(dropped.created_at.is_none());
+    }
+
+    #[test]
     fn builds_public_pull_request_author_search_urls() {
         let url = Url::parse(&public_pull_request_search_url("Dionysuzx", 2).unwrap()).unwrap();
         let query = url
@@ -824,6 +881,97 @@ mod tests {
             }),
         }
     }
+
+    const PULL_REQUEST_WITH_TEAM_FIXTURE: &str = r#"
+{
+  "url": "https://api.github.com/repos/some-org/maid/pulls/7",
+  "html_url": "https://github.com/some-org/maid/pull/7",
+  "number": 7,
+  "user": { "login": "octocat" },
+  "created_at": "2026-10-21T18:00:00Z",
+  "requested_teams": [
+    {
+      "name": "Engineering Infra",
+      "slug": "Eng-Infra",
+      "html_url": "https://github.com/orgs/Some-Org/teams/eng-infra"
+    },
+    {
+      "name": "Engineering Infra",
+      "slug": "eng-infra",
+      "html_url": "https://github.com/orgs/Some-Org/teams/eng-infra"
+    }
+  ],
+  "base": {
+    "repo": {
+      "name": "maid",
+      "clone_url": "https://github.com/some-org/maid.git",
+      "owner": { "login": "some-org" }
+    }
+  }
+}
+"#;
+
+    const PULL_REQUEST_WITHOUT_TEAMS_FIXTURE: &str = r#"
+{
+  "url": "https://api.github.com/repos/some-org/maid/pulls/7",
+  "html_url": "https://github.com/some-org/maid/pull/7",
+  "number": 7,
+  "user": { "login": "octocat" },
+  "created_at": "2026-10-21T18:00:00Z",
+  "base": {
+    "repo": {
+      "name": "maid",
+      "clone_url": "https://github.com/some-org/maid.git",
+      "owner": { "login": "some-org" }
+    }
+  }
+}
+"#;
+
+    const PULL_REQUEST_WITH_NULL_TEAMS_FIXTURE: &str = r#"
+{
+  "url": "https://api.github.com/repos/some-org/maid/pulls/7",
+  "html_url": "https://github.com/some-org/maid/pull/7",
+  "number": 7,
+  "user": { "login": "octocat" },
+  "created_at": "2026-10-21T18:00:00Z",
+  "requested_teams": null,
+  "base": {
+    "repo": {
+      "name": "maid",
+      "clone_url": "https://github.com/some-org/maid.git",
+      "owner": { "login": "some-org" }
+    }
+  }
+}
+"#;
+
+    const PULL_REQUEST_WITH_UNUSABLE_TEAM_FIXTURE: &str = r#"
+{
+  "url": "https://api.github.com/repos/some-org/maid/pulls/7",
+  "html_url": "https://github.com/some-org/maid/pull/7",
+  "number": 7,
+  "user": { "login": "octocat" },
+  "created_at": "not-a-timestamp",
+  "requested_teams": [
+    {
+      "slug": "eng-infra",
+      "html_url": "https://example.com/not-a-team"
+    },
+    {
+      "slug": "docs",
+      "html_url": "https://github.com/orgs/Some-Org/teams/docs"
+    }
+  ],
+  "base": {
+    "repo": {
+      "name": "maid",
+      "clone_url": "https://github.com/some-org/maid.git",
+      "owner": { "login": "some-org" }
+    }
+  }
+}
+"#;
 
     fn api_repo(visibility: Option<ApiRepoVisibility>) -> ApiRepo {
         ApiRepo {
@@ -956,15 +1104,15 @@ impl GitHubRestClient {
 
     async fn pull_request_from_url(&self, pr_url: &str) -> Result<PullRequest> {
         let pr = self.get::<ApiPullRequest>(pr_url).await?;
-        Self::pull_request_from_api(pr)
+        Ok(Self::open_pull_request_from_api(pr)?.pull_request)
     }
 
-    fn pull_request_from_api(pr: ApiPullRequest) -> Result<PullRequest> {
+    fn open_pull_request_from_api(pr: ApiPullRequest) -> Result<OpenPullRequest> {
         let Some(owner) = pr.base.repo.owner else {
             return Err(anyhow!("pull request base repo has no owner"));
         };
 
-        Ok(PullRequest {
+        let pull_request = PullRequest {
             owner: owner.login,
             repo: pr.base.repo.name,
             number: pr.number,
@@ -972,6 +1120,20 @@ impl GitHubRestClient {
             api_url: pr.url,
             html_url: pr.html_url,
             clone_url: pr.base.repo.clone_url,
+        };
+        let created_at = created_at_from_api(&pr.created_at);
+        if created_at.is_none() {
+            warn!(
+                pr = %pull_request.html_url,
+                created_at = %pr.created_at,
+                "pull request created_at could not be parsed; team review will skip it"
+            );
+        }
+
+        Ok(OpenPullRequest {
+            requested_teams: requested_teams_from_api(pr.requested_teams),
+            created_at,
+            pull_request,
         })
     }
 
@@ -1112,6 +1274,47 @@ fn reaction_page_url(reactions_url: &str, page: u64) -> String {
     format!("{reactions_url}?per_page=100&page={page}")
 }
 
+fn open_pull_requests_url(repo: &RepoSlug) -> String {
+    format!(
+        "https://api.github.com/repos/{}/{}/pulls?state=open&sort=created&direction=desc&per_page=50",
+        repo.owner, repo.repo
+    )
+}
+
+fn created_at_from_api(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|created_at| created_at.with_timezone(&Utc))
+}
+
+fn requested_teams_from_api(teams: Option<Vec<ApiRequestedTeam>>) -> Vec<TeamSlug> {
+    let mut parsed = Vec::new();
+    for team in teams.unwrap_or_default() {
+        let Some(html_url) = team
+            .html_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+        else {
+            warn!(slug = team.slug, "ignoring requested team without html_url");
+            continue;
+        };
+
+        match TeamSlug::from_github_team(&team.slug, html_url) {
+            Ok(slug) if !parsed.contains(&slug) => parsed.push(slug),
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    slug = team.slug,
+                    html_url,
+                    error = %err,
+                    "ignoring requested team"
+                );
+            }
+        }
+    }
+    parsed
+}
+
 fn notification_page_url(since: &str, page: usize) -> String {
     format!(
         "https://api.github.com/notifications?participating=true&all=true&per_page={NOTIFICATION_PAGE_SIZE}&page={page}&since={since}"
@@ -1250,7 +1453,16 @@ struct ApiPullRequest {
     html_url: String,
     number: u64,
     user: ApiUser,
+    created_at: String,
+    #[serde(default)]
+    requested_teams: Option<Vec<ApiRequestedTeam>>,
     base: ApiPullRequestBase,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiRequestedTeam {
+    slug: String,
+    html_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

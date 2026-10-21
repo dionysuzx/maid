@@ -13,6 +13,15 @@ auto_review_repos = ["your-name/maid"]
 # master_accounts. Empty or omitted disables cross-repository discovery.
 auto_review_public_accounts = ["your-name"]
 
+# Optional. Reviews an open pull request in auto_review_repos when one of these
+# teams is still requested. Entries are org/team-slug. Any author is eligible
+# except the bot. Empty or omitted disables team reviews. Only pull requests
+# created within github_notification_window_hours, and only the newest 50 open
+# pull requests per watched repository, are considered, so an existing backlog
+# is not reviewed. Each pull request is reviewed at most once. A team request
+# removed before that read is skipped.
+auto_review_teams = ["Some-Org/eng-infra"]
+
 # Optional. Defaults shown below.
 git_dir = "~/.maid/git"
 codex_bin = "codex"

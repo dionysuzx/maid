@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use std::fmt;
 
 pub const OPERATOR_TRIGGER: &str = "/operate";
@@ -57,6 +58,98 @@ impl fmt::Display for RepoSlug {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}/{}", self.owner, self.repo)
     }
+}
+
+/// A GitHub team, written `org/team-slug`.
+///
+/// Constructed only by parsing config or a GitHub team URL, both of which
+/// normalize case. Equality is the authorization check for team review.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TeamSlug {
+    org: String,
+    team: String,
+}
+
+impl TeamSlug {
+    pub fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        let Some((org, team)) = value.split_once('/') else {
+            return Err(anyhow!(
+                "team must be formatted as org/team-slug: {value:?}"
+            ));
+        };
+        if team.contains('/') {
+            return Err(anyhow!(
+                "team must be formatted as org/team-slug: {value:?}"
+            ));
+        }
+
+        Self::from_parts(org, team)
+    }
+
+    /// Build a team from the slug and `html_url` on a pull request's requested team.
+    ///
+    /// GitHub's team object has no organization login. The org comes from
+    /// `https://github.com/orgs/{org}/teams/{slug}`. A slug that disagrees with
+    /// that URL is rejected so a partial payload cannot authorize the wrong team.
+    pub fn from_github_team(slug: &str, html_url: &str) -> Result<Self> {
+        let parsed = Self::from_html_url(html_url)?;
+        let slug = slug.trim().to_ascii_lowercase();
+        if slug != parsed.team {
+            return Err(anyhow!(
+                "requested team slug {slug:?} does not match {html_url}"
+            ));
+        }
+
+        Ok(parsed)
+    }
+
+    fn from_html_url(value: &str) -> Result<Self> {
+        let Some(path) = value.trim().strip_prefix("https://github.com/orgs/") else {
+            return Err(anyhow!(
+                "requested team html_url must be an orgs team URL: {value:?}"
+            ));
+        };
+        let Some((org, team)) = path.split_once("/teams/") else {
+            return Err(anyhow!(
+                "requested team html_url must be an orgs team URL: {value:?}"
+            ));
+        };
+        if team.contains('/') || team.is_empty() {
+            return Err(anyhow!(
+                "requested team html_url must be an orgs team URL: {value:?}"
+            ));
+        }
+
+        Self::from_parts(org, team)
+    }
+
+    fn from_parts(org: &str, team: &str) -> Result<Self> {
+        validate_repo_name_part(org, "team organization")?;
+        validate_repo_name_part(team, "team slug")?;
+        Ok(Self {
+            org: org.to_ascii_lowercase(),
+            team: team.to_ascii_lowercase(),
+        })
+    }
+}
+
+impl fmt::Display for TeamSlug {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.org, self.team)
+    }
+}
+
+/// One open pull request from GitHub's list endpoint.
+///
+/// `requested_teams` is who was still requested on that read. `created_at` is
+/// absent when the timestamp cannot be parsed: author auto-review can still
+/// proceed, and team review will not.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenPullRequest {
+    pub pull_request: PullRequest,
+    pub requested_teams: Vec<TeamSlug>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -653,6 +746,52 @@ mod tests {
         assert!(RepoSlug::parse("dionysuzx").is_err());
         assert!(RepoSlug::parse("dionysuzx/maid/extra").is_err());
         assert!(RepoSlug::parse("../maid").is_err());
+    }
+
+    #[test]
+    fn parses_team_slugs() {
+        assert_eq!(
+            TeamSlug::parse(" Some-Org/Eng-Infra ").unwrap().to_string(),
+            "some-org/eng-infra"
+        );
+        assert_eq!(
+            TeamSlug::parse("Some-Org/Eng-Infra").unwrap(),
+            TeamSlug::parse("some-org/eng-infra").unwrap()
+        );
+
+        assert!(TeamSlug::parse("eng-infra").is_err());
+        assert!(TeamSlug::parse("some-org/eng-infra/extra").is_err());
+        assert!(TeamSlug::parse("some-org/").is_err());
+        assert!(TeamSlug::parse("/eng-infra").is_err());
+        assert!(TeamSlug::parse("../eng-infra").is_err());
+    }
+
+    #[test]
+    fn parses_requested_team_from_github_html_url() {
+        let team = TeamSlug::from_github_team(
+            "Eng-Infra",
+            "https://github.com/orgs/Some-Org/teams/eng-infra",
+        )
+        .unwrap();
+
+        assert_eq!(team, TeamSlug::parse("some-org/eng-infra").unwrap());
+        assert!(
+            TeamSlug::from_github_team(
+                "other",
+                "https://github.com/orgs/Some-Org/teams/eng-infra",
+            )
+            .is_err()
+        );
+        assert!(
+            TeamSlug::from_github_team("eng-infra", "https://github.com/orgs/some-org").is_err()
+        );
+        assert!(
+            TeamSlug::from_github_team(
+                "eng-infra",
+                "https://github.com/orgs/some-org/teams/eng-infra/members",
+            )
+            .is_err()
+        );
     }
 
     fn test_prompts() -> CodexPromptTemplates {
