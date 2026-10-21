@@ -131,12 +131,8 @@ pub struct Maid<G, R, C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AutoReviewSource {
     Repository,
-    /// The recently-updated page. It authorizes a team request only; author
-    /// auto-review still comes from the newest-created page.
     TeamActivity,
-    PublicAuthor {
-        login: String,
-    },
+    PublicAuthor { login: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

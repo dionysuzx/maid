@@ -48,30 +48,12 @@ requests Maid should discover across GitHub. Maid ignores PRs into private base
 repositories. Repository-scoped review remains available through
 `auto_review_repos` and `auto_review_accounts`.
 
-Set `auto_review_teams` to `org/team-slug` entries, for example
-`Some-Org/eng-infra`, to review an open pull request in `auto_review_repos`
-when that team is still in the pull request's requested reviewers. Any author
-is eligible except Maid itself. The review is the same automatic review used
-for trusted authors, including the same prompt, one comment, and the same
-handled reaction and local marker, so a pull request is reviewed at most once.
-Empty or omitted leaves team review off.
-
-Maid does not walk an existing backlog. Author auto-review reads the 50
-newest open pull requests by creation time in each watched repository.
-Team review, only when `auto_review_teams` is set, reads a second page: the
-50 most recently updated open pull requests
-(`sort=updated&direction=desc`). A team review starts when `updated_at` is
-inside `github_notification_window_hours` (24 by default) and that team is
-still requested on the read. GitHub moves `updated_at` when a draft is marked
+For `auto_review_teams`, GitHub moves `updated_at` when a draft is marked
 ready or a reviewer is requested, and also when someone later comments or
-pushes on a pull request that still requests the team. Untouched older pull
-requests stay out of the page. The list has no request timestamp, and the
-timeline is a separate oldest-first history, so the bound is last activity.
-A team request already removed by that read is skipped. Author auto-review
-does not use this window or the recently-updated page, so the pull requests
-it sees are unchanged. `review_requested` notifications are not the trigger:
-GitHub rewrites notification reasons, and the bot only receives them when it
-is on the team. The pull request's `requested_teams` is the signal.
+pushes on a pull request that still requests the team. The pull request list
+has no request timestamp, and the timeline is a separate oldest-first history.
+GitHub rewrites notification reasons, and the bot only receives
+`review_requested` when it is on the team.
 
 ## Metrics
 

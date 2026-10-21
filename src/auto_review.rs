@@ -23,14 +23,6 @@ pub fn classify_auto_review_author(
     }
 }
 
-/// The configured team that authorizes review of this pull request, if any.
-///
-/// `updated_at` is the pull request's last activity. Requesting a team and
-/// marking a draft ready both move it, so a request is eligible when it
-/// happens rather than when the pull request was opened. Activity outside
-/// `window` (measured from `now`; a future timestamp counts as inside)
-/// authorizes nothing, which leaves an untouched backlog alone. A missing
-/// timestamp, an empty team list, or a non-positive window authorizes nothing.
 pub fn authorizing_team<'a>(
     requested_teams: &[TeamSlug],
     configured_teams: &'a [TeamSlug],

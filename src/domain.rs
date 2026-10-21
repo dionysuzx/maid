@@ -60,10 +60,6 @@ impl fmt::Display for RepoSlug {
     }
 }
 
-/// A GitHub team, written `org/team-slug`.
-///
-/// Constructed only by parsing config or a GitHub team URL, both of which
-/// normalize case. Equality is the authorization check for team review.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TeamSlug {
     org: String,
@@ -87,11 +83,7 @@ impl TeamSlug {
         Self::from_parts(org, team)
     }
 
-    /// Build a team from the slug and `html_url` on a pull request's requested team.
-    ///
-    /// GitHub's team object has no organization login. The org comes from
-    /// `https://github.com/orgs/{org}/teams/{slug}`. A slug that disagrees with
-    /// that URL is rejected so a partial payload cannot authorize the wrong team.
+    /// GitHub's team object has no organization login.
     pub fn from_github_team(slug: &str, html_url: &str) -> Result<Self> {
         let parsed = Self::from_html_url(html_url)?;
         let slug = slug.trim().to_ascii_lowercase();
@@ -140,24 +132,12 @@ impl fmt::Display for TeamSlug {
     }
 }
 
-/// Which page of open pull requests to list.
-///
-/// Author auto-review uses [`OpenPullRequestOrder::NewestCreated`]. Team review
-/// uses [`OpenPullRequestOrder::RecentlyUpdated`], because a team is often
-/// requested days after creation, when a draft is marked ready.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenPullRequestOrder {
     NewestCreated,
     RecentlyUpdated,
 }
 
-/// One open pull request from GitHub's list endpoint.
-///
-/// `requested_teams` is who was still requested on that read. `updated_at` is
-/// the pull request's last activity and is the team-review backlog bound:
-/// requesting reviewers, or marking a draft ready, moves it. `created_at` is
-/// not that bound. Either timestamp is absent when it cannot be parsed; author
-/// auto-review still proceeds, and team review does not without `updated_at`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenPullRequest {
     pub pull_request: PullRequest,
