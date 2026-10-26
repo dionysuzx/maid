@@ -1,5 +1,5 @@
 use crate::{
-    domain::{CodexPromptTemplates, RepoSlug},
+    domain::{CodexPromptTemplates, RepoSlug, TeamSlug},
     github::{
         DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
         GitHubApiRequestRate, GitHubNotificationWindow,
@@ -22,6 +22,7 @@ pub struct Config {
     pub auto_review_accounts: Vec<String>,
     pub auto_review_public_accounts: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
+    pub auto_review_teams: Vec<TeamSlug>,
     pub git_dir: PathBuf,
     pub daemon_pid_path: PathBuf,
     pub task_start_ledger_path: PathBuf,
@@ -71,6 +72,7 @@ impl Config {
             "auto_review_public_accounts",
         )?;
         let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
+        let auto_review_teams = optional_teams(file.auto_review_teams, "auto_review_teams")?;
         let git_dir = non_empty(file.git_dir)
             .map(|path| expand_home(&path))
             .transpose()?
@@ -123,6 +125,7 @@ impl Config {
             auto_review_accounts,
             auto_review_public_accounts,
             auto_review_repos,
+            auto_review_teams,
             git_dir,
             daemon_pid_path: maid_home.join("maid.pid"),
             task_start_ledger_path: maid_home.join("task-starts.json"),
@@ -149,6 +152,7 @@ struct ConfigFile {
     auto_review_accounts: Option<Vec<String>>,
     auto_review_public_accounts: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
+    auto_review_teams: Option<Vec<String>>,
     git_dir: Option<String>,
     task_limit_per_24h: Option<usize>,
     max_concurrent_requests: Option<usize>,
@@ -236,6 +240,21 @@ fn optional_repos(value: Option<Vec<String>>, key: &str) -> Result<Vec<RepoSlug>
         }
     }
     Ok(repos)
+}
+
+fn optional_teams(value: Option<Vec<String>>, key: &str) -> Result<Vec<TeamSlug>> {
+    let Some(raw_teams) = value else {
+        return Ok(Vec::new());
+    };
+
+    let mut teams = Vec::new();
+    for team in raw_teams {
+        let team = TeamSlug::parse(&team).with_context(|| format!("invalid {key} entry"))?;
+        if !teams.contains(&team) {
+            teams.push(team);
+        }
+    }
+    Ok(teams)
 }
 
 fn require_subset(logins: &[String], trusted_logins: &[String], key: &str) -> Result<()> {
@@ -365,6 +384,7 @@ master_accounts = ["dionysuzx"]
 auto_review_accounts = ["dionysuzx"]
 auto_review_public_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
+auto_review_teams = ["Some-Org/eng-infra"]
 git_dir = "~/.maid/git"
 task_limit_per_24h = 5
 max_concurrent_requests = 3
@@ -399,6 +419,10 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(
             config.auto_review_repos,
             Some(vec!["dionysuzx/maid".to_string()])
+        );
+        assert_eq!(
+            config.auto_review_teams,
+            Some(vec!["Some-Org/eng-infra".to_string()])
         );
         assert_eq!(config.git_dir.as_deref(), Some("~/.maid/git"));
         assert_eq!(config.task_limit_per_24h, Some(5));
@@ -437,6 +461,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.auto_review_accounts, None);
         assert_eq!(config.auto_review_public_accounts, None);
         assert_eq!(config.auto_review_repos, None);
+        assert_eq!(config.auto_review_teams, None);
         assert_eq!(config.git_dir, None);
         assert_eq!(config.task_limit_per_24h, None);
         assert_eq!(config.github_api_requests_per_hour, None);
@@ -569,6 +594,34 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(
             optional_repos(None, "auto_review_repos").unwrap(),
             Vec::<RepoSlug>::new()
+        );
+    }
+
+    #[test]
+    fn optional_teams_parse_to_slugs() {
+        assert_eq!(
+            optional_teams(
+                Some(vec![
+                    "  Some-Org/Eng-Infra  ".to_string(),
+                    "some-org/eng-infra".to_string(),
+                    "some-org/docs".to_string()
+                ]),
+                "auto_review_teams"
+            )
+            .unwrap(),
+            vec![
+                TeamSlug::parse("some-org/eng-infra").unwrap(),
+                TeamSlug::parse("some-org/docs").unwrap()
+            ]
+        );
+        assert_eq!(
+            optional_teams(Some(Vec::new()), "auto_review_teams").unwrap(),
+            Vec::<TeamSlug>::new()
+        );
+        assert!(optional_teams(Some(vec!["eng-infra".to_string()]), "auto_review_teams").is_err());
+        assert_eq!(
+            optional_teams(None, "auto_review_teams").unwrap(),
+            Vec::<TeamSlug>::new()
         );
     }
 

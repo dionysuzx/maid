@@ -5,9 +5,10 @@ Maid is a smol bot that runs local Codex on GitHub events.
 It watches for opened PRs and issue or PR mentions to your configured GitHub bot account
 (a "maid), checks that the request came from a trusted master account, prepares
 an isolated worktree, runs `codex`, and posts Codex's final answer back as a
-comment. It can also run automatic reviews for configured repositories or for
-configured accounts across all public repositories, and trusted users can
-request adhoc operator tasks with `/operate`.
+comment. It can also run automatic reviews for configured repositories, for
+configured accounts across all public repositories, or when a configured team
+is requested on an open pull request, and trusted users can request adhoc
+operator tasks with `/operate`.
 
 Each task runs in its own git worktree while sharing a cached bare repository
 for the source GitHub repo.
@@ -46,6 +47,13 @@ Set `auto_review_public_accounts` to trusted GitHub logins whose open pull
 requests Maid should discover across GitHub. Maid ignores PRs into private base
 repositories. Repository-scoped review remains available through
 `auto_review_repos` and `auto_review_accounts`.
+
+For `auto_review_teams`, GitHub moves `updated_at` when a draft is marked
+ready or a reviewer is requested, and also when someone later comments or
+pushes on a pull request that still requests the team. The pull request list
+has no request timestamp, and the timeline is a separate oldest-first history.
+GitHub rewrites notification reasons, and the bot only receives
+`review_requested` when it is on the team.
 
 ## Metrics
 

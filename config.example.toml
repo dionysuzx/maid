@@ -13,6 +13,10 @@ auto_review_repos = ["your-name/maid"]
 # master_accounts. Empty or omitted disables cross-repository discovery.
 auto_review_public_accounts = ["your-name"]
 
+# Optional. A comment or push inside github_notification_window_hours can still
+# qualify a pull request that still requests the team.
+auto_review_teams = ["Some-Org/eng-infra"]
+
 # Optional. Defaults shown below.
 git_dir = "~/.maid/git"
 codex_bin = "codex"
