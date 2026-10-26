@@ -65,7 +65,7 @@ impl PromptHash {
         &self.0
     }
 
-    fn parse_hex(value: &str) -> Result<Self> {
+    pub fn parse_hex(value: &str) -> Result<Self> {
         if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
             bail!("prompt hash must be 64 hex characters");
         }
@@ -77,7 +77,7 @@ impl PromptHash {
         Ok(Self(bytes))
     }
 
-    fn to_hex(&self) -> String {
+    pub fn to_hex(&self) -> String {
         self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }

@@ -4,7 +4,7 @@ use crate::domain::{
     OpenPullRequestOrder, PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
 };
 use crate::handled_marker::{
-    MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
+    MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore, UnflushedPost,
 };
 use crate::mention_thread::{
     MentionNotificationPlan, MentionObservation, MentionThread, MentionThreadAction,
@@ -380,6 +380,11 @@ where
             error!(
                 error = ?err,
                 "skipping auto-review because the review ledger is unreadable"
+            );
+        } else if let Err(err) = self.flush_unflushed_posts() {
+            error!(
+                error = ?err,
+                "skipping auto-review because a posted review could not be recorded"
             );
         } else {
             self.review_candidates(&mut report, &mut observed_pending_markers)
@@ -1174,9 +1179,30 @@ where
         identity: &RunIdentity,
         outcome: Outcome,
     ) -> Result<()> {
+        let posted = match &outcome {
+            Outcome::Posted { comment_url } => Some(comment_url.clone()),
+            Outcome::Failed => None,
+        };
         let recorded = self.record_finished_review(pr_url, head, identity, outcome);
         let marker = PendingHandledMarker::for_pull_request(pr);
         self.pending_handled_markers.record(&marker)?;
+        let remembered = if recorded.is_err() {
+            match posted {
+                Some(comment_url) => self.pending_handled_markers.remember_post(&UnflushedPost {
+                    pr: pr_url.as_str().to_string(),
+                    sha: head.as_str().to_string(),
+                    model: identity.model.as_str().to_string(),
+                    prompt_hash: identity.prompt_hash.to_hex(),
+                    effort: identity.effort.as_str().to_string(),
+                    started_unix: identity.started_unix,
+                    finished_unix: identity.finished_unix,
+                    comment_url: comment_url.as_str().to_string(),
+                }),
+                None => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
         if let Err(err) = self.github.mark_pr_handled(pr).await {
             error!(
                 pr = %pr.html_url,
@@ -1184,7 +1210,32 @@ where
                 "failed to mark auto-review pull request handled after posting response"
             );
         }
-        recorded
+        remembered.and(recorded)
+    }
+
+    fn flush_unflushed_posts(&self) -> Result<()> {
+        for post in self.pending_handled_markers.unflushed_posts()? {
+            let pr = PrUrl::parse(&post.pr)?;
+            let sha = HeadSha::parse(&post.sha)?;
+            self.reviews.record(
+                &pr,
+                &sha,
+                ReviewRun::new(
+                    ReviewAgent::Codex,
+                    ModelName::parse(&post.model)?,
+                    PromptHash::parse_hex(&post.prompt_hash)?,
+                    EffortName::parse(&post.effort)?,
+                    post.started_unix,
+                    post.finished_unix,
+                    Outcome::Posted {
+                        comment_url: CommentUrl::parse(&post.comment_url)?,
+                    },
+                )?,
+            )?;
+            self.pending_handled_markers
+                .forget_post(&post.pr, &post.sha)?;
+        }
+        Ok(())
     }
 
     fn record_finished_review(
@@ -1316,6 +1367,11 @@ where
             error!(
                 error = ?err,
                 "skipping auto-review because the review ledger is unreadable"
+            );
+        } else if let Err(err) = self.maid.flush_unflushed_posts() {
+            error!(
+                error = ?err,
+                "skipping auto-review because a posted review could not be recorded"
             );
         } else {
             for candidate in self.maid.auto_review_candidates().await? {
@@ -2924,9 +2980,21 @@ mod tests {
 
     #[tokio::test]
     async fn unwritable_ledger_still_posts_one_comment_and_does_not_review_again() {
+        unwritable_ledger_posts_once(false).await;
+    }
+
+    #[tokio::test]
+    async fn unwritable_ledger_with_continuous_review_posts_once() {
+        unwritable_ledger_posts_once(true).await;
+    }
+
+    async fn unwritable_ledger_posts_once(continuous_review: bool) {
         let github = FakeGithub::default();
         let pull_request = pr();
         *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        if continuous_review {
+            set_head(&github, &pull_request, FAKE_HEAD_SHA);
+        }
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join("reviews");
         std::fs::create_dir(&directory).unwrap();
@@ -2935,6 +3003,7 @@ mod tests {
         let markers = MemoryPendingHandledMarkerStore::default();
         let codex = FakeCodex::default();
         let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_continuous_review(continuous_review)
             .with_review_ledger(reviews.clone())
             .with_pending_handled_marker_store(markers.clone());
         let _restore = RestoreWriteAccess(&directory);
@@ -2959,6 +3028,9 @@ mod tests {
                 .unwrap()
         );
         assert!(reviews.is_empty().unwrap());
+        let pending = markers.unflushed_posts().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sha, FAKE_HEAD_SHA);
 
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
         let second = maid.run_once().await.unwrap();
@@ -2967,7 +3039,15 @@ mod tests {
         assert_eq!(second.failed, 0);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
         assert_eq!(github.posts.lock().unwrap().len(), 1);
-        assert!(reviews.is_empty().unwrap());
+        assert!(markers.unflushed_posts().unwrap().is_empty());
+        let runs = reviews
+            .runs(
+                &PrUrl::parse(&pull_request.html_url).unwrap(),
+                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(matches!(runs[0].outcome(), Outcome::Posted { .. }));
     }
 
     struct RestoreWriteAccess<'a>(&'a Path);
