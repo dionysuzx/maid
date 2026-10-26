@@ -12,7 +12,7 @@ use maid::{
     task_limit::FileTaskStartRecorder,
     worktree::GitWorktrees,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
     .with_continuous_review(config.continuous_review)
     .with_max_failures_per_head(config.max_failures_per_head)
     .into_concurrent(config.max_concurrent_requests);
+    let maid = Arc::new(maid);
 
     let task_limit_per_24h = config
         .task_limit_per_24h
@@ -72,9 +73,10 @@ async fn main() -> Result<()> {
         .max_failures_per_head
         .map_or_else(|| "none".to_string(), |limit| limit.get().to_string());
     let poller_metrics = polling_metrics.clone();
+    let poller_maid = Arc::clone(&maid);
     let poller = tokio::spawn(async move {
         loop {
-            match maid.run_once().await {
+            match poller_maid.run_once().await {
                 Ok(report) => {
                     poller_metrics.record_success();
                     info!(
@@ -117,6 +119,7 @@ async fn main() -> Result<()> {
     shutdown_signal().await;
     poller.abort();
     let _ = poller.await;
+    maid.drain().await;
     metrics_server.abort();
     let _ = metrics_server.await;
 
