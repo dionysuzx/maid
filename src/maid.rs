@@ -166,7 +166,7 @@ struct AutoReviewCandidate {
     source: AutoReviewSource,
     requested_teams: Vec<TeamSlug>,
     updated_at: Option<DateTime<Utc>>,
-    head_sha: Option<String>,
+    head_sha: Option<HeadSha>,
 }
 
 impl AutoReviewCandidate {
@@ -778,14 +778,6 @@ where
                 );
                 return Ok(TaskAssessment::Skipped);
             };
-            let Ok(sha) = HeadSha::parse(&sha) else {
-                info!(
-                    pr = %pr.html_url,
-                    head = %sha,
-                    "skipping pull request with an unreadable head sha"
-                );
-                return Ok(TaskAssessment::Skipped);
-            };
             Observation::Head {
                 pr: PrUrl::parse(&pr.html_url)?,
                 sha,
@@ -806,7 +798,7 @@ where
     async fn head_for_continuous_review(
         &self,
         candidate: &AutoReviewCandidate,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<HeadSha>> {
         if let Some(sha) = &candidate.head_sha {
             return Ok(Some(sha.clone()));
         }
@@ -1821,7 +1813,12 @@ mod tests {
                     .unwrap_or_default(),
                 created_at: self.pull_created_at.lock().unwrap().get(&html_url).copied(),
                 updated_at: self.pull_updated_at.lock().unwrap().get(&html_url).copied(),
-                head_sha: self.head_shas.lock().unwrap().get(&html_url).cloned(),
+                head_sha: self
+                    .head_shas
+                    .lock()
+                    .unwrap()
+                    .get(&html_url)
+                    .and_then(|sha| HeadSha::parse(sha).ok()),
                 pull_request,
             }
         }
@@ -2863,39 +2860,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuous_review_off_ignores_a_new_head_on_a_handled_pull_request() {
+    async fn unset_continuous_review_keeps_the_old_poll() {
         let github = FakeGithub::default();
-        let pull_request = pr();
-        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        let handled = pr_with_number(1);
+        let pending = pr_with_number(2);
+        *github.pull_requests.lock().unwrap() = vec![handled.clone(), pending.clone()];
         github
             .handled_prs
             .lock()
             .unwrap()
-            .insert(pull_request.html_url.clone());
-        set_head(&github, &pull_request, OTHER_HEAD_SHA);
+            .insert(handled.html_url.clone());
+        set_head(&github, &handled, OTHER_HEAD_SHA);
+        set_head(&github, &pending, FAKE_HEAD_SHA);
         let reviews = MemoryReviewLedger::default();
-        record_posted_run(&reviews, &pull_request, FAKE_HEAD_SHA);
+        record_posted_run(&reviews, &handled, FAKE_HEAD_SHA);
         let starts = recording_recorder();
+        let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
-            .with_review_ledger(reviews)
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_review_ledger(reviews.clone())
             .with_task_start_recorder(starts.clone())
             .run_once()
             .await
             .unwrap();
 
+        assert_eq!(report.seen, 2);
         assert_eq!(report.skipped, 1);
-        assert_eq!(report.responded, 0);
-        assert_eq!(*starts.calls.lock().unwrap(), 0);
-        assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.pull_gets.lock().unwrap().is_empty());
+        assert_eq!(report.responded, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
+        assert_eq!(
+            *github.list_orders.lock().unwrap(),
+            vec![OpenPullRequestOrder::NewestCreated]
+        );
         assert!(
             github
-                .events
+                .public_pull_request_authors
                 .lock()
                 .unwrap()
-                .iter()
-                .all(|event| event != "start_pr")
+                .is_empty()
+        );
+        assert!(github.pull_gets.lock().unwrap().is_empty());
+        assert_eq!(
+            *github.pr_state_calls.lock().unwrap(),
+            vec![handled.html_url.clone(), pending.html_url.clone()]
+        );
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["start_pr", "post", "handled_pr"]
+        );
+        assert_eq!(
+            *github.started_prs.lock().unwrap(),
+            vec![pending.html_url.clone()]
+        );
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(codex.calls.lock().unwrap()[0].1.pr_url, pending.html_url);
+        assert!(
+            reviews
+                .runs(
+                    &PrUrl::parse(&handled.html_url).unwrap(),
+                    &HeadSha::parse(OTHER_HEAD_SHA).unwrap(),
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reviews
+                .runs(
+                    &PrUrl::parse(&handled.html_url).unwrap(),
+                    &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+                )
+                .unwrap()
+                .len(),
+            1
         );
     }
 

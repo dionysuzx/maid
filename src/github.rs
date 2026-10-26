@@ -4,6 +4,7 @@ use crate::{
         RepoSlug, ReviewState, TeamSlug, WorkTarget,
     },
     maid::GithubClient,
+    pr_review::HeadSha,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -783,7 +784,7 @@ mod tests {
             )
         );
         assert_eq!(
-            open.head_sha.as_deref(),
+            open.head_sha.as_ref().map(HeadSha::as_str),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
 
@@ -810,6 +811,19 @@ mod tests {
         );
         assert!(dropped.created_at.is_some());
         assert!(dropped.updated_at.is_none());
+    }
+
+    #[test]
+    fn unparseable_head_sha_is_absent() {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(PULL_REQUEST_WITHOUT_TEAMS_FIXTURE).unwrap();
+        payload["head"] = serde_json::json!({ "sha": "not-a-sha" });
+
+        let open =
+            GitHubRestClient::open_pull_request_from_api(serde_json::from_value(payload).unwrap())
+                .unwrap();
+
+        assert_eq!(open.head_sha, None);
     }
 
     #[test]
@@ -1180,9 +1194,25 @@ impl GitHubRestClient {
             requested_teams: requested_teams_from_api(pr.requested_teams),
             created_at,
             updated_at,
-            head_sha: pr.head.map(|head| head.sha),
+            head_sha: Self::head_sha_from_api(&pull_request.html_url, pr.head.map(|head| head.sha)),
             pull_request,
         })
+    }
+
+    fn head_sha_from_api(html_url: &str, sha: Option<String>) -> Option<HeadSha> {
+        let sha = sha?;
+        match HeadSha::parse(&sha) {
+            Ok(head) => Some(head),
+            Err(err) => {
+                warn!(
+                    pr = %html_url,
+                    head = %sha,
+                    error = %err,
+                    "pull request head sha could not be parsed"
+                );
+                None
+            }
+        }
     }
 
     fn public_pull_request_from_search_item(

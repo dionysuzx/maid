@@ -1,3 +1,4 @@
+use crate::pr_review::HeadSha;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use std::fmt;
@@ -144,7 +145,7 @@ pub struct OpenPullRequest {
     pub requested_teams: Vec<TeamSlug>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
-    pub head_sha: Option<String>,
+    pub head_sha: Option<HeadSha>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
