@@ -166,6 +166,32 @@ enum AutoReviewSource {
     PublicAuthor { login: String },
 }
 
+impl AutoReviewSource {
+    fn has_allowed_author(
+        &self,
+        author: &str,
+        repository_accounts: &HashSet<String>,
+        public_accounts: &HashSet<String>,
+    ) -> bool {
+        match self {
+            Self::Repository => repository_accounts.contains(&author.to_ascii_lowercase()),
+            Self::TeamActivity => false,
+            Self::PublicAuthor { login } => {
+                public_accounts.contains(login) && author.eq_ignore_ascii_case(login)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiscoveredCandidate {
+    pr: PullRequest,
+    source: AutoReviewSource,
+    requested_teams: Vec<TeamSlug>,
+    updated_at: Option<DateTime<Utc>>,
+    listed_head: Option<HeadSha>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AutoReviewCandidate {
     pr: PullRequest,
@@ -181,15 +207,8 @@ impl AutoReviewCandidate {
         repository_accounts: &HashSet<String>,
         public_accounts: &HashSet<String>,
     ) -> bool {
-        match &self.source {
-            AutoReviewSource::Repository => {
-                repository_accounts.contains(&self.pr.author.to_ascii_lowercase())
-            }
-            AutoReviewSource::TeamActivity => false,
-            AutoReviewSource::PublicAuthor { login } => {
-                public_accounts.contains(login) && self.pr.author.eq_ignore_ascii_case(login)
-            }
-        }
+        self.source
+            .has_allowed_author(&self.pr.author, repository_accounts, public_accounts)
     }
 }
 
@@ -782,7 +801,7 @@ where
     }
 
     async fn auto_review_candidates(&self) -> Result<Vec<AutoReviewCandidate>> {
-        let mut candidates = Vec::new();
+        let mut discovered = Vec::new();
 
         for repo in &self.auto_review_repos {
             for open in self
@@ -794,16 +813,13 @@ where
                 )
                 .await?
             {
-                candidates.push(
-                    self.auto_review_candidate(
-                        open.pull_request,
-                        AutoReviewSource::Repository,
-                        open.requested_teams,
-                        open.updated_at,
-                        open.head_sha,
-                    )
-                    .await?,
-                );
+                discovered.push(discover(
+                    open.pull_request,
+                    AutoReviewSource::Repository,
+                    open.requested_teams,
+                    open.updated_at,
+                    open.head_sha,
+                ));
             }
             if !self.auto_review_teams.is_empty() {
                 for open in self
@@ -815,16 +831,13 @@ where
                     )
                     .await?
                 {
-                    candidates.push(
-                        self.auto_review_candidate(
-                            open.pull_request,
-                            AutoReviewSource::TeamActivity,
-                            open.requested_teams,
-                            open.updated_at,
-                            open.head_sha,
-                        )
-                        .await?,
-                    );
+                    discovered.push(discover(
+                        open.pull_request,
+                        AutoReviewSource::TeamActivity,
+                        open.requested_teams,
+                        open.updated_at,
+                        open.head_sha,
+                    ));
                 }
             }
         }
@@ -837,52 +850,50 @@ where
                 .open_public_pull_requests_by_author(author)
                 .await?
             {
-                candidates.push(
-                    self.auto_review_candidate(
-                        pr,
-                        AutoReviewSource::PublicAuthor {
-                            login: (*author).clone(),
-                        },
-                        Vec::new(),
-                        None,
-                        None,
-                    )
-                    .await?,
-                );
+                discovered.push(discover(
+                    pr,
+                    AutoReviewSource::PublicAuthor {
+                        login: (*author).clone(),
+                    },
+                    Vec::new(),
+                    None,
+                    None,
+                ));
             }
         }
 
-        Ok(deduplicate_auto_review_candidates(
-            candidates,
+        let mut candidates = Vec::new();
+        for candidate in deduplicate_auto_review_candidates(
+            discovered,
             &self.auto_review_accounts,
             &self.auto_review_public_accounts,
-        ))
+        ) {
+            let pr_url = candidate.pr.html_url.clone();
+            match self.resolve_discovered(candidate).await {
+                Ok(candidate) => candidates.push(candidate),
+                Err(err) => error!(
+                    pr = %pr_url,
+                    error = ?err,
+                    "skipping pull request whose head could not be resolved"
+                ),
+            }
+        }
+        Ok(candidates)
     }
 
-    async fn auto_review_candidate(
+    async fn resolve_discovered(
         &self,
-        pr: PullRequest,
-        source: AutoReviewSource,
-        requested_teams: Vec<TeamSlug>,
-        updated_at: Option<DateTime<Utc>>,
-        head_sha: Option<String>,
+        discovered: DiscoveredCandidate,
     ) -> Result<AutoReviewCandidate> {
-        let listed_head = match head_sha.as_deref().and_then(|sha| HeadSha::parse(sha).ok()) {
+        let listed_head = match discovered.listed_head {
             Some(head) => head,
-            None => HeadSha::parse(
-                &self
-                    .github
-                    .pull_request_head(&pr)
-                    .await
-                    .context("failed to resolve pull request head")?,
-            )
-            .context("pull request head sha is invalid")?,
+            None => HeadSha::parse(&self.github.pull_request_head(&discovered.pr).await?)?,
         };
         Ok(AutoReviewCandidate {
-            pr,
-            source,
-            requested_teams,
-            updated_at,
+            pr: discovered.pr,
+            source: discovered.source,
+            requested_teams: discovered.requested_teams,
+            updated_at: discovered.updated_at,
             listed_head,
         })
     }
@@ -1758,23 +1769,45 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
         .collect()
 }
 
+fn discover(
+    pr: PullRequest,
+    source: AutoReviewSource,
+    requested_teams: Vec<TeamSlug>,
+    updated_at: Option<DateTime<Utc>>,
+    head_sha: Option<String>,
+) -> DiscoveredCandidate {
+    DiscoveredCandidate {
+        listed_head: head_sha.as_deref().and_then(|sha| HeadSha::parse(sha).ok()),
+        pr,
+        source,
+        requested_teams,
+        updated_at,
+    }
+}
+
 fn deduplicate_auto_review_candidates(
-    candidates: Vec<AutoReviewCandidate>,
+    candidates: Vec<DiscoveredCandidate>,
     repository_accounts: &HashSet<String>,
     public_accounts: &HashSet<String>,
-) -> Vec<AutoReviewCandidate> {
-    let mut deduplicated = Vec::<AutoReviewCandidate>::new();
+) -> Vec<DiscoveredCandidate> {
+    let mut deduplicated = Vec::<DiscoveredCandidate>::new();
     let mut index_by_url = HashMap::<String, usize>::new();
 
     for candidate in candidates {
         let key = candidate.pr.html_url.to_ascii_lowercase();
         if let Some(index) = index_by_url.get(&key).copied() {
             let existing = &deduplicated[index];
-            if !existing.has_allowed_author(repository_accounts, public_accounts)
-                && candidate.has_allowed_author(repository_accounts, public_accounts)
-            {
+            if !existing.source.has_allowed_author(
+                &existing.pr.author,
+                repository_accounts,
+                public_accounts,
+            ) && candidate.source.has_allowed_author(
+                &candidate.pr.author,
+                repository_accounts,
+                public_accounts,
+            ) {
                 let listed_head = existing.listed_head.clone();
-                deduplicated[index] = AutoReviewCandidate {
+                deduplicated[index] = DiscoveredCandidate {
                     listed_head,
                     ..candidate
                 };
@@ -1817,6 +1850,7 @@ mod tests {
         pull_updated_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         pull_heads: Arc<StdMutex<HashMap<String, String>>>,
         head_reads: Arc<StdMutex<Vec<String>>>,
+        head_errors: Arc<StdMutex<HashMap<String, String>>>,
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         posts: Arc<StdMutex<Vec<String>>>,
@@ -1909,6 +1943,9 @@ mod tests {
 
         async fn pull_request_head(&self, pr: &PullRequest) -> Result<String> {
             self.head_reads.lock().unwrap().push(pr.html_url.clone());
+            if let Some(message) = self.head_errors.lock().unwrap().get(&pr.html_url).cloned() {
+                return Err(anyhow!(message));
+            }
             Ok(self
                 .pull_heads
                 .lock()
@@ -3894,23 +3931,22 @@ mod tests {
     #[test]
     fn dedupe_keeps_the_listing_head_when_a_public_author_replaces_the_candidate() {
         let listing = HeadSha::parse(FAKE_HEAD_SHA).unwrap();
-        let fetched = HeadSha::parse("abcdefabcdefabcdefabcdefabcdefabcdefabcd").unwrap();
         let pull_request = pr();
-        let repository = AutoReviewCandidate {
+        let repository = DiscoveredCandidate {
             pr: pull_request.clone(),
             source: AutoReviewSource::Repository,
             requested_teams: Vec::new(),
             updated_at: None,
-            listed_head: listing.clone(),
+            listed_head: Some(listing.clone()),
         };
-        let public_author = AutoReviewCandidate {
+        let public_author = DiscoveredCandidate {
             pr: pull_request,
             source: AutoReviewSource::PublicAuthor {
                 login: "dionysuzx".to_string(),
             },
             requested_teams: Vec::new(),
             updated_at: None,
-            listed_head: fetched,
+            listed_head: None,
         };
         let deduped = deduplicate_auto_review_candidates(
             vec![repository, public_author],
@@ -3919,11 +3955,82 @@ mod tests {
         );
 
         assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0].listed_head, listing);
+        assert_eq!(deduped[0].listed_head.as_ref(), Some(&listing));
         assert!(matches!(
             deduped[0].source,
             AutoReviewSource::PublicAuthor { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_head_lookup_leaves_the_other_pull_request_reviewed() {
+        let github = FakeGithub::default();
+        let healthy = pr_with_number(1);
+        let missing = pr_with_author_and_number("public-author", 2);
+        list_head(&github, &healthy);
+        *github.pull_requests.lock().unwrap() = vec![healthy.clone()];
+        *github.public_pull_requests.lock().unwrap() = vec![missing.clone()];
+        github
+            .head_errors
+            .lock()
+            .unwrap()
+            .insert(missing.html_url.clone(), "404 not found".to_string());
+        let worktrees = idle_worktrees();
+        let codex = FakeCodex::default();
+
+        let report = Maid::new(
+            github.clone(),
+            worktrees.clone(),
+            codex.clone(),
+            "maid-bot",
+            ["dionysuzx", "public-author"],
+            ["dionysuzx"],
+            [RepoSlug {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+            }],
+        )
+        .with_public_auto_review_accounts(["public-author"])
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(*github.head_reads.lock().unwrap(), vec![missing.html_url]);
+        assert_eq!(codex.calls.lock().unwrap()[0].1.pr_url, healthy.html_url);
+        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_pull_request_does_not_look_up_its_head() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        list_head(&github, &pull_request);
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        *github.public_pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        let codex = FakeCodex::default();
+
+        let report = Maid::new(
+            github.clone(),
+            idle_worktrees(),
+            codex.clone(),
+            "maid-bot",
+            ["dionysuzx"],
+            ["dionysuzx"],
+            [RepoSlug {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+            }],
+        )
+        .with_public_auto_review_accounts(["dionysuzx"])
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert!(github.head_reads.lock().unwrap().is_empty());
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
