@@ -46,6 +46,7 @@ pub trait GithubClient: Send + Sync {
         all_pages: bool,
     ) -> Result<Vec<OpenPullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
+    async fn pull_request_head(&self, pr: &PullRequest) -> Result<String>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<String>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -171,48 +172,10 @@ struct AutoReviewCandidate {
     source: AutoReviewSource,
     requested_teams: Vec<TeamSlug>,
     updated_at: Option<DateTime<Utc>>,
-    listed_head: Option<HeadSha>,
-}
-
-fn listed_head(open: &OpenPullRequest) -> Option<HeadSha> {
-    open.head_sha
-        .as_deref()
-        .and_then(|sha| HeadSha::parse(sha).ok())
+    listed_head: HeadSha,
 }
 
 impl AutoReviewCandidate {
-    fn repository(open: OpenPullRequest) -> Self {
-        Self {
-            listed_head: listed_head(&open),
-            pr: open.pull_request,
-            source: AutoReviewSource::Repository,
-            requested_teams: open.requested_teams,
-            updated_at: open.updated_at,
-        }
-    }
-
-    fn team_activity(open: OpenPullRequest) -> Self {
-        Self {
-            listed_head: listed_head(&open),
-            pr: open.pull_request,
-            source: AutoReviewSource::TeamActivity,
-            requested_teams: open.requested_teams,
-            updated_at: open.updated_at,
-        }
-    }
-
-    fn public_author(pr: PullRequest, login: &str) -> Self {
-        Self {
-            pr,
-            source: AutoReviewSource::PublicAuthor {
-                login: login.to_string(),
-            },
-            requested_teams: Vec::new(),
-            updated_at: None,
-            listed_head: None,
-        }
-    }
-
     fn has_allowed_author(
         &self,
         repository_accounts: &HashSet<String>,
@@ -412,7 +375,7 @@ where
         for candidate in self.auto_review_candidates().await? {
             let pr = &candidate.pr;
             report.seen += 1;
-            match self.listed_head_is_idle(&candidate) {
+            match self.head_is_idle(&candidate.pr.html_url, &candidate.listed_head) {
                 Ok(true) => {
                     report.skipped += 1;
                     continue;
@@ -831,7 +794,16 @@ where
                 )
                 .await?
             {
-                candidates.push(AutoReviewCandidate::repository(open));
+                candidates.push(
+                    self.auto_review_candidate(
+                        open.pull_request,
+                        AutoReviewSource::Repository,
+                        open.requested_teams,
+                        open.updated_at,
+                        open.head_sha,
+                    )
+                    .await?,
+                );
             }
             if !self.auto_review_teams.is_empty() {
                 for open in self
@@ -843,7 +815,16 @@ where
                     )
                     .await?
                 {
-                    candidates.push(AutoReviewCandidate::team_activity(open));
+                    candidates.push(
+                        self.auto_review_candidate(
+                            open.pull_request,
+                            AutoReviewSource::TeamActivity,
+                            open.requested_teams,
+                            open.updated_at,
+                            open.head_sha,
+                        )
+                        .await?,
+                    );
                 }
             }
         }
@@ -856,7 +837,18 @@ where
                 .open_public_pull_requests_by_author(author)
                 .await?
             {
-                candidates.push(AutoReviewCandidate::public_author(pr, author));
+                candidates.push(
+                    self.auto_review_candidate(
+                        pr,
+                        AutoReviewSource::PublicAuthor {
+                            login: (*author).clone(),
+                        },
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .await?,
+                );
             }
         }
 
@@ -865,6 +857,34 @@ where
             &self.auto_review_accounts,
             &self.auto_review_public_accounts,
         ))
+    }
+
+    async fn auto_review_candidate(
+        &self,
+        pr: PullRequest,
+        source: AutoReviewSource,
+        requested_teams: Vec<TeamSlug>,
+        updated_at: Option<DateTime<Utc>>,
+        head_sha: Option<String>,
+    ) -> Result<AutoReviewCandidate> {
+        let listed_head = match head_sha.as_deref().and_then(|sha| HeadSha::parse(sha).ok()) {
+            Some(head) => head,
+            None => HeadSha::parse(
+                &self
+                    .github
+                    .pull_request_head(&pr)
+                    .await
+                    .context("failed to resolve pull request head")?,
+            )
+            .context("pull request head sha is invalid")?,
+        };
+        Ok(AutoReviewCandidate {
+            pr,
+            source,
+            requested_teams,
+            updated_at,
+            listed_head,
+        })
     }
 
     async fn start_task(&self, intent: Box<TaskIntent>) -> Result<TaskStartOutcome> {
@@ -1028,12 +1048,7 @@ where
                     .context("checked out pull request has no head")?,
             )?;
             let pr_url = PrUrl::parse(&pr.html_url)?;
-            if self.plan_for_head(&pr_url, &head)? == Action::Idle {
-                info!(
-                    pr = %pr.html_url,
-                    head = head.as_str(),
-                    "skipping covered pull request head"
-                );
+            if self.head_is_idle(&pr.html_url, &head)? {
                 return Ok(None);
             }
             Ok(Some((pr_url, head)))
@@ -1057,29 +1072,21 @@ where
         }
     }
 
-    fn plan_for_head(&self, pr_url: &PrUrl, head: &HeadSha) -> Result<Action> {
-        Ok(plan(
-            &self.reviews.runs(pr_url, head)?,
+    fn head_is_idle(&self, html_url: &str, head: &HeadSha) -> Result<bool> {
+        let pr_url = PrUrl::parse(html_url)?;
+        let idle = plan(
+            &self.reviews.runs(&pr_url, head)?,
             ReviewAgent::Codex,
             self.max_failures_per_head,
-        ))
-    }
-
-    fn listed_head_is_idle(&self, candidate: &AutoReviewCandidate) -> Result<bool> {
-        let Some(head) = candidate.listed_head.as_ref() else {
-            return Ok(false);
-        };
-        let pr_url = PrUrl::parse(&candidate.pr.html_url)?;
-        if self.plan_for_head(&pr_url, head)? == Action::Idle {
+        ) == Action::Idle;
+        if idle {
             info!(
-                pr = %candidate.pr.html_url,
+                pr = %html_url,
                 head = head.as_str(),
                 "skipping covered pull request head"
             );
-            Ok(true)
-        } else {
-            Ok(false)
         }
+        Ok(idle)
     }
 
     async fn run_auto_review(&self, session: AutoReviewSession) -> Result<TaskFinish> {
@@ -1367,7 +1374,10 @@ where
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
         report: &mut PollReport,
     ) {
-        match self.maid.listed_head_is_idle(candidate) {
+        match self
+            .maid
+            .head_is_idle(&candidate.pr.html_url, &candidate.listed_head)
+        {
             Ok(true) => {
                 report.skipped += 1;
                 return;
@@ -1763,7 +1773,11 @@ fn deduplicate_auto_review_candidates(
             if !existing.has_allowed_author(repository_accounts, public_accounts)
                 && candidate.has_allowed_author(repository_accounts, public_accounts)
             {
-                deduplicated[index] = candidate;
+                let listed_head = existing.listed_head.clone();
+                deduplicated[index] = AutoReviewCandidate {
+                    listed_head,
+                    ..candidate
+                };
             }
         } else {
             index_by_url.insert(key, deduplicated.len());
@@ -1802,6 +1816,7 @@ mod tests {
         pull_created_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         pull_updated_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         pull_heads: Arc<StdMutex<HashMap<String, String>>>,
+        head_reads: Arc<StdMutex<Vec<String>>>,
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         posts: Arc<StdMutex<Vec<String>>>,
@@ -1890,6 +1905,17 @@ mod tests {
                 .unwrap()
                 .push(author.to_string());
             Ok(self.public_pull_requests.lock().unwrap().clone())
+        }
+
+        async fn pull_request_head(&self, pr: &PullRequest) -> Result<String> {
+            self.head_reads.lock().unwrap().push(pr.html_url.clone());
+            Ok(self
+                .pull_heads
+                .lock()
+                .unwrap()
+                .get(&pr.html_url)
+                .cloned()
+                .unwrap_or_else(|| FAKE_HEAD_SHA.to_string()))
         }
 
         async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
@@ -3849,7 +3875,7 @@ mod tests {
         let worktrees = idle_worktrees();
         let codex = FakeCodex::default();
 
-        let report = maid(github, worktrees.clone(), codex.clone())
+        let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .with_review_ledger(reviews)
             .run_once()
             .await
@@ -3859,62 +3885,119 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert_eq!(report.responded, 1);
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r".to_string()]);
+        assert!(github.head_reads.lock().unwrap().is_empty());
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1.pr_url, fresh.html_url);
     }
 
+    #[test]
+    fn dedupe_keeps_the_listing_head_when_a_public_author_replaces_the_candidate() {
+        let listing = HeadSha::parse(FAKE_HEAD_SHA).unwrap();
+        let fetched = HeadSha::parse("abcdefabcdefabcdefabcdefabcdefabcdefabcd").unwrap();
+        let pull_request = pr();
+        let repository = AutoReviewCandidate {
+            pr: pull_request.clone(),
+            source: AutoReviewSource::Repository,
+            requested_teams: Vec::new(),
+            updated_at: None,
+            listed_head: listing.clone(),
+        };
+        let public_author = AutoReviewCandidate {
+            pr: pull_request,
+            source: AutoReviewSource::PublicAuthor {
+                login: "dionysuzx".to_string(),
+            },
+            requested_teams: Vec::new(),
+            updated_at: None,
+            listed_head: fetched,
+        };
+        let deduped = deduplicate_auto_review_candidates(
+            vec![repository, public_author],
+            &HashSet::new(),
+            &HashSet::from(["dionysuzx".to_string()]),
+        );
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].listed_head, listing);
+        assert!(matches!(
+            deduped[0].source,
+            AutoReviewSource::PublicAuthor { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn covered_heads_do_not_starve_a_mention() {
-        let github = FakeGithub::default();
-        let first = pr_with_number(1);
-        let second = pr_with_number(2);
-        *github.pull_requests.lock().unwrap() = vec![first.clone(), second.clone()];
-        list_head(&github, &first);
-        list_head(&github, &second);
-        let reviews = MemoryReviewLedger::default();
-        cover_head(&reviews, &first);
-        cover_head(&reviews, &second);
-        let prepares = Arc::new(StdMutex::new(Vec::new()));
-        let worktrees = OpenedPullRequestGate {
-            inner: idle_worktrees(),
-            prepares: prepares.clone(),
-            gate: Arc::new(Notify::new()),
-        };
-        let codex = FakeCodex::default();
-        let maid = Maid::new(
-            github.clone(),
-            worktrees,
-            codex.clone(),
-            "maid-bot",
-            ["dionysuzx"],
-            ["dionysuzx"],
-            [RepoSlug {
-                owner: "o".to_string(),
-                repo: "r".to_string(),
-            }],
-        )
-        .with_review_ledger(reviews)
-        .into_concurrent(1);
+        for public_author in [false, true] {
+            let github = FakeGithub::default();
+            let first = pr_with_number(1);
+            let second = pr_with_number(2);
+            list_head(&github, &first);
+            list_head(&github, &second);
+            let reviews = MemoryReviewLedger::default();
+            cover_head(&reviews, &first);
+            cover_head(&reviews, &second);
+            if public_author {
+                *github.public_pull_requests.lock().unwrap() = vec![first.clone(), second.clone()];
+            } else {
+                *github.pull_requests.lock().unwrap() = vec![first.clone(), second.clone()];
+            }
+            let prepares = Arc::new(StdMutex::new(Vec::new()));
+            let codex = FakeCodex::default();
+            let mut maid = Maid::new(
+                github.clone(),
+                OpenedPullRequestGate {
+                    inner: idle_worktrees(),
+                    prepares: prepares.clone(),
+                    gate: Arc::new(Notify::new()),
+                },
+                codex.clone(),
+                "maid-bot",
+                ["dionysuzx"],
+                if public_author {
+                    Vec::new()
+                } else {
+                    vec!["dionysuzx"]
+                },
+                [RepoSlug {
+                    owner: "o".to_string(),
+                    repo: "r".to_string(),
+                }],
+            )
+            .with_review_ledger(reviews);
+            if public_author {
+                maid = maid.with_public_auto_review_accounts(["dionysuzx"]);
+            }
+            let maid = maid.into_concurrent(1);
 
-        maid.run_once().await.unwrap();
-        assert!(prepares.lock().unwrap().is_empty());
+            let report = maid.run_once().await.unwrap();
+            assert_eq!(report.skipped, 2);
+            assert_eq!(report.failed, 0);
+            assert!(prepares.lock().unwrap().is_empty());
+            let reads = github.head_reads.lock().unwrap().clone();
+            if public_author {
+                assert_eq!(reads, vec![first.html_url, second.html_url]);
+            } else {
+                assert!(reads.is_empty());
+            }
 
-        *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
-        for _ in 0..10 {
-            maid.run_once().await.unwrap();
+            *github.notifications.lock().unwrap() = vec![notification("n1")];
+            *github.mention.lock().unwrap() =
+                Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+            for _ in 0..10 {
+                maid.run_once().await.unwrap();
+            }
+
+            wait_until(|| !codex.calls.lock().unwrap().is_empty()).await;
+            assert!(prepares.lock().unwrap().is_empty());
+            assert!(matches!(
+                codex.calls.lock().unwrap()[0].1.origin,
+                CodexTaskOrigin::Mention { .. }
+            ));
+            tokio::time::timeout(Duration::from_secs(1), maid.drain())
+                .await
+                .expect("covered pull requests stayed queued");
         }
-
-        wait_until(|| !codex.calls.lock().unwrap().is_empty()).await;
-        assert!(prepares.lock().unwrap().is_empty());
-        assert!(matches!(
-            codex.calls.lock().unwrap()[0].1.origin,
-            CodexTaskOrigin::Mention { .. }
-        ));
-        tokio::time::timeout(Duration::from_secs(1), maid.drain())
-            .await
-            .expect("covered pull requests stayed queued");
     }
 
     #[tokio::test]
