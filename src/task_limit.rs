@@ -98,12 +98,11 @@ impl FileTaskStartRecorder {
                 window: limit.window,
             });
         }
-        if !record {
-            return Ok(TaskStartDecision::Recorded);
-        }
 
-        ledger.started_at_unix_seconds.push(now);
-        ledger.write(&self.path)?;
+        if record {
+            ledger.started_at_unix_seconds.push(now);
+            ledger.write(&self.path)?;
+        }
         Ok(TaskStartDecision::Recorded)
     }
 }

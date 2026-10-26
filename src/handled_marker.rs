@@ -28,26 +28,11 @@ impl PendingHandledMarker {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct UnflushedPost {
-    pub pr: String,
-    pub sha: String,
-    pub model: String,
-    pub prompt_hash: String,
-    pub effort: String,
-    pub started_unix: u64,
-    pub finished_unix: u64,
-    pub comment_url: String,
-}
-
 pub trait PendingHandledMarkerStore: Send + Sync {
     fn record(&self, marker: &PendingHandledMarker) -> Result<()>;
     fn contains(&self, marker: &PendingHandledMarker) -> Result<bool>;
     fn remove(&self, marker: &PendingHandledMarker) -> Result<()>;
     fn pending(&self) -> Result<Vec<PendingHandledMarker>>;
-    fn remember_post(&self, post: &UnflushedPost) -> Result<()>;
-    fn unflushed_posts(&self) -> Result<Vec<UnflushedPost>>;
-    fn forget_post(&self, pr: &str, sha: &str) -> Result<()>;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -86,30 +71,6 @@ impl PendingHandledMarkerStore for MemoryPendingHandledMarkerStore {
             .lock()
             .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?
             .pending())
-    }
-
-    fn remember_post(&self, post: &UnflushedPost) -> Result<()> {
-        self.ledger
-            .lock()
-            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?
-            .remember_post(post);
-        Ok(())
-    }
-
-    fn unflushed_posts(&self) -> Result<Vec<UnflushedPost>> {
-        Ok(self
-            .ledger
-            .lock()
-            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?
-            .unflushed_posts())
-    }
-
-    fn forget_post(&self, pr: &str, sha: &str) -> Result<()> {
-        self.ledger
-            .lock()
-            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?
-            .forget_post(pr, sha);
-        Ok(())
     }
 }
 
@@ -164,42 +125,12 @@ impl PendingHandledMarkerStore for FilePendingHandledMarkerStore {
             .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
         Ok(PendingHandledMarkerLedger::read(&self.path)?.pending())
     }
-
-    fn remember_post(&self, post: &UnflushedPost) -> Result<()> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
-        let mut ledger = PendingHandledMarkerLedger::read(&self.path)?;
-        ledger.remember_post(post);
-        ledger.write(&self.path)
-    }
-
-    fn unflushed_posts(&self) -> Result<Vec<UnflushedPost>> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
-        Ok(PendingHandledMarkerLedger::read(&self.path)?.unflushed_posts())
-    }
-
-    fn forget_post(&self, pr: &str, sha: &str) -> Result<()> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
-        let mut ledger = PendingHandledMarkerLedger::read(&self.path)?;
-        ledger.forget_post(pr, sha);
-        ledger.write(&self.path)
-    }
 }
 
 #[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct PendingHandledMarkerLedger {
     mention_api_urls: BTreeSet<String>,
     pull_request_html_urls: BTreeSet<String>,
-    #[serde(default)]
-    unflushed_posts: Vec<UnflushedPost>,
 }
 
 impl PendingHandledMarkerLedger {
@@ -245,27 +176,6 @@ impl PendingHandledMarkerLedger {
                 self.pull_request_html_urls.remove(html_url);
             }
         }
-    }
-
-    fn remember_post(&mut self, post: &UnflushedPost) {
-        if let Some(existing) = self
-            .unflushed_posts
-            .iter_mut()
-            .find(|kept| kept.pr == post.pr && kept.sha == post.sha)
-        {
-            *existing = post.clone();
-        } else {
-            self.unflushed_posts.push(post.clone());
-        }
-    }
-
-    fn unflushed_posts(&self) -> Vec<UnflushedPost> {
-        self.unflushed_posts.clone()
-    }
-
-    fn forget_post(&mut self, pr: &str, sha: &str) {
-        self.unflushed_posts
-            .retain(|post| post.pr != pr || post.sha != sha);
     }
 
     fn pending(&self) -> Vec<PendingHandledMarker> {
@@ -331,55 +241,5 @@ mod tests {
         reloaded.remove(&marker).unwrap();
         assert!(!store.contains(&marker).unwrap());
         assert!(reloaded.pending().unwrap().is_empty());
-    }
-
-    #[test]
-    fn file_store_keeps_an_unflushed_post_across_reload() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("pending-handled-markers.json");
-        let marker = PendingHandledMarker::PullRequest {
-            html_url: "https://github.com/o/r/pull/1".to_string(),
-        };
-        fs::write(
-            &path,
-            r#"{"mention_api_urls":[],"pull_request_html_urls":["https://github.com/o/r/pull/1"]}"#,
-        )
-        .unwrap();
-
-        let store = FilePendingHandledMarkerStore::new(&path);
-        assert!(store.contains(&marker).unwrap());
-        assert!(store.unflushed_posts().unwrap().is_empty());
-
-        let post = UnflushedPost {
-            pr: "https://github.com/o/r/pull/1".to_string(),
-            sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            model: "gpt-5.5".to_string(),
-            prompt_hash: "ab".repeat(32),
-            effort: "high".to_string(),
-            started_unix: 1,
-            finished_unix: 2,
-            comment_url: "https://github.com/o/r/pull/1#issuecomment-1".to_string(),
-        };
-        store.remember_post(&post).unwrap();
-
-        let reloaded = FilePendingHandledMarkerStore::new(&path);
-        assert_eq!(reloaded.unflushed_posts().unwrap(), vec![post.clone()]);
-        assert!(reloaded.contains(&marker).unwrap());
-
-        let replaced = UnflushedPost {
-            comment_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
-            ..post.clone()
-        };
-        reloaded.remember_post(&replaced).unwrap();
-        assert_eq!(store.unflushed_posts().unwrap(), vec![replaced]);
-
-        store
-            .forget_post(
-                "https://github.com/o/r/pull/1",
-                "0123456789abcdef0123456789abcdef01234567",
-            )
-            .unwrap();
-        assert!(reloaded.unflushed_posts().unwrap().is_empty());
-        assert!(store.contains(&marker).unwrap());
     }
 }

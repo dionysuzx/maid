@@ -55,18 +55,15 @@ has no request timestamp, and the timeline is a separate oldest-first history.
 GitHub rewrites notification reasons, and the bot only receives
 `review_requested` when it is on the team.
 
-Set `continuous_review` to review an open pull request in any of those scopes
-again when its head commit has no posted Codex run. A head that already has a
-posted Codex run is not reviewed again, and a pull request outside the tracked
-scopes is still ignored. Omit the flag to keep the current behavior: a pull
-request with the bot's +1 stays handled, including after new commits. Turning
-the flag on reviews tracked open pull requests that lack a Codex run at the
-tip, and `task_limit_per_24h` spreads that catch-up. Set
-`max_failures_per_head` to stop retrying one head after that many failed runs
+A tracked open pull request is reviewed when its current head has no posted
+Codex run. A new commit is reviewed again. A head that already has a posted
+Codex run is not. Pull requests outside the tracked scopes are ignored.
+
+Set `continuous_review` to scan open pull requests past the first page of 50.
+Omit it to scan only that page. The flag does not change the review decision.
+Set `max_failures_per_head` to leave a head idle after that many failed runs
 and no posted run. It applies whether or not `continuous_review` is on. Omit
-it for no cap. A new head has its own count. A posted Codex run is not idled
-by the cap; with the flag on, that posted run is also why the head is not
-reviewed again.
+it for no cap. A new head has its own count. A posted run covers that head.
 
 ## Metrics
 

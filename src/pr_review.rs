@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -65,7 +65,7 @@ impl PromptHash {
         &self.0
     }
 
-    pub fn parse_hex(value: &str) -> Result<Self> {
+    fn parse_hex(value: &str) -> Result<Self> {
         if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
             bail!("prompt hash must be 64 hex characters");
         }
@@ -77,7 +77,7 @@ impl PromptHash {
         Ok(Self(bytes))
     }
 
-    pub fn to_hex(&self) -> String {
+    fn to_hex(&self) -> String {
         self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
@@ -202,24 +202,10 @@ impl ReviewRun {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Observation {
-    pub pr: PrUrl,
-    pub sha: Option<HeadSha>,
-    pub marker: bool,
-    pub plus_one: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     Idle,
-    ForgetMarker,
-    RetryPlusOne,
     Review,
-}
-
-pub fn weight(runs: &[ReviewRun]) -> u32 {
-    posted_identities(runs).len() as u32
 }
 
 pub fn covered_by(runs: &[ReviewRun], agent: ReviewAgent) -> bool {
@@ -230,69 +216,23 @@ pub fn covered_by(runs: &[ReviewRun], agent: ReviewAgent) -> bool {
 pub fn plan(
     runs_at_head: &[ReviewRun],
     agent: ReviewAgent,
-    observation: &Observation,
-    continuous_review: bool,
     max_failures: Option<NonZeroUsize>,
 ) -> Action {
-    let covered = covered_by(runs_at_head, agent);
-    let needs_review = if continuous_review {
-        !covered
-    } else {
-        !observation.plus_one && !observation.marker
-    };
-    if !needs_review {
-        return match (observation.plus_one, observation.marker) {
-            (true, true) => Action::ForgetMarker,
-            (true, false) => Action::Idle,
-            (false, _) => Action::RetryPlusOne,
-        };
+    if covered_by(runs_at_head, agent) {
+        return Action::Idle;
     }
-    if !covered && failures_reached(runs_at_head, agent, max_failures) {
-        Action::Idle
-    } else {
-        Action::Review
-    }
-}
-
-fn failures_reached(
-    runs: &[ReviewRun],
-    agent: ReviewAgent,
-    max_failures: Option<NonZeroUsize>,
-) -> bool {
-    let Some(max_failures) = max_failures else {
-        return false;
-    };
-    runs.iter()
-        .filter(|run| run.agent == agent && matches!(run.outcome, Outcome::Failed))
-        .count()
-        >= max_failures.get()
-}
-
-fn posted_identities(
-    runs: &[ReviewRun],
-) -> BTreeSet<(ReviewAgent, ModelName, PromptHash, EffortName)> {
-    runs.iter()
-        .filter(|run| matches!(run.outcome, Outcome::Posted { .. }))
-        .map(|run| {
-            (
-                run.agent,
-                run.model.clone(),
-                run.prompt_hash.clone(),
-                run.effort.clone(),
-            )
-        })
-        .collect()
+    let capped = max_failures.is_some_and(|limit| {
+        runs_at_head
+            .iter()
+            .filter(|run| run.agent == agent && matches!(run.outcome, Outcome::Failed))
+            .count()
+            >= limit.get()
+    });
+    if capped { Action::Idle } else { Action::Review }
 }
 
 pub trait ReviewLedger: Send + Sync {
     fn ensure_readable(&self) -> Result<()>;
-    fn plan(
-        &self,
-        agent: ReviewAgent,
-        observation: &Observation,
-        continuous_review: bool,
-        max_failures: Option<NonZeroUsize>,
-    ) -> Result<Action>;
     fn record(&self, pr: &PrUrl, sha: &HeadSha, run: ReviewRun) -> Result<()>;
     fn runs(&self, pr: &PrUrl, sha: &HeadSha) -> Result<Vec<ReviewRun>>;
     fn is_empty(&self) -> Result<bool>;
@@ -306,23 +246,6 @@ pub struct MemoryReviewLedger {
 impl ReviewLedger for MemoryReviewLedger {
     fn ensure_readable(&self) -> Result<()> {
         Ok(())
-    }
-
-    fn plan(
-        &self,
-        agent: ReviewAgent,
-        observation: &Observation,
-        continuous_review: bool,
-        max_failures: Option<NonZeroUsize>,
-    ) -> Result<Action> {
-        let state = self.lock()?;
-        Ok(plan_state(
-            &state,
-            agent,
-            observation,
-            continuous_review,
-            max_failures,
-        ))
     }
 
     fn record(&self, pr: &PrUrl, sha: &HeadSha, run: ReviewRun) -> Result<()> {
@@ -368,24 +291,6 @@ impl ReviewLedger for FileReviewLedger {
         ReviewFile::read(&self.path).map(|_| ())
     }
 
-    fn plan(
-        &self,
-        agent: ReviewAgent,
-        observation: &Observation,
-        continuous_review: bool,
-        max_failures: Option<NonZeroUsize>,
-    ) -> Result<Action> {
-        let _guard = self.file_lock()?;
-        let state = ReviewFile::read(&self.path)?.into_state()?;
-        Ok(plan_state(
-            &state,
-            agent,
-            observation,
-            continuous_review,
-            max_failures,
-        ))
-    }
-
     fn record(&self, pr: &PrUrl, sha: &HeadSha, run: ReviewRun) -> Result<()> {
         let _guard = self.file_lock()?;
         let mut file = ReviewFile::read(&self.path)?;
@@ -412,21 +317,6 @@ impl FileReviewLedger {
             .lock()
             .map_err(|_| anyhow!("review ledger lock is poisoned"))
     }
-}
-
-fn plan_state(
-    state: &ReviewState,
-    agent: ReviewAgent,
-    observation: &Observation,
-    continuous_review: bool,
-    max_failures: Option<NonZeroUsize>,
-) -> Action {
-    let runs = observation
-        .sha
-        .as_ref()
-        .map(|sha| state.runs(&observation.pr, sha))
-        .unwrap_or_default();
-    plan(&runs, agent, observation, continuous_review, max_failures)
 }
 
 #[derive(Debug, Default)]
@@ -617,242 +507,62 @@ mod tests {
     const SHA_B: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
 
     #[test]
-    fn weight_counts_distinct_posted_identities() {
+    fn a_posted_run_covers_only_that_head() {
         let posted = posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt");
-        let duplicate = posted.clone();
-        let other_effort = posted_run(ReviewAgent::Codex, "gpt-5.5", "low", "prompt");
-        let failed = failed_run();
-
-        assert_eq!(weight(&[]), 0);
-        assert_eq!(weight(&[failed]), 0);
-        assert_eq!(weight(std::slice::from_ref(&posted)), 1);
-        assert_eq!(weight(&[posted, duplicate]), 1);
-        assert_eq!(weight(std::slice::from_ref(&other_effort)), 1);
+        assert_eq!(plan(&[], ReviewAgent::Codex, None), Action::Review);
         assert_eq!(
-            weight(&[
-                posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt"),
-                other_effort
-            ]),
-            2
-        );
-    }
-
-    #[test]
-    fn flag_off_plan_matches_today() {
-        let posted = [posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")];
-        assert_eq!(
-            plan(
-                &[],
-                ReviewAgent::Codex,
-                &observe(Some(SHA_A), true, true),
-                false,
-                None
-            ),
-            Action::ForgetMarker
+            plan(&[failed_run()], ReviewAgent::Codex, None),
+            Action::Review
         );
         assert_eq!(
-            plan(
-                &[],
-                ReviewAgent::Codex,
-                &observe(Some(SHA_A), false, true),
-                false,
-                None
-            ),
+            plan(std::slice::from_ref(&posted), ReviewAgent::Codex, None),
             Action::Idle
-        );
-        assert_eq!(
-            plan(
-                &[],
-                ReviewAgent::Codex,
-                &observe(Some(SHA_A), true, false),
-                false,
-                None
-            ),
-            Action::RetryPlusOne
-        );
-        assert_eq!(
-            plan(
-                &[],
-                ReviewAgent::Codex,
-                &observe(Some(SHA_A), false, false),
-                false,
-                None
-            ),
-            Action::Review
-        );
-        assert_eq!(
-            plan(
-                &posted,
-                ReviewAgent::Codex,
-                &observe(Some(SHA_A), false, false),
-                false,
-                None
-            ),
-            Action::Review
-        );
-    }
-
-    #[test]
-    fn head_plan_reviews_an_uncovered_sha() {
-        let covered = posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt");
-        let head = observe(Some(SHA_A), true, true);
-
-        assert_eq!(
-            plan(&[covered], ReviewAgent::Codex, &head, true, None),
-            Action::ForgetMarker
-        );
-        assert_eq!(
-            plan(
-                &[],
-                ReviewAgent::Codex,
-                &observe(Some(SHA_A), true, true),
-                true,
-                None
-            ),
-            Action::Review
-        );
-        let ledger = MemoryReviewLedger::default();
-        let pr = PrUrl::parse("https://github.com/o/r/pull/1").unwrap();
-        ledger
-            .record(
-                &pr,
-                &HeadSha::parse(SHA_A).unwrap(),
-                posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt"),
-            )
-            .unwrap();
-        assert_eq!(
-            ledger
-                .plan(
-                    ReviewAgent::Codex,
-                    &observe(Some(SHA_B), false, false),
-                    true,
-                    None
-                )
-                .unwrap(),
-            Action::Review
-        );
-        assert_eq!(
-            plan(
-                &[posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")],
-                ReviewAgent::Codex,
-                &observe(Some(SHA_A), true, false),
-                true,
-                None,
-            ),
-            Action::RetryPlusOne
-        );
-        assert_eq!(
-            plan(
-                &[posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")],
-                ReviewAgent::Codex,
-                &observe(Some(SHA_A), false, true),
-                true,
-                None,
-            ),
-            Action::Idle
-        );
-        assert!(!covered_by(&[failed_run()], ReviewAgent::Codex));
-        assert!(covered_by(
-            &[posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")],
-            ReviewAgent::Codex
-        ));
-    }
-
-    #[test]
-    fn failure_cap_idles_only_the_capped_head() {
-        let cap = NonZeroUsize::new(2);
-        let head = observe(Some(SHA_A), false, false);
-        let one_failure = [failed_run()];
-        let two_failures = [failed_run(), failed_run()];
-        let posted_after_failure = [
-            failed_run(),
-            posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt"),
-        ];
-
-        assert_eq!(
-            plan(&two_failures, ReviewAgent::Codex, &head, true, None),
-            Action::Review
-        );
-        assert_eq!(
-            plan(&two_failures, ReviewAgent::Codex, &head, false, None),
-            Action::Review
-        );
-        assert_eq!(
-            plan(&one_failure, ReviewAgent::Codex, &head, true, cap),
-            Action::Review
-        );
-        assert_eq!(
-            plan(&one_failure, ReviewAgent::Codex, &head, false, cap),
-            Action::Review
-        );
-        assert_eq!(
-            plan(&two_failures, ReviewAgent::Codex, &head, true, cap),
-            Action::Idle
-        );
-        assert_eq!(
-            plan(&two_failures, ReviewAgent::Codex, &head, false, cap),
-            Action::Idle
-        );
-        assert_eq!(
-            plan(
-                &posted_after_failure,
-                ReviewAgent::Codex,
-                &head,
-                true,
-                NonZeroUsize::new(1),
-            ),
-            Action::RetryPlusOne
-        );
-        assert_eq!(
-            plan(
-                &posted_after_failure,
-                ReviewAgent::Codex,
-                &head,
-                false,
-                NonZeroUsize::new(1),
-            ),
-            Action::Review
-        );
-        assert_eq!(
-            plan(
-                &two_failures,
-                ReviewAgent::Codex,
-                &observe(Some(SHA_A), true, false),
-                false,
-                cap,
-            ),
-            Action::RetryPlusOne
         );
 
         let ledger = MemoryReviewLedger::default();
         let pr = PrUrl::parse("https://github.com/o/r/pull/1").unwrap();
         let sha_a = HeadSha::parse(SHA_A).unwrap();
-        ledger.record(&pr, &sha_a, failed_run()).unwrap();
-        ledger.record(&pr, &sha_a, failed_run()).unwrap();
-        for continuous_review in [true, false] {
-            assert_eq!(
-                ledger
-                    .plan(
-                        ReviewAgent::Codex,
-                        &observe(Some(SHA_A), false, false),
-                        continuous_review,
-                        cap
-                    )
-                    .unwrap(),
-                Action::Idle
-            );
-            assert_eq!(
-                ledger
-                    .plan(
-                        ReviewAgent::Codex,
-                        &observe(Some(SHA_B), false, false),
-                        continuous_review,
-                        cap
-                    )
-                    .unwrap(),
-                Action::Review
-            );
-        }
+        ledger.record(&pr, &sha_a, posted).unwrap();
+        assert_eq!(
+            plan(&ledger.runs(&pr, &sha_a).unwrap(), ReviewAgent::Codex, None),
+            Action::Idle
+        );
+        assert_eq!(
+            plan(
+                &ledger.runs(&pr, &HeadSha::parse(SHA_B).unwrap()).unwrap(),
+                ReviewAgent::Codex,
+                None
+            ),
+            Action::Review
+        );
+    }
+
+    #[test]
+    fn failure_cap_idles_only_that_head() {
+        let limit = NonZeroUsize::new(2).unwrap();
+        let one_failure = [failed_run()];
+        let two_failures = [failed_run(), failed_run()];
+        assert_eq!(
+            plan(&one_failure, ReviewAgent::Codex, Some(limit)),
+            Action::Review
+        );
+        assert_eq!(
+            plan(&two_failures, ReviewAgent::Codex, Some(limit)),
+            Action::Idle
+        );
+        assert_eq!(
+            plan(&two_failures, ReviewAgent::Codex, None),
+            Action::Review
+        );
+        let posted = posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt");
+        assert_eq!(
+            plan(
+                &[posted, failed_run(), failed_run()],
+                ReviewAgent::Codex,
+                Some(limit)
+            ),
+            Action::Idle
+        );
     }
 
     #[test]
@@ -892,15 +602,8 @@ mod tests {
         let runs = reloaded.runs(&pr, &sha).unwrap();
         assert_eq!(runs, vec![run]);
         assert_eq!(
-            reloaded
-                .plan(
-                    ReviewAgent::Codex,
-                    &observe(Some(SHA_A), false, false),
-                    false,
-                    None
-                )
-                .unwrap(),
-            Action::Review
+            plan(&reloaded.runs(&pr, &sha).unwrap(), ReviewAgent::Codex, None),
+            Action::Idle
         );
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"version\": 1"));
@@ -926,15 +629,6 @@ mod tests {
         fs::write(&path, "{\"version\": 2, \"pulls\": {}}").unwrap();
         assert!(FileReviewLedger::new(&path).ensure_readable().is_err());
         assert!(path.exists());
-    }
-
-    fn observe(sha: Option<&str>, marker: bool, plus_one: bool) -> Observation {
-        Observation {
-            pr: PrUrl::parse("https://github.com/o/r/pull/1").unwrap(),
-            sha: sha.map(|sha| HeadSha::parse(sha).unwrap()),
-            marker,
-            plus_one,
-        }
     }
 
     fn posted_run(agent: ReviewAgent, model: &str, effort: &str, prompt: &str) -> ReviewRun {

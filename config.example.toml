@@ -39,17 +39,14 @@ codex_reasoning_effort = "high"
 # Optional. Omitted by default for no task limit. Set to 0 to pause new starts.
 # task_limit_per_24h = 5
 
-# Optional. Omitted means false. When true, an open pull request in any tracked
-# scope (auto_review_repos accounts, auto_review_public_accounts, or
-# auto_review_teams) is reviewed again when its head commit has no posted Codex
-# run. A head that already has a posted Codex run is left alone. Turning this
-# on reviews tracked open pull requests that lack a Codex run at the tip,
-# spread by task_limit_per_24h.
+# Optional. Omitted means false. When true, discovery reads every page of open
+# pull requests. When false, only the first page of 50 is scanned. Either way,
+# a tracked pull request is reviewed when its head has no posted Codex run.
 # continuous_review = false
 
-# Optional. Omitted means no cap. Stop retrying a head after this many failed
-# runs and no posted run, whether or not continuous_review is on. A new head
-# starts a fresh count. A posted run is not idled by the cap. Must be at least 1.
+# Optional. Omitted means no cap. Leave a head idle after this many failed runs
+# and no posted run, whether or not continuous_review is on. A new head starts
+# a fresh count. Must be at least 1.
 # max_failures_per_head = 3
 
 # Optional. Leave omitted unless you need to pin api.github.com.

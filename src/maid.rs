@@ -4,7 +4,7 @@ use crate::domain::{
     OpenPullRequestOrder, PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
 };
 use crate::handled_marker::{
-    MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore, UnflushedPost,
+    MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
 };
 use crate::mention_thread::{
     MentionNotificationPlan, MentionObservation, MentionThread, MentionThreadAction,
@@ -12,8 +12,8 @@ use crate::mention_thread::{
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::pr_review::{
-    Action, CommentUrl, EffortName, HeadSha, MemoryReviewLedger, ModelName, Observation, Outcome,
-    PrUrl, PromptHash, ReviewAgent, ReviewLedger, ReviewRun, covered_by,
+    Action, CommentUrl, EffortName, HeadSha, MemoryReviewLedger, ModelName, Outcome, PrUrl,
+    PromptHash, ReviewAgent, ReviewLedger, ReviewRun, plan,
 };
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::{Context, Result};
@@ -43,7 +43,6 @@ pub trait GithubClient: Send + Sync {
         all_pages: bool,
     ) -> Result<Vec<OpenPullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
-    async fn open_pull_request(&self, pr: &PullRequest) -> Result<OpenPullRequest>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<String>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -169,7 +168,6 @@ struct AutoReviewCandidate {
     source: AutoReviewSource,
     requested_teams: Vec<TeamSlug>,
     updated_at: Option<DateTime<Utc>>,
-    head_sha: Option<HeadSha>,
 }
 
 impl AutoReviewCandidate {
@@ -179,7 +177,6 @@ impl AutoReviewCandidate {
             source: AutoReviewSource::Repository,
             requested_teams: open.requested_teams,
             updated_at: open.updated_at,
-            head_sha: open.head_sha,
         }
     }
 
@@ -189,7 +186,6 @@ impl AutoReviewCandidate {
             source: AutoReviewSource::TeamActivity,
             requested_teams: open.requested_teams,
             updated_at: open.updated_at,
-            head_sha: open.head_sha,
         }
     }
 
@@ -201,7 +197,6 @@ impl AutoReviewCandidate {
             },
             requested_teams: Vec::new(),
             updated_at: None,
-            head_sha: None,
         }
     }
 
@@ -267,6 +262,19 @@ where
         }
     }
 
+    pub fn with_continuous_review(mut self, continuous_review: bool) -> Self {
+        self.continuous_review = continuous_review;
+        self
+    }
+
+    pub fn with_max_failures_per_head(
+        mut self,
+        max_failures_per_head: Option<NonZeroUsize>,
+    ) -> Self {
+        self.max_failures_per_head = max_failures_per_head;
+        self
+    }
+
     pub fn with_public_auto_review_accounts(
         mut self,
         accounts: impl IntoIterator<Item = impl Into<String>>,
@@ -311,16 +319,6 @@ where
 
     pub fn with_review_ledger(mut self, reviews: impl ReviewLedger + 'static) -> Self {
         self.reviews = Arc::new(reviews);
-        self
-    }
-
-    pub fn with_continuous_review(mut self, continuous_review: bool) -> Self {
-        self.continuous_review = continuous_review;
-        self
-    }
-
-    pub fn with_max_failures_per_head(mut self, max_failures: Option<NonZeroUsize>) -> Self {
-        self.max_failures_per_head = max_failures;
         self
     }
 
@@ -380,11 +378,6 @@ where
             error!(
                 error = ?err,
                 "skipping auto-review because the review ledger is unreadable"
-            );
-        } else if let Err(err) = self.flush_unflushed_posts() {
-            error!(
-                error = ?err,
-                "skipping auto-review because a posted review could not be recorded"
             );
         } else {
             self.review_candidates(&mut report, &mut observed_pending_markers)
@@ -753,7 +746,7 @@ where
     async fn task_for_auto_review_candidate(
         &self,
         candidate: &AutoReviewCandidate,
-        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
+        _observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<TaskAssessment> {
         let pr = &candidate.pr;
         let author_allowed = candidate.has_allowed_author(
@@ -782,56 +775,17 @@ where
             return Ok(TaskAssessment::Skipped);
         }
 
-        let state = self.github.pr_state(pr, &self.bot_login).await?;
-        let marker = PendingHandledMarker::for_pull_request(pr);
-        let has_pending_marker = self.pending_handled_markers.contains(&marker)?;
-        let plus_one = state == ReviewState::Handled;
-        let sha = if self.continuous_review {
-            let Some(sha) = self.head_for_continuous_review(candidate).await? else {
-                info!(
-                    pr = %pr.html_url,
-                    "skipping pull request with no head sha"
-                );
-                return Ok(TaskAssessment::Skipped);
-            };
-            Some(sha)
-        } else {
-            candidate.head_sha.clone()
-        };
-        let observation = Observation {
-            pr: PrUrl::parse(&pr.html_url)?,
-            sha,
-            marker: has_pending_marker,
-            plus_one,
-        };
-        let action = self.reviews.plan(
-            ReviewAgent::Codex,
-            &observation,
-            self.continuous_review,
-            self.max_failures_per_head,
-        )?;
-        self.apply_review_action(
-            pr,
-            action,
-            has_pending_marker,
-            plus_one,
-            observed_pending_markers,
-        )
-        .await
-    }
-
-    async fn head_for_continuous_review(
-        &self,
-        candidate: &AutoReviewCandidate,
-    ) -> Result<Option<HeadSha>> {
-        if let Some(sha) = &candidate.head_sha {
-            return Ok(Some(sha.clone()));
-        }
-        if !matches!(candidate.source, AutoReviewSource::PublicAuthor { .. }) {
-            return Ok(None);
-        }
-
-        Ok(self.github.open_pull_request(&candidate.pr).await?.head_sha)
+        Ok(TaskAssessment::Ready(Box::new(
+            TaskIntent::AutoReviewPullRequest {
+                pr: pr.clone(),
+                task: CodexTask {
+                    pr_url: pr.html_url.clone(),
+                    origin: CodexTaskOrigin::PullRequestOpened {
+                        author: pr.author.clone(),
+                    },
+                },
+            },
+        )))
     }
 
     async fn auto_review_candidates(&self) -> Result<Vec<AutoReviewCandidate>> {
@@ -883,63 +837,8 @@ where
         ))
     }
 
-    async fn apply_review_action(
-        &self,
-        pr: &PullRequest,
-        action: Action,
-        marker_present: bool,
-        plus_one: bool,
-        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
-    ) -> Result<TaskAssessment> {
-        let marker = PendingHandledMarker::for_pull_request(pr);
-        match action {
-            Action::Review => Ok(TaskAssessment::Ready(Box::new(
-                TaskIntent::AutoReviewPullRequest {
-                    pr: pr.clone(),
-                    task: CodexTask {
-                        pr_url: pr.html_url.clone(),
-                        origin: CodexTaskOrigin::PullRequestOpened {
-                            author: pr.author.clone(),
-                        },
-                    },
-                    marker: marker_present,
-                    plus_one,
-                },
-            ))),
-            Action::RetryPlusOne => {
-                observed_pending_markers.insert(marker);
-                self.github.mark_pr_handled(pr).await?;
-                info!(
-                    pr = %pr.html_url,
-                    "refreshed pending completed auto-review pull request handled marker"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-            Action::ForgetMarker => {
-                self.pending_handled_markers.remove(&marker)?;
-                info!(
-                    pr = %pr.html_url,
-                    "skipping already handled auto-review pull request"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-            Action::Idle => {
-                info!(
-                    pr = %pr.html_url,
-                    "skipping already handled auto-review pull request"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-        }
-    }
-
     async fn start_task(&self, intent: Box<TaskIntent>) -> Result<TaskStartOutcome> {
-        let room = if matches!(intent.as_ref(), TaskIntent::AutoReviewPullRequest { .. }) {
-            self.task_starts.can_start()?
-        } else {
-            self.can_start_task()?
-        };
-        if !room {
+        if matches!(intent.as_ref(), TaskIntent::Mention { .. }) && !self.can_start_task()? {
             intent.log_task_limit_reached();
             return Ok(TaskStartOutcome::Skipped);
         }
@@ -950,19 +849,9 @@ where
                 mention,
                 task,
             } => self.start_mention_task(notification, mention, task).await,
-            TaskIntent::AutoReviewPullRequest {
-                pr,
-                task,
-                marker,
-                plus_one,
-            } => Ok(TaskStartOutcome::Started(Box::new(
-                StartedTask::AutoReviewPullRequest {
-                    pr,
-                    task,
-                    marker,
-                    plus_one,
-                },
-            ))),
+            TaskIntent::AutoReviewPullRequest { pr, task } => Ok(TaskStartOutcome::Started(
+                Box::new(StartedTask::AutoReviewPullRequest { pr, task }),
+            )),
         }
     }
 
@@ -987,7 +876,19 @@ where
             task,
         })))
     }
+}
 
+enum TaskFinish {
+    Completed,
+    Skipped,
+}
+
+impl<G, R, C> Maid<G, R, C>
+where
+    G: GithubClient,
+    R: Worktrees,
+    C: CodexRunner,
+{
     async fn finish_task(&self, task: Box<StartedTask>) -> Result<TaskFinish> {
         match *task {
             StartedTask::Mention {
@@ -998,14 +899,8 @@ where
                 .finish_mention_task(notification, mention, task)
                 .await
                 .map(|()| TaskFinish::Completed),
-            StartedTask::AutoReviewPullRequest {
-                pr,
-                task,
-                marker,
-                plus_one,
-            } => {
-                self.finish_auto_review_task(pr, task, marker, plus_one)
-                    .await
+            StartedTask::AutoReviewPullRequest { pr, task } => {
+                self.finish_auto_review_task(pr, task).await
             }
         }
     }
@@ -1062,13 +957,41 @@ where
         &self,
         pr: PullRequest,
         task: CodexTask,
-        marker: bool,
-        plus_one: bool,
     ) -> Result<TaskFinish> {
+        let Some(session) = self.open_auto_review(pr, task).await? else {
+            return Ok(TaskFinish::Skipped);
+        };
+        match self.can_start_task() {
+            Ok(true) => self.run_auto_review(session).await,
+            Ok(false) => {
+                self.discard_auto_review(session).await?;
+                Ok(TaskFinish::Skipped)
+            }
+            Err(err) => {
+                let _ = self.discard_auto_review(session).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn open_auto_review(
+        &self,
+        pr: PullRequest,
+        task: CodexTask,
+    ) -> Result<Option<AutoReviewSession>> {
+        if !self.task_starts.can_start()? {
+            info!(
+                pr = %pr.html_url,
+                author = %pr.author,
+                "skipping auto-review pull request because the 24-hour task limit is reached"
+            );
+            return Ok(None);
+        }
+
         let started_unix = unix_seconds(SystemTime::now())?;
         let target = WorkTarget::PullRequest(pr.clone());
         let worktree = self.worktrees.prepare(&target, &task).await?;
-        let result = async {
+        let decision = async {
             let head = HeadSha::parse(
                 worktree
                     .head()
@@ -1076,30 +999,45 @@ where
             )?;
             let pr_url = PrUrl::parse(&pr.html_url)?;
             let runs = self.reviews.runs(&pr_url, &head)?;
-            let mut action = crate::pr_review::plan(
-                &runs,
-                ReviewAgent::Codex,
-                &Observation {
-                    pr: pr_url.clone(),
-                    sha: Some(head.clone()),
-                    marker,
-                    plus_one,
-                },
-                self.continuous_review,
-                self.max_failures_per_head,
-            );
-            if action == Action::Review && covered_by(&runs, ReviewAgent::Codex) {
-                action = Action::RetryPlusOne;
+            if plan(&runs, ReviewAgent::Codex, self.max_failures_per_head) == Action::Idle {
+                info!(
+                    pr = %pr.html_url,
+                    head = head.as_str(),
+                    "skipping covered pull request head"
+                );
+                return Ok(None);
             }
-            if action != Action::Review {
-                let mut observed = HashSet::new();
-                self.apply_review_action(&pr, action, marker, plus_one, &mut observed)
-                    .await?;
-                return Ok(TaskFinish::Skipped);
+            Ok(Some((pr_url, head)))
+        }
+        .await;
+
+        match decision {
+            Ok(Some((pr_url, head))) => Ok(Some(AutoReviewSession {
+                pr,
+                task,
+                worktree,
+                pr_url,
+                head,
+                started_unix,
+            })),
+            Ok(None) => self.cleanup_worktree(worktree, Ok(())).await.map(|()| None),
+            Err(err) => {
+                let result: Result<Option<AutoReviewSession>> = Err(err);
+                self.cleanup_worktree(worktree, result).await
             }
-            if !self.can_start_task()? {
-                return Ok(TaskFinish::Skipped);
-            }
+        }
+    }
+
+    async fn run_auto_review(&self, session: AutoReviewSession) -> Result<TaskFinish> {
+        let AutoReviewSession {
+            pr,
+            task,
+            worktree,
+            pr_url,
+            head,
+            started_unix,
+        } = session;
+        let result = async {
             self.github.mark_pr_started(&pr).await?;
             info!(
                 pr = %pr.html_url,
@@ -1113,7 +1051,6 @@ where
             let prompt_hash = PromptHash::of(&facts.prompt);
             let codex_result = self.codex.run(worktree.path(), &task).await;
             let finished_unix = unix_seconds(SystemTime::now())?.max(started_unix);
-
             let identity = RunIdentity {
                 model,
                 prompt_hash,
@@ -1128,7 +1065,6 @@ where
                     return Err(err);
                 }
             };
-
             let comment_url = match self.github.post_pr_comment(&pr, &codex_run.response).await {
                 Ok(comment_url) => comment_url,
                 Err(err) => {
@@ -1136,17 +1072,16 @@ where
                     return Err(err);
                 }
             };
-            let outcome = match CommentUrl::parse(&comment_url) {
-                Ok(comment_url) => Outcome::Posted { comment_url },
-                Err(err) => {
-                    self.complete_posted_review(&pr, &pr_url, &head, &identity, Outcome::Failed)
-                        .await?;
-                    return Err(err);
-                }
-            };
-            let recorded = self
-                .complete_posted_review(&pr, &pr_url, &head, &identity, outcome)
-                .await;
+            self.record_posted_review(
+                &pr,
+                &pr_url,
+                &head,
+                &identity,
+                Outcome::Posted {
+                    comment_url: CommentUrl::parse(&comment_url)?,
+                },
+            )
+            .await;
 
             if let Some((session_id, resume_command)) = codex_run.resume_command() {
                 info!(
@@ -1163,7 +1098,6 @@ where
                     "responded to auto-review pull request"
                 );
             }
-            recorded?;
             Ok(TaskFinish::Completed)
         }
         .await;
@@ -1171,38 +1105,32 @@ where
         self.cleanup_worktree(worktree, result).await
     }
 
-    async fn complete_posted_review(
+    async fn discard_auto_review(&self, session: AutoReviewSession) -> Result<()> {
+        self.cleanup_worktree(session.worktree, Ok(())).await
+    }
+
+    async fn record_posted_review(
         &self,
         pr: &PullRequest,
         pr_url: &PrUrl,
         head: &HeadSha,
         identity: &RunIdentity,
         outcome: Outcome,
-    ) -> Result<()> {
-        let posted = match &outcome {
-            Outcome::Posted { comment_url } => Some(comment_url.clone()),
-            Outcome::Failed => None,
-        };
-        let recorded = self.record_finished_review(pr_url, head, identity, outcome);
-        let marker = PendingHandledMarker::for_pull_request(pr);
-        self.pending_handled_markers.record(&marker)?;
-        let remembered = if recorded.is_err() {
-            match posted {
-                Some(comment_url) => self.pending_handled_markers.remember_post(&UnflushedPost {
-                    pr: pr_url.as_str().to_string(),
-                    sha: head.as_str().to_string(),
-                    model: identity.model.as_str().to_string(),
-                    prompt_hash: identity.prompt_hash.to_hex(),
-                    effort: identity.effort.as_str().to_string(),
-                    started_unix: identity.started_unix,
-                    finished_unix: identity.finished_unix,
-                    comment_url: comment_url.as_str().to_string(),
-                }),
-                None => Ok(()),
+    ) {
+        loop {
+            match self.record_finished_review(pr_url, head, identity, outcome.clone()) {
+                Ok(()) => break,
+                Err(err) => {
+                    error!(
+                        pr = %pr.html_url,
+                        head = head.as_str(),
+                        error = ?err,
+                        "retrying review ledger write after posting"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
             }
-        } else {
-            Ok(())
-        };
+        }
         if let Err(err) = self.github.mark_pr_handled(pr).await {
             error!(
                 pr = %pr.html_url,
@@ -1210,32 +1138,6 @@ where
                 "failed to mark auto-review pull request handled after posting response"
             );
         }
-        remembered.and(recorded)
-    }
-
-    fn flush_unflushed_posts(&self) -> Result<()> {
-        for post in self.pending_handled_markers.unflushed_posts()? {
-            let pr = PrUrl::parse(&post.pr)?;
-            let sha = HeadSha::parse(&post.sha)?;
-            self.reviews.record(
-                &pr,
-                &sha,
-                ReviewRun::new(
-                    ReviewAgent::Codex,
-                    ModelName::parse(&post.model)?,
-                    PromptHash::parse_hex(&post.prompt_hash)?,
-                    EffortName::parse(&post.effort)?,
-                    post.started_unix,
-                    post.finished_unix,
-                    Outcome::Posted {
-                        comment_url: CommentUrl::parse(&post.comment_url)?,
-                    },
-                )?,
-            )?;
-            self.pending_handled_markers
-                .forget_post(&post.pr, &post.sha)?;
-        }
-        Ok(())
     }
 
     fn record_finished_review(
@@ -1368,39 +1270,11 @@ where
                 error = ?err,
                 "skipping auto-review because the review ledger is unreadable"
             );
-        } else if let Err(err) = self.maid.flush_unflushed_posts() {
-            error!(
-                error = ?err,
-                "skipping auto-review because a posted review could not be recorded"
-            );
         } else {
             for candidate in self.maid.auto_review_candidates().await? {
-                let pr = &candidate.pr;
                 report.seen += 1;
-                let Some(reservation) = self.work.try_reserve(task_key_for_trigger(&pr.html_url))
-                else {
-                    report.skipped += 1;
-                    continue;
-                };
-
-                match self
-                    .maid
-                    .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
-                    .await
-                {
-                    Ok(TaskAssessment::Ready(intent)) => {
-                        self.start_reserved(intent, reservation, &mut report).await;
-                    }
-                    Ok(TaskAssessment::Skipped) => report.skipped += 1,
-                    Err(err) => {
-                        report.failed += 1;
-                        error!(
-                            pr = %pr.html_url,
-                            error = ?err,
-                            "failed to handle auto-review pull request"
-                        );
-                    }
-                }
+                self.start_auto_review(&candidate, &mut observed_pending_markers, &mut report)
+                    .await;
             }
         }
 
@@ -1410,6 +1284,124 @@ where
             .await?;
         report.in_flight = self.work.in_flight();
         Ok(report)
+    }
+
+    async fn start_auto_review(
+        &self,
+        candidate: &AutoReviewCandidate,
+        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
+        report: &mut PollReport,
+    ) {
+        if !self.work.has_capacity() {
+            report.skipped += 1;
+            return;
+        }
+        let Some(mut reservation) = self
+            .work
+            .try_reserve_key(task_key_for_trigger(&candidate.pr.html_url))
+        else {
+            report.skipped += 1;
+            return;
+        };
+
+        let (pr, task) = match self
+            .maid
+            .task_for_auto_review_candidate(candidate, observed_pending_markers)
+            .await
+        {
+            Ok(TaskAssessment::Ready(intent)) => match *intent {
+                TaskIntent::AutoReviewPullRequest { pr, task } => (pr, task),
+                TaskIntent::Mention { .. } => {
+                    report.failed += 1;
+                    error!(
+                        pr = %candidate.pr.html_url,
+                        "auto-review candidate produced a mention task"
+                    );
+                    return;
+                }
+            },
+            Ok(TaskAssessment::Skipped) => {
+                report.skipped += 1;
+                return;
+            }
+            Err(err) => {
+                report.failed += 1;
+                error!(
+                    pr = %candidate.pr.html_url,
+                    error = ?err,
+                    "failed to handle auto-review pull request"
+                );
+                return;
+            }
+        };
+
+        let session = match self.maid.open_auto_review(pr, task).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                report.skipped += 1;
+                return;
+            }
+            Err(err) => {
+                report.failed += 1;
+                error!(
+                    pr = %candidate.pr.html_url,
+                    error = ?err,
+                    "failed to handle auto-review pull request"
+                );
+                return;
+            }
+        };
+
+        let Some(permit) = self.work.try_acquire_permit() else {
+            self.skip_or_fail_discard(session, report).await;
+            return;
+        };
+        match self.maid.can_start_task() {
+            Ok(true) => {}
+            Ok(false) => {
+                self.skip_or_fail_discard(session, report).await;
+                return;
+            }
+            Err(err) => {
+                report.failed += 1;
+                error!(
+                    pr = %session.pr.html_url,
+                    error = ?err,
+                    "failed to record auto-review task start"
+                );
+                let _ = self.maid.discard_auto_review(session).await;
+                return;
+            }
+        }
+
+        reservation.permit = Some(permit);
+        report.started += 1;
+        let maid = self.maid.clone();
+        let pr_url = session.pr.html_url.clone();
+        tokio::spawn(async move {
+            let _reservation = reservation;
+            if let Err(err) = maid.run_auto_review(session).await {
+                error!(
+                    pr = %pr_url,
+                    error = ?err,
+                    "failed to handle auto-review pull request task"
+                );
+            }
+        });
+    }
+
+    async fn skip_or_fail_discard(&self, session: AutoReviewSession, report: &mut PollReport) {
+        let pr_url = session.pr.html_url.clone();
+        if let Err(err) = self.maid.discard_auto_review(session).await {
+            report.failed += 1;
+            error!(
+                pr = %pr_url,
+                error = ?err,
+                "failed to clean up auto-review worktree"
+            );
+        } else {
+            report.skipped += 1;
+        }
     }
 
     async fn handle_assessments(
@@ -1490,22 +1482,30 @@ impl WorkQueue {
         }
     }
 
-    fn try_reserve(&self, key: String) -> Option<WorkReservation> {
-        let mut running = self.running.lock().expect("work queue lock is poisoned");
-        if running.contains(&key) {
-            return None;
-        }
+    fn has_capacity(&self) -> bool {
+        self.slots.available_permits() > 0
+    }
 
-        let permit = self.slots.clone().try_acquire_owned().ok()?;
+    fn try_reserve_key(&self, key: String) -> Option<WorkReservation> {
+        let mut running = self.running.lock().expect("work queue lock is poisoned");
         if !running.insert(key.clone()) {
             return None;
         }
-
         Some(WorkReservation {
             keys: vec![key],
             running: self.running.clone(),
-            _permit: permit,
+            permit: None,
         })
+    }
+
+    fn try_acquire_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.slots.clone().try_acquire_owned().ok()
+    }
+
+    fn try_reserve(&self, key: String) -> Option<WorkReservation> {
+        let mut reservation = self.try_reserve_key(key)?;
+        reservation.permit = Some(self.try_acquire_permit()?);
+        Some(reservation)
     }
 
     fn in_flight(&self) -> usize {
@@ -1516,7 +1516,7 @@ impl WorkQueue {
 struct WorkReservation {
     keys: Vec<String>,
     running: Arc<std::sync::Mutex<HashSet<String>>>,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl WorkReservation {
@@ -1561,11 +1561,6 @@ enum TaskStartOutcome {
     Skipped,
 }
 
-enum TaskFinish {
-    Completed,
-    Skipped,
-}
-
 #[derive(Clone, Debug)]
 enum TaskIntent {
     Mention {
@@ -1576,8 +1571,6 @@ enum TaskIntent {
     AutoReviewPullRequest {
         pr: PullRequest,
         task: CodexTask,
-        marker: bool,
-        plus_one: bool,
     },
 }
 
@@ -1621,8 +1614,6 @@ enum StartedTask {
     AutoReviewPullRequest {
         pr: PullRequest,
         task: CodexTask,
-        marker: bool,
-        plus_one: bool,
     },
 }
 
@@ -1672,6 +1663,15 @@ fn is_permanent_pending_marker_error(err: &anyhow::Error) -> bool {
     })
 }
 
+struct AutoReviewSession {
+    pr: PullRequest,
+    task: CodexTask,
+    worktree: PreparedWorktree,
+    pr_url: PrUrl,
+    head: HeadSha,
+    started_unix: u64,
+}
+
 struct RunIdentity {
     model: ModelName,
     prompt_hash: PromptHash,
@@ -1710,10 +1710,6 @@ fn deduplicate_auto_review_candidates(
             if !existing.has_allowed_author(repository_accounts, public_accounts)
                 && candidate.has_allowed_author(repository_accounts, public_accounts)
             {
-                let mut candidate = candidate;
-                if candidate.head_sha.is_none() {
-                    candidate.head_sha.clone_from(&existing.head_sha);
-                }
                 deduplicated[index] = candidate;
             }
         } else {
@@ -1730,7 +1726,6 @@ mod tests {
     use super::*;
 
     const FAKE_HEAD_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
-    const OTHER_HEAD_SHA: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
     use crate::domain::{CodexTaskOrigin, Issue, TeamSlug};
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -1748,15 +1743,11 @@ mod tests {
         mention: Arc<StdMutex<FakeMentionResult>>,
         mentions: Arc<StdMutex<FakeMentionsResult>>,
         pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
-        later_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         list_orders: Arc<StdMutex<Vec<OpenPullRequestOrder>>>,
-        listed_all_pages: Arc<StdMutex<Vec<bool>>>,
         recently_updated_pull_requests: Arc<StdMutex<Option<Vec<PullRequest>>>>,
         requested_teams: Arc<StdMutex<HashMap<String, Vec<TeamSlug>>>>,
         pull_created_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         pull_updated_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
-        head_shas: Arc<StdMutex<HashMap<String, String>>>,
-        pull_gets: Arc<StdMutex<Vec<String>>>,
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         posts: Arc<StdMutex<Vec<String>>>,
@@ -1805,19 +1796,32 @@ mod tests {
             all_pages: bool,
         ) -> Result<Vec<OpenPullRequest>> {
             self.list_orders.lock().unwrap().push(order);
-            self.listed_all_pages.lock().unwrap().push(all_pages);
             let created = self.pull_requests.lock().unwrap().clone();
             let updated = self.recently_updated_pull_requests.lock().unwrap().clone();
             let mut pull_requests = match order {
                 OpenPullRequestOrder::NewestCreated => created,
                 OpenPullRequestOrder::RecentlyUpdated => updated.unwrap_or(created),
             };
-            if all_pages {
-                pull_requests.extend(self.later_pull_requests.lock().unwrap().clone());
+            if !all_pages {
+                pull_requests.truncate(50);
             }
+            let requested_teams = self.requested_teams.lock().unwrap().clone();
+            let created_at = self.pull_created_at.lock().unwrap().clone();
+            let updated_at = self.pull_updated_at.lock().unwrap().clone();
             Ok(pull_requests
                 .into_iter()
-                .map(|pull_request| self.open_pull(pull_request))
+                .map(|pull_request| {
+                    let teams = requested_teams
+                        .get(&pull_request.html_url)
+                        .cloned()
+                        .unwrap_or_default();
+                    OpenPullRequest {
+                        requested_teams: teams,
+                        created_at: created_at.get(&pull_request.html_url).copied(),
+                        updated_at: updated_at.get(&pull_request.html_url).copied(),
+                        pull_request,
+                    }
+                })
                 .collect())
         }
 
@@ -1830,11 +1834,6 @@ mod tests {
                 .unwrap()
                 .push(author.to_string());
             Ok(self.public_pull_requests.lock().unwrap().clone())
-        }
-
-        async fn open_pull_request(&self, pr: &PullRequest) -> Result<OpenPullRequest> {
-            self.pull_gets.lock().unwrap().push(pr.api_url.clone());
-            Ok(self.open_pull(pr.clone()))
         }
 
         async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
@@ -1966,28 +1965,6 @@ mod tests {
     }
 
     impl FakeGithub {
-        fn open_pull(&self, pull_request: PullRequest) -> OpenPullRequest {
-            let html_url = pull_request.html_url.clone();
-            OpenPullRequest {
-                requested_teams: self
-                    .requested_teams
-                    .lock()
-                    .unwrap()
-                    .get(&html_url)
-                    .cloned()
-                    .unwrap_or_default(),
-                created_at: self.pull_created_at.lock().unwrap().get(&html_url).copied(),
-                updated_at: self.pull_updated_at.lock().unwrap().get(&html_url).copied(),
-                head_sha: self
-                    .head_shas
-                    .lock()
-                    .unwrap()
-                    .get(&html_url)
-                    .and_then(|sha| HeadSha::parse(sha).ok()),
-                pull_request,
-            }
-        }
-
         fn take_mention(&self) -> Result<Option<CommentMention>> {
             match self.mention.lock().unwrap().take().unwrap_or(Ok(None)) {
                 Ok(value) => Ok(value),
@@ -2094,11 +2071,11 @@ mod tests {
 
     impl TaskStartRecorder for FixedTaskStartRecorder {
         fn can_start(&self) -> Result<bool> {
-            let allowed = !matches!(self.decision, TaskStartDecision::AtLimit { .. });
-            if !allowed {
+            let at_limit = matches!(self.decision, TaskStartDecision::AtLimit { .. });
+            if at_limit {
                 *self.calls.lock().unwrap() += 1;
             }
-            Ok(allowed)
+            Ok(!at_limit)
         }
 
         fn try_record_started(&self) -> Result<TaskStartDecision> {
@@ -2199,62 +2176,6 @@ mod tests {
 
     fn team_slug(value: &str) -> TeamSlug {
         TeamSlug::parse(value).unwrap()
-    }
-
-    fn set_head(github: &FakeGithub, pr: &PullRequest, sha: &str) {
-        github
-            .head_shas
-            .lock()
-            .unwrap()
-            .insert(pr.html_url.clone(), sha.to_string());
-    }
-
-    fn record_posted_run(reviews: &MemoryReviewLedger, pr: &PullRequest, sha: &str) {
-        reviews
-            .record(
-                &PrUrl::parse(&pr.html_url).unwrap(),
-                &HeadSha::parse(sha).unwrap(),
-                ReviewRun::new(
-                    ReviewAgent::Codex,
-                    ModelName::parse("gpt-5.5").unwrap(),
-                    PromptHash::of("please review"),
-                    EffortName::parse("high").unwrap(),
-                    1,
-                    2,
-                    Outcome::Posted {
-                        comment_url: CommentUrl::parse(&format!("{}#issuecomment-9", pr.html_url))
-                            .unwrap(),
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap();
-    }
-
-    fn record_failed_run(reviews: &MemoryReviewLedger, pr: &PullRequest, sha: &str) {
-        reviews
-            .record(
-                &PrUrl::parse(&pr.html_url).unwrap(),
-                &HeadSha::parse(sha).unwrap(),
-                ReviewRun::new(
-                    ReviewAgent::Codex,
-                    ModelName::parse("gpt-5.5").unwrap(),
-                    PromptHash::of("please review"),
-                    EffortName::parse("high").unwrap(),
-                    1,
-                    2,
-                    Outcome::Failed,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-    }
-
-    fn recording_recorder() -> FixedTaskStartRecorder {
-        FixedTaskStartRecorder {
-            decision: TaskStartDecision::Recorded,
-            calls: Arc::new(StdMutex::new(0)),
-        }
     }
 
     fn request_team(github: &FakeGithub, pr: &PullRequest, updated_at: DateTime<Utc>) {
@@ -2826,10 +2747,7 @@ mod tests {
         assert_eq!(first_report.started, 1);
         assert_eq!(first_report.skipped, 1);
         assert_eq!(first_report.in_flight, 1);
-        assert_eq!(
-            *github.pr_state_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/1"]
-        );
+        assert!(github.pr_state_calls.lock().unwrap().is_empty());
         entered.wait().await;
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
 
@@ -2934,7 +2852,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_a_posted_auto_review_and_leaves_the_marker() {
+    async fn records_a_posted_auto_review_and_does_not_review_that_head_again() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
         let reviews = MemoryReviewLedger::default();
@@ -2967,7 +2885,7 @@ mod tests {
             }
         );
         assert!(
-            markers
+            !markers
                 .contains(&PendingHandledMarker::for_pull_request(&pr()))
                 .unwrap()
         );
@@ -2979,42 +2897,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unwritable_ledger_still_posts_one_comment_and_does_not_review_again() {
-        unwritable_ledger_posts_once(false).await;
-    }
-
-    #[tokio::test]
-    async fn unwritable_ledger_with_continuous_review_posts_once() {
-        unwritable_ledger_posts_once(true).await;
-    }
-
-    async fn unwritable_ledger_posts_once(continuous_review: bool) {
+    async fn unwritable_ledger_and_marker_files_post_one_comment() {
         let github = FakeGithub::default();
         let pull_request = pr();
         *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        if continuous_review {
-            set_head(&github, &pull_request, FAKE_HEAD_SHA);
-        }
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("reviews");
+        let directory = temp.path().join("state");
         std::fs::create_dir(&directory).unwrap();
-        let ledger_path = directory.join("pr-reviews.json");
-        let reviews = crate::pr_review::FileReviewLedger::new(&ledger_path);
-        let markers = MemoryPendingHandledMarkerStore::default();
+        let reviews = crate::pr_review::FileReviewLedger::new(directory.join("pr-reviews.json"));
+        let markers = crate::handled_marker::FilePendingHandledMarkerStore::new(
+            directory.join("pending-handled-markers.json"),
+        );
         let codex = FakeCodex::default();
         let maid = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_continuous_review(continuous_review)
             .with_review_ledger(reviews.clone())
-            .with_pending_handled_marker_store(markers.clone());
+            .with_pending_handled_marker_store(markers);
         let _restore = RestoreWriteAccess(&directory);
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let report = maid.run_once().await.unwrap();
-
-        assert_eq!(report.responded, 0);
-        assert_eq!(report.failed, 1);
+        let running = tokio::spawn({
+            let maid = maid.clone();
+            async move { maid.run_once().await }
+        });
+        wait_until(|| github.posts.lock().unwrap().len() == 1).await;
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let report = running.await.unwrap().unwrap();
+        assert_eq!(report.responded, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
         assert!(
             github
                 .handled_prs
@@ -3022,24 +2934,12 @@ mod tests {
                 .unwrap()
                 .contains(&pull_request.html_url)
         );
-        assert!(
-            markers
-                .contains(&PendingHandledMarker::for_pull_request(&pull_request))
-                .unwrap()
-        );
-        assert!(reviews.is_empty().unwrap());
-        let pending = markers.unflushed_posts().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].sha, FAKE_HEAD_SHA);
 
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
         let second = maid.run_once().await.unwrap();
-
         assert_eq!(second.responded, 0);
-        assert_eq!(second.failed, 0);
+        assert_eq!(second.skipped, 1);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
         assert_eq!(github.posts.lock().unwrap().len(), 1);
-        assert!(markers.unflushed_posts().unwrap().is_empty());
         let runs = reviews
             .runs(
                 &PrUrl::parse(&pull_request.html_url).unwrap(),
@@ -3048,6 +2948,46 @@ mod tests {
             .unwrap();
         assert_eq!(runs.len(), 1);
         assert!(matches!(runs[0].outcome(), Outcome::Posted { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_overlapping_poll_does_not_review_a_posted_head_twice() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("state");
+        std::fs::create_dir(&directory).unwrap();
+        let reviews = crate::pr_review::FileReviewLedger::new(directory.join("pr-reviews.json"));
+        let markers = crate::handled_marker::FilePendingHandledMarkerStore::new(
+            directory.join("pending-handled-markers.json"),
+        );
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_review_ledger(reviews.clone())
+            .with_pending_handled_marker_store(markers)
+            .into_concurrent(2);
+        let _restore = RestoreWriteAccess(&directory);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let running = tokio::spawn({
+            let maid = maid.clone();
+            async move { maid.run_once().await }
+        });
+        wait_until(|| github.posts.lock().unwrap().len() == 1).await;
+
+        let overlapping = maid.run_once().await.unwrap();
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(overlapping.responded, 0);
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        running.await.unwrap().unwrap();
+        let pr_url = PrUrl::parse(&pull_request.html_url).unwrap();
+        let sha = HeadSha::parse(FAKE_HEAD_SHA).unwrap();
+        wait_until(|| reviews.runs(&pr_url, &sha).unwrap().len() == 1).await;
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
     }
 
     struct RestoreWriteAccess<'a>(&'a Path);
@@ -3129,608 +3069,6 @@ mod tests {
         assert_eq!(second.responded, 0);
         assert_eq!(second.skipped, 1);
         assert_eq!(github.posts.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn flag_off_poll_makes_the_same_calls_and_decisions() {
-        let github = FakeGithub::default();
-        let handled = pr_with_number(1);
-        let pending = pr_with_number(2);
-        *github.pull_requests.lock().unwrap() = vec![handled.clone(), pending.clone()];
-        github
-            .handled_prs
-            .lock()
-            .unwrap()
-            .insert(handled.html_url.clone());
-        set_head(&github, &handled, OTHER_HEAD_SHA);
-        set_head(&github, &pending, FAKE_HEAD_SHA);
-        let reviews = MemoryReviewLedger::default();
-        record_posted_run(&reviews, &handled, FAKE_HEAD_SHA);
-        let starts = recording_recorder();
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_review_ledger(reviews.clone())
-            .with_task_start_recorder(starts.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.seen, 2);
-        assert_eq!(report.skipped, 1);
-        assert_eq!(report.responded, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
-        assert_eq!(
-            *github.list_orders.lock().unwrap(),
-            vec![OpenPullRequestOrder::NewestCreated]
-        );
-        assert!(
-            github
-                .public_pull_request_authors
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
-        assert!(github.pull_gets.lock().unwrap().is_empty());
-        assert_eq!(*github.listed_all_pages.lock().unwrap(), vec![false]);
-        assert_eq!(
-            *github.pr_state_calls.lock().unwrap(),
-            vec![handled.html_url.clone(), pending.html_url.clone()]
-        );
-        assert_eq!(
-            *github.events.lock().unwrap(),
-            vec!["start_pr", "post", "handled_pr"]
-        );
-        assert_eq!(
-            *github.started_prs.lock().unwrap(),
-            vec![pending.html_url.clone()]
-        );
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert_eq!(codex.calls.lock().unwrap()[0].1.pr_url, pending.html_url);
-        assert!(
-            reviews
-                .runs(
-                    &PrUrl::parse(&handled.html_url).unwrap(),
-                    &HeadSha::parse(OTHER_HEAD_SHA).unwrap(),
-                )
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            reviews
-                .runs(
-                    &PrUrl::parse(&handled.html_url).unwrap(),
-                    &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
-                )
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn failure_cap_idles_a_head_with_the_flag_on_and_off() {
-        for continuous_review in [true, false] {
-            let (report, github, codex, starts) = poll_capped_head(
-                FAKE_HEAD_SHA,
-                &[FAKE_HEAD_SHA],
-                Some(1),
-                false,
-                continuous_review,
-            )
-            .await;
-
-            assert_eq!(report.skipped, 1);
-            assert_eq!(report.responded, 0);
-            assert_eq!(*starts.calls.lock().unwrap(), 0);
-            assert!(codex.calls.lock().unwrap().is_empty());
-            assert!(github.events.lock().unwrap().is_empty());
-            assert!(github.pull_gets.lock().unwrap().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn one_failure_below_the_cap_is_still_reviewed() {
-        for continuous_review in [true, false] {
-            let (report, github, codex, starts) = poll_capped_head(
-                FAKE_HEAD_SHA,
-                &[FAKE_HEAD_SHA],
-                Some(2),
-                false,
-                continuous_review,
-            )
-            .await;
-
-            assert_eq!(report.responded, 1);
-            assert_eq!(*starts.calls.lock().unwrap(), 1);
-            assert_eq!(codex.calls.lock().unwrap().len(), 1);
-            assert!(github.pull_gets.lock().unwrap().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn a_new_head_resets_the_failure_count() {
-        for continuous_review in [true, false] {
-            let (report, github, codex, starts) = poll_capped_head(
-                FAKE_HEAD_SHA,
-                &[OTHER_HEAD_SHA],
-                Some(1),
-                false,
-                continuous_review,
-            )
-            .await;
-
-            assert_eq!(report.responded, 1);
-            assert_eq!(*starts.calls.lock().unwrap(), 1);
-            assert_eq!(codex.calls.lock().unwrap().len(), 1);
-            assert!(github.pull_gets.lock().unwrap().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn an_unset_failure_cap_retries_the_head() {
-        for continuous_review in [true, false] {
-            let (report, _github, codex, starts) = poll_capped_head(
-                FAKE_HEAD_SHA,
-                &[FAKE_HEAD_SHA, FAKE_HEAD_SHA],
-                None,
-                false,
-                continuous_review,
-            )
-            .await;
-
-            assert_eq!(report.responded, 1);
-            assert_eq!(*starts.calls.lock().unwrap(), 1);
-            assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn a_posted_run_covers_a_head_past_the_failure_cap() {
-        let pull_request = pr();
-        let (report, github, codex, starts) =
-            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(1), true, true).await;
-
-        assert_eq!(report.responded, 0);
-        assert_eq!(*starts.calls.lock().unwrap(), 0);
-        assert!(codex.calls.lock().unwrap().is_empty());
-        assert_eq!(
-            *github.events.lock().unwrap(),
-            vec!["handled_pr".to_string()]
-        );
-        assert!(
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .contains(&pull_request.html_url)
-        );
-    }
-
-    #[tokio::test]
-    async fn flag_off_posted_checkout_does_not_review_again() {
-        let (report, github, codex, starts) =
-            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(1), true, false).await;
-
-        assert_eq!(report.responded, 0);
-        assert_eq!(*starts.calls.lock().unwrap(), 0);
-        assert!(codex.calls.lock().unwrap().is_empty());
-        assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.pull_gets.lock().unwrap().is_empty());
-        assert_eq!(
-            *github.events.lock().unwrap(),
-            vec!["handled_pr".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn flag_off_public_author_does_not_fetch_the_pull_request() {
-        let github = FakeGithub::default();
-        let pull_request = pr();
-        *github.public_pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        set_head(&github, &pull_request, FAKE_HEAD_SHA);
-        let reviews = MemoryReviewLedger::default();
-        record_failed_run(&reviews, &pull_request, FAKE_HEAD_SHA);
-        let starts = recording_recorder();
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_public_auto_review_accounts(["dionysuzx"])
-            .with_max_failures_per_head(NonZeroUsize::new(1))
-            .with_review_ledger(reviews)
-            .with_task_start_recorder(starts.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert!(github.pull_gets.lock().unwrap().is_empty());
-        assert_eq!(report.responded, 0);
-        assert_eq!(*starts.calls.lock().unwrap(), 0);
-        assert!(codex.calls.lock().unwrap().is_empty());
-        assert!(github.posts.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn public_author_failure_cap_runs_codex_once() {
-        for continuous_review in [true, false] {
-            let github = FakeGithub::default();
-            let pull_request = pr();
-            *github.public_pull_requests.lock().unwrap() = vec![pull_request.clone()];
-            set_head(&github, &pull_request, FAKE_HEAD_SHA);
-            let reviews = MemoryReviewLedger::default();
-            let starts = recording_recorder();
-            let codex = FakeCodex {
-                error: Arc::new(StdMutex::new(Some("codex failed".to_string()))),
-                ..FakeCodex::default()
-            };
-            let maid = maid(github.clone(), idle_worktrees(), codex.clone())
-                .with_public_auto_review_accounts(["dionysuzx"])
-                .with_continuous_review(continuous_review)
-                .with_max_failures_per_head(NonZeroUsize::new(1))
-                .with_review_ledger(reviews.clone())
-                .with_task_start_recorder(starts.clone());
-
-            for _ in 0..3 {
-                maid.run_once().await.unwrap();
-            }
-
-            assert_eq!(codex.calls.lock().unwrap().len(), 1);
-            assert_eq!(*starts.calls.lock().unwrap(), 1);
-            assert!(github.posts.lock().unwrap().is_empty());
-            if !continuous_review {
-                assert!(github.pull_gets.lock().unwrap().is_empty());
-            }
-            let runs = reviews
-                .runs(
-                    &PrUrl::parse(&pull_request.html_url).unwrap(),
-                    &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
-                )
-                .unwrap();
-            assert_eq!(runs.len(), 1);
-            assert_eq!(runs[0].outcome(), &Outcome::Failed);
-        }
-    }
-
-    #[tokio::test]
-    async fn a_checkout_of_a_covered_head_is_not_reviewed_again() {
-        for continuous_review in [true, false] {
-            for plus_one in [true, false] {
-                for has_marker in [true, false] {
-                    let github = FakeGithub::default();
-                    let pull_request = pr();
-                    *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
-                    set_head(&github, &pull_request, OTHER_HEAD_SHA);
-                    if plus_one {
-                        github
-                            .handled_prs
-                            .lock()
-                            .unwrap()
-                            .insert(pull_request.html_url.clone());
-                    }
-                    let reviews = MemoryReviewLedger::default();
-                    record_posted_run(&reviews, &pull_request, FAKE_HEAD_SHA);
-                    let markers = MemoryPendingHandledMarkerStore::default();
-                    if has_marker {
-                        markers
-                            .record(&PendingHandledMarker::for_pull_request(&pull_request))
-                            .unwrap();
-                    }
-                    let starts = recording_recorder();
-                    let codex = FakeCodex::default();
-
-                    maid(github.clone(), idle_worktrees(), codex.clone())
-                        .with_continuous_review(continuous_review)
-                        .with_review_ledger(reviews.clone())
-                        .with_pending_handled_marker_store(markers)
-                        .with_task_start_recorder(starts.clone())
-                        .run_once()
-                        .await
-                        .unwrap();
-
-                    assert!(codex.calls.lock().unwrap().is_empty());
-                    assert!(github.posts.lock().unwrap().is_empty());
-                    assert_eq!(*starts.calls.lock().unwrap(), 0);
-                    assert_eq!(
-                        reviews
-                            .runs(
-                                &PrUrl::parse(&pull_request.html_url).unwrap(),
-                                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
-                            )
-                            .unwrap()
-                            .len(),
-                        1
-                    );
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn continuous_review_reaches_an_uncovered_pull_request_past_the_first_page() {
-        let first = pr_with_number(1);
-        let second = pr_with_number(2);
-        for (continuous_review, reviewed) in [(false, false), (true, true)] {
-            let github = FakeGithub::default();
-            *github.pull_requests.lock().unwrap() = vec![first.clone()];
-            *github.later_pull_requests.lock().unwrap() = vec![second.clone()];
-            set_head(&github, &first, FAKE_HEAD_SHA);
-            set_head(&github, &second, FAKE_HEAD_SHA);
-            let reviews = MemoryReviewLedger::default();
-            record_posted_run(&reviews, &first, FAKE_HEAD_SHA);
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .insert(first.html_url.clone());
-            let codex = FakeCodex::default();
-
-            maid(github.clone(), idle_worktrees(), codex.clone())
-                .with_continuous_review(continuous_review)
-                .with_review_ledger(reviews)
-                .run_once()
-                .await
-                .unwrap();
-
-            assert_eq!(codex.calls.lock().unwrap().len(), usize::from(reviewed));
-            assert!(
-                github
-                    .listed_all_pages
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|all_pages| *all_pages == continuous_review)
-            );
-            if reviewed {
-                assert_eq!(codex.calls.lock().unwrap()[0].1.pr_url, second.html_url);
-            }
-        }
-    }
-
-    async fn poll_capped_head(
-        head: &str,
-        failed_shas: &[&str],
-        cap: Option<usize>,
-        posted: bool,
-        continuous_review: bool,
-    ) -> (PollReport, FakeGithub, FakeCodex, FixedTaskStartRecorder) {
-        let github = FakeGithub::default();
-        let pull_request = pr();
-        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        set_head(&github, &pull_request, head);
-        let reviews = MemoryReviewLedger::default();
-        for sha in failed_shas {
-            record_failed_run(&reviews, &pull_request, sha);
-        }
-        if posted {
-            record_posted_run(&reviews, &pull_request, head);
-        }
-        let starts = recording_recorder();
-        let codex = FakeCodex::default();
-        let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_continuous_review(continuous_review)
-            .with_max_failures_per_head(cap.and_then(NonZeroUsize::new))
-            .with_review_ledger(reviews)
-            .with_task_start_recorder(starts.clone())
-            .run_once()
-            .await
-            .unwrap();
-        (report, github, codex, starts)
-    }
-
-    #[tokio::test]
-    async fn continuous_review_does_not_rereview_a_covered_team_head() {
-        let github = FakeGithub::default();
-        let pull_request = pr_with_author("contributor");
-        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        request_team(&github, &pull_request, recent_pr_time());
-        github
-            .handled_prs
-            .lock()
-            .unwrap()
-            .insert(pull_request.html_url.clone());
-        set_head(&github, &pull_request, FAKE_HEAD_SHA);
-        let reviews = MemoryReviewLedger::default();
-        record_posted_run(&reviews, &pull_request, FAKE_HEAD_SHA);
-        let markers = MemoryPendingHandledMarkerStore::default();
-        markers
-            .record(&PendingHandledMarker::for_pull_request(&pull_request))
-            .unwrap();
-        let starts = recording_recorder();
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
-            .with_continuous_review(true)
-            .with_review_ledger(reviews)
-            .with_pending_handled_marker_store(markers.clone())
-            .with_task_start_recorder(starts.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.skipped, 1);
-        assert_eq!(report.responded, 0);
-        assert_eq!(*starts.calls.lock().unwrap(), 0);
-        assert!(codex.calls.lock().unwrap().is_empty());
-        assert!(github.pull_gets.lock().unwrap().is_empty());
-        assert!(github.posts.lock().unwrap().is_empty());
-        assert!(
-            !markers
-                .contains(&PendingHandledMarker::for_pull_request(&pull_request))
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn continuous_review_rereviews_an_uncovered_team_head() {
-        let github = FakeGithub::default();
-        let pull_request = pr_with_author("contributor");
-        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        request_team(&github, &pull_request, recent_pr_time());
-        github
-            .handled_prs
-            .lock()
-            .unwrap()
-            .insert(pull_request.html_url.clone());
-        set_head(&github, &pull_request, FAKE_HEAD_SHA);
-        let reviews = MemoryReviewLedger::default();
-        record_posted_run(&reviews, &pull_request, OTHER_HEAD_SHA);
-        let markers = MemoryPendingHandledMarkerStore::default();
-        let marker = PendingHandledMarker::for_pull_request(&pull_request);
-        markers.record(&marker).unwrap();
-        let starts = recording_recorder();
-        let codex = FakeCodex::default();
-        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
-            .with_continuous_review(true)
-            .with_review_ledger(reviews.clone())
-            .with_pending_handled_marker_store(markers.clone())
-            .with_task_start_recorder(starts.clone());
-
-        let report = maid.run_once().await.unwrap();
-
-        assert_eq!(report.responded, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert!(github.pull_gets.lock().unwrap().is_empty());
-        let runs = reviews
-            .runs(
-                &PrUrl::parse(&pull_request.html_url).unwrap(),
-                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(runs.len(), 1);
-        assert!(matches!(runs[0].outcome(), Outcome::Posted { .. }));
-
-        let second = maid.run_once().await.unwrap();
-        assert_eq!(second.responded, 0);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn continuous_review_zero_task_limit_starts_nothing() {
-        let github = FakeGithub::default();
-        let pull_request = pr();
-        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        set_head(&github, &pull_request, FAKE_HEAD_SHA);
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("task-starts.json");
-        let starts = crate::task_limit::FileTaskStartRecorder::new(Some(0), &path);
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_continuous_review(true)
-            .with_task_start_recorder(starts)
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.skipped, 1);
-        assert_eq!(report.responded, 0);
-        assert!(codex.calls.lock().unwrap().is_empty());
-        assert!(github.events.lock().unwrap().is_empty());
-        let reloaded = crate::task_limit::FileTaskStartRecorder::new(Some(1), &path);
-        assert_eq!(
-            reloaded.try_record_started().unwrap(),
-            TaskStartDecision::Recorded
-        );
-    }
-
-    #[tokio::test]
-    async fn continuous_review_full_semaphore_consumes_no_start() {
-        let github = FakeGithub::default();
-        let first = pr_with_number(1);
-        let second = pr_with_number(2);
-        *github.pull_requests.lock().unwrap() = vec![first.clone(), second.clone()];
-        set_head(&github, &first, FAKE_HEAD_SHA);
-        set_head(&github, &second, FAKE_HEAD_SHA);
-        let codex = BlockingCodex::new();
-        let entered = codex.entered.clone();
-        let release = codex.release.clone();
-        let starts = recording_recorder();
-        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_continuous_review(true)
-            .with_task_start_recorder(starts.clone())
-            .into_concurrent(1);
-
-        let report = maid.run_once().await.unwrap();
-
-        assert_eq!(report.started, 1);
-        assert_eq!(report.skipped, 1);
-        entered.wait().await;
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert!(github.pull_gets.lock().unwrap().is_empty());
-
-        release.notify_waiters();
-        wait_until(|| github.handled_prs.lock().unwrap().len() == 1).await;
-    }
-
-    #[tokio::test]
-    async fn continuous_review_fetches_a_public_pull_request_once() {
-        let github = FakeGithub::default();
-        let pull_request = pr();
-        *github.public_pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        set_head(&github, &pull_request, FAKE_HEAD_SHA);
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_public_auto_review_accounts(["dionysuzx"])
-            .with_continuous_review(true)
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.responded, 1);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert_eq!(
-            *github.pull_gets.lock().unwrap(),
-            vec![pull_request.api_url.clone()]
-        );
-    }
-
-    #[tokio::test]
-    async fn continuous_review_skips_a_list_pull_request_with_no_head() {
-        let github = FakeGithub::default();
-        *github.pull_requests.lock().unwrap() = vec![pr()];
-        let starts = recording_recorder();
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_continuous_review(true)
-            .with_task_start_recorder(starts.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.skipped, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 0);
-        assert!(codex.calls.lock().unwrap().is_empty());
-        assert!(github.pull_gets.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn continuous_review_ignores_an_untracked_pull_request() {
-        let github = FakeGithub::default();
-        let pull_request = pr_with_author("contributor");
-        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        set_head(&github, &pull_request, FAKE_HEAD_SHA);
-        let starts = recording_recorder();
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
-            .with_continuous_review(true)
-            .with_task_start_recorder(starts.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.skipped, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 0);
-        assert!(codex.calls.lock().unwrap().is_empty());
-        assert!(github.pull_gets.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3910,10 +3248,7 @@ mod tests {
             .map(|(_, task)| task.pr_url.clone())
             .collect::<Vec<_>>();
         assert_eq!(urls, vec!["https://github.com/o/r/pull/3".to_string()]);
-        assert_eq!(
-            *github.pr_state_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/3".to_string()]
-        );
+        assert!(github.pr_state_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4056,22 +3391,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_opened_pr_with_durable_handled_marker_after_restart() {
+    async fn a_posted_head_is_not_reviewed_again() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
-        github
-            .handled_prs
-            .lock()
-            .unwrap()
-            .insert("https://github.com/o/r/pull/1".to_string());
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/unused"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
+        let reviews = MemoryReviewLedger::default();
+        reviews
+            .record(
+                &PrUrl::parse(&pr().html_url).unwrap(),
+                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+                ReviewRun::new(
+                    ReviewAgent::Codex,
+                    ModelName::parse("gpt-5.5").unwrap(),
+                    PromptHash::of("please review"),
+                    EffortName::parse("high").unwrap(),
+                    1,
+                    2,
+                    Outcome::Posted {
+                        comment_url: CommentUrl::parse(
+                            "https://github.com/o/r/pull/1#issuecomment-1",
+                        )
+                        .unwrap(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), worktrees.clone(), codex.clone())
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_review_ledger(reviews)
             .run_once()
             .await
             .unwrap();
@@ -4079,10 +3427,77 @@ mod tests {
         assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.marks.lock().unwrap().is_empty());
         assert!(github.events.lock().unwrap().is_empty());
-        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failure_cap_skips_a_head_without_continuous_review() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let reviews = MemoryReviewLedger::default();
+        reviews
+            .record(
+                &PrUrl::parse(&pr().html_url).unwrap(),
+                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+                ReviewRun::new(
+                    ReviewAgent::Codex,
+                    ModelName::parse("gpt-5.5").unwrap(),
+                    PromptHash::of("please review"),
+                    EffortName::parse("high").unwrap(),
+                    1,
+                    2,
+                    Outcome::Failed,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let codex = FakeCodex::default();
+
+        let report = maid(github, idle_worktrees(), codex.clone())
+            .with_review_ledger(reviews)
+            .with_max_failures_per_head(NonZeroUsize::new(1))
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.skipped, 1);
+        assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuous_review_scans_past_the_first_page() {
+        let github = FakeGithub::default();
+        let mut pulls = Vec::new();
+        for number in 1..=50 {
+            pulls.push(pr_with_author_and_number("stranger", number));
+        }
+        pulls.push(pr_with_author_and_number("dionysuzx", 51));
+        *github.pull_requests.lock().unwrap() = pulls;
+
+        let hidden = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+            .run_once()
+            .await
+            .unwrap();
+        assert_eq!(hidden.responded, 0);
+
+        let codex = FakeCodex::default();
+        let visible = maid(github, idle_worktrees(), codex.clone())
+            .with_continuous_review(true)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(visible.responded, 1);
+        let urls = codex
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, task)| task.pr_url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(urls, vec!["https://github.com/o/r/pull/51".to_string()]);
     }
 
     #[tokio::test]
@@ -5102,7 +4517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_pending_auto_review_marker_without_rerunning_codex() {
+    async fn a_failed_plus_one_is_not_retried_and_the_head_stays_covered() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("pending-handled-markers.json");
         let github = FakeGithub::default();
@@ -5126,13 +4541,7 @@ mod tests {
         assert_eq!(second_report.skipped, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert!(
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .contains("https://github.com/o/r/pull/1")
-        );
+        assert!(github.handled_prs.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
