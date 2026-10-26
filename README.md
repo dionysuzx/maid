@@ -66,8 +66,9 @@ and no posted run. It applies whether or not `continuous_review` is on. Omit
 it for no cap. A new head has its own count. A posted run covers that head.
 
 A normal shutdown waits until a posted review is written to the ledger, including
-while that write is still failing. Killing the process after the GitHub comment
-and before the write can review the same head once more.
+while that write is still failing. `just stop` waits for that shutdown. Killing
+the process after the GitHub comment and before the write can review the same
+head once more.
 
 ## Metrics
 

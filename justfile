@@ -136,17 +136,9 @@ stop:
     }
 
     wait_for_stop() {
-        for _ in {1..20}; do
-            if ! kill -0 "$pid" 2>/dev/null; then
-                rm -f "{{pid_file}}"
-                echo "maid stopped"
-                exit 0
-            fi
-            sleep 0.25
-        done
-
-        echo "maid did not stop after 5 seconds; pid still running: $pid"
-        exit 1
+        tail --pid="$pid" -f /dev/null
+        rm -f "{{pid_file}}"
+        echo "maid stopped"
     }
 
     if [[ ! -f "{{pid_file}}" ]]; then

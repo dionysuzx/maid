@@ -1317,10 +1317,6 @@ where
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
         report: &mut PollReport,
     ) {
-        if !self.work.has_capacity() {
-            report.skipped += 1;
-            return;
-        }
         let Some(reservation) = self
             .work
             .try_reserve_key(task_key_for_trigger(&candidate.pr.html_url))
@@ -1364,7 +1360,8 @@ where
         let runner = self.clone();
         let pr_url = pr.html_url.clone();
         self.track(tokio::spawn(async move {
-            let _reservation = reservation;
+            let mut reservation = reservation;
+            reservation.permit = Some(runner.work.acquire_permit().await);
             if let Err(err) = runner.finish_reserved_auto_review(pr, task).await {
                 error!(
                     pr = %pr_url,
@@ -1379,10 +1376,6 @@ where
         let Some(session) = self.maid.open_auto_review(pr, task).await? else {
             return Ok(());
         };
-        let Some(permit) = self.work.try_acquire_permit() else {
-            return self.maid.discard_auto_review(session).await;
-        };
-        let _permit = permit;
         match self.maid.can_start_task() {
             Ok(true) => self.maid.run_auto_review(session).await.map(|_| ()),
             Ok(false) => self.maid.discard_auto_review(session).await,
@@ -1471,8 +1464,12 @@ impl WorkQueue {
         }
     }
 
-    fn has_capacity(&self) -> bool {
-        self.slots.available_permits() > 0
+    async fn acquire_permit(&self) -> OwnedSemaphorePermit {
+        self.slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("work semaphore is closed")
     }
 
     fn try_reserve_key(&self, key: String) -> Option<WorkReservation> {
@@ -2012,6 +2009,40 @@ mod tests {
                 response: "codex response".to_string(),
                 session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingWorktrees {
+        inner: FakeWorktrees,
+        active: Arc<StdMutex<usize>>,
+        max_active: Arc<StdMutex<usize>>,
+        started: Arc<StdMutex<usize>>,
+        release: watch::Receiver<bool>,
+    }
+
+    #[async_trait]
+    impl Worktrees for CountingWorktrees {
+        async fn prepare(&self, target: &WorkTarget, task: &CodexTask) -> Result<PreparedWorktree> {
+            {
+                let mut active = self.active.lock().unwrap();
+                *active += 1;
+                let mut max_active = self.max_active.lock().unwrap();
+                *max_active = (*max_active).max(*active);
+                *self.started.lock().unwrap() += 1;
+            }
+            let mut release = self.release.clone();
+            while !*release.borrow() {
+                if release.changed().await.is_err() {
+                    break;
+                }
+            }
+            *self.active.lock().unwrap() -= 1;
+            self.inner.prepare(target, task).await
+        }
+
+        async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()> {
+            self.inner.cleanup(worktree).await
         }
     }
 
@@ -2809,16 +2840,10 @@ mod tests {
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
 
         release.notify_waiters();
-        wait_until(|| github.handled_prs.lock().unwrap().len() == 1).await;
-
-        let second_report = maid.run_once().await.unwrap();
-
-        assert_eq!(second_report.started, 2);
-        assert_eq!(second_report.skipped, 0);
         entered.wait().await;
+        assert_eq!(codex.calls.lock().unwrap().len(), 2);
         release.notify_waiters();
         wait_until(|| github.handled_prs.lock().unwrap().len() == 2).await;
-        assert_eq!(codex.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -3156,6 +3181,91 @@ mod tests {
             .await
             .expect("blocked checkout did not finish");
         assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn preparations_never_exceed_max_concurrent_requests() {
+        for limit in [1_usize, 2] {
+            let github = FakeGithub::default();
+            *github.pull_requests.lock().unwrap() =
+                (1..=16).map(pr_with_number).collect::<Vec<_>>();
+            let (release, receiver) = watch::channel(false);
+            let active = Arc::new(StdMutex::new(0));
+            let max_active = Arc::new(StdMutex::new(0));
+            let started = Arc::new(StdMutex::new(0));
+            let worktrees = CountingWorktrees {
+                inner: idle_worktrees(),
+                active: active.clone(),
+                max_active: max_active.clone(),
+                started: started.clone(),
+                release: receiver,
+            };
+            let maid = Maid::new(
+                github,
+                worktrees,
+                FakeCodex::default(),
+                "maid-bot",
+                ["dionysuzx"],
+                ["dionysuzx"],
+                [RepoSlug {
+                    owner: "o".to_string(),
+                    repo: "r".to_string(),
+                }],
+            )
+            .into_concurrent(limit);
+
+            let report = maid.run_once().await.unwrap();
+            wait_until(|| *started.lock().unwrap() == limit).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert_eq!(report.started, 16);
+            assert_eq!(*started.lock().unwrap(), limit);
+            assert_eq!(*active.lock().unwrap(), limit);
+            assert_eq!(*max_active.lock().unwrap(), limit);
+
+            release.send(true).unwrap();
+            maid.drain().await;
+            assert_eq!(*started.lock().unwrap(), 16);
+            assert_eq!(*max_active.lock().unwrap(), limit);
+        }
+    }
+
+    #[test]
+    fn stop_waits_for_a_slow_drain() {
+        use std::os::unix::process::CommandExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let maid_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/maid");
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg("trap 'sleep 6; exit 0' TERM; while true; do sleep 30; done")
+            .arg0(&maid_bin);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        std::fs::write(home.path().join("maid.pid"), pid.to_string()).unwrap();
+        let waiter = std::thread::spawn(move || child.wait());
+
+        let started = std::time::Instant::now();
+        let output = std::process::Command::new("just")
+            .arg("stop")
+            .env("MAID_HOME", home.path())
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        let elapsed = started.elapsed();
+        let _ = waiter.join();
+
+        assert!(
+            output.status.success(),
+            "stdout {}\nstderr {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "stop returned in {elapsed:?}"
+        );
     }
 
     struct RestoreWriteAccess<'a>(&'a Path);
