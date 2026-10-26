@@ -1017,20 +1017,14 @@ where
             let outcome = match CommentUrl::parse(&comment_url) {
                 Ok(comment_url) => Outcome::Posted { comment_url },
                 Err(err) => {
-                    self.record_finished_review(&pr_url, &head, &identity, Outcome::Failed)?;
+                    self.complete_posted_review(&pr, &pr_url, &head, &identity, Outcome::Failed)
+                        .await?;
                     return Err(err);
                 }
             };
-            self.record_finished_review(&pr_url, &head, &identity, outcome)?;
-            let marker = PendingHandledMarker::for_pull_request(&pr);
-            self.pending_handled_markers.record(&marker)?;
-            if let Err(err) = self.github.mark_pr_handled(&pr).await {
-                error!(
-                    pr = %pr.html_url,
-                    error = ?err,
-                    "failed to mark auto-review pull request handled after posting response"
-                );
-            }
+            let recorded = self
+                .complete_posted_review(&pr, &pr_url, &head, &identity, outcome)
+                .await;
 
             if let Some((session_id, resume_command)) = codex_run.resume_command() {
                 info!(
@@ -1047,11 +1041,33 @@ where
                     "responded to auto-review pull request"
                 );
             }
+            recorded?;
             Ok(())
         }
         .await;
 
         self.cleanup_worktree(worktree, result).await
+    }
+
+    async fn complete_posted_review(
+        &self,
+        pr: &PullRequest,
+        pr_url: &PrUrl,
+        head: &HeadSha,
+        identity: &RunIdentity,
+        outcome: Outcome,
+    ) -> Result<()> {
+        let recorded = self.record_finished_review(pr_url, head, identity, outcome);
+        let marker = PendingHandledMarker::for_pull_request(pr);
+        self.pending_handled_markers.record(&marker)?;
+        if let Err(err) = self.github.mark_pr_handled(pr).await {
+            error!(
+                pr = %pr.html_url,
+                error = ?err,
+                "failed to mark auto-review pull request handled after posting response"
+            );
+        }
+        recorded
     }
 
     fn record_finished_review(
@@ -1532,6 +1548,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
     use tokio::sync::{Barrier, Notify};
@@ -2686,6 +2703,62 @@ mod tests {
         assert_eq!(second.responded, 0);
         assert_eq!(second.skipped, 1);
         assert_eq!(reviews.runs(&pr_url, &sha).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unwritable_ledger_still_posts_one_comment_and_does_not_review_again() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("reviews");
+        std::fs::create_dir(&directory).unwrap();
+        let ledger_path = directory.join("pr-reviews.json");
+        let reviews = crate::pr_review::FileReviewLedger::new(&ledger_path);
+        let markers = MemoryPendingHandledMarkerStore::default();
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_review_ledger(reviews.clone())
+            .with_pending_handled_marker_store(markers.clone());
+        let _restore = RestoreWriteAccess(&directory);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.responded, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert!(
+            github
+                .handled_prs
+                .lock()
+                .unwrap()
+                .contains(&pull_request.html_url)
+        );
+        assert!(
+            markers
+                .contains(&PendingHandledMarker::for_pull_request(&pull_request))
+                .unwrap()
+        );
+        assert!(reviews.is_empty().unwrap());
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let second = maid.run_once().await.unwrap();
+
+        assert_eq!(second.responded, 0);
+        assert_eq!(second.failed, 0);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert!(reviews.is_empty().unwrap());
+    }
+
+    struct RestoreWriteAccess<'a>(&'a Path);
+
+    impl Drop for RestoreWriteAccess<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
     }
 
     #[tokio::test]
