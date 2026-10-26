@@ -13,7 +13,7 @@ use crate::mention_thread::{
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::pr_review::{
     Action, CommentUrl, EffortName, HeadSha, MemoryReviewLedger, ModelName, Observation, Outcome,
-    PrUrl, PromptHash, ReviewAgent, ReviewLedger, ReviewRun,
+    PrUrl, PromptHash, ReviewAgent, ReviewLedger, ReviewRun, covered_by,
 };
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::{Context, Result};
@@ -40,6 +40,7 @@ pub trait GithubClient: Send + Sync {
         &self,
         repo: &RepoSlug,
         order: OpenPullRequestOrder,
+        all_pages: bool,
     ) -> Result<Vec<OpenPullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
     async fn open_pull_request(&self, pr: &PullRequest) -> Result<OpenPullRequest>;
@@ -405,7 +406,8 @@ where
             {
                 Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
                     Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
-                        Ok(()) => report.responded += 1,
+                        Ok(TaskFinish::Completed) => report.responded += 1,
+                        Ok(TaskFinish::Skipped) => report.skipped += 1,
                         Err(err) => {
                             report.failed += 1;
                             error!(
@@ -517,7 +519,8 @@ where
             match assessment {
                 TaskAssessment::Ready(intent) => match self.start_task(intent).await {
                     Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
-                        Ok(()) => report.responded += 1,
+                        Ok(TaskFinish::Completed) => report.responded += 1,
+                        Ok(TaskFinish::Skipped) => report.skipped += 1,
                         Err(err) => {
                             report.failed += 1;
                             error!(
@@ -802,8 +805,14 @@ where
             self.continuous_review,
             self.max_failures_per_head,
         )?;
-        self.apply_review_action(pr, action, observed_pending_markers)
-            .await
+        self.apply_review_action(
+            pr,
+            action,
+            has_pending_marker,
+            plus_one,
+            observed_pending_markers,
+        )
+        .await
     }
 
     async fn head_for_continuous_review(
@@ -826,7 +835,11 @@ where
         for repo in &self.auto_review_repos {
             for open in self
                 .github
-                .open_pull_requests(repo, OpenPullRequestOrder::NewestCreated)
+                .open_pull_requests(
+                    repo,
+                    OpenPullRequestOrder::NewestCreated,
+                    self.continuous_review,
+                )
                 .await?
             {
                 candidates.push(AutoReviewCandidate::repository(open));
@@ -834,7 +847,11 @@ where
             if !self.auto_review_teams.is_empty() {
                 for open in self
                     .github
-                    .open_pull_requests(repo, OpenPullRequestOrder::RecentlyUpdated)
+                    .open_pull_requests(
+                        repo,
+                        OpenPullRequestOrder::RecentlyUpdated,
+                        self.continuous_review,
+                    )
                     .await?
                 {
                     candidates.push(AutoReviewCandidate::team_activity(open));
@@ -865,6 +882,8 @@ where
         &self,
         pr: &PullRequest,
         action: Action,
+        marker_present: bool,
+        plus_one: bool,
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<TaskAssessment> {
         let marker = PendingHandledMarker::for_pull_request(pr);
@@ -878,6 +897,8 @@ where
                             author: pr.author.clone(),
                         },
                     },
+                    marker: marker_present,
+                    plus_one,
                 },
             ))),
             Action::RetryPlusOne => {
@@ -908,7 +929,12 @@ where
     }
 
     async fn start_task(&self, intent: Box<TaskIntent>) -> Result<TaskStartOutcome> {
-        if !self.can_start_task()? {
+        let room = if matches!(intent.as_ref(), TaskIntent::AutoReviewPullRequest { .. }) {
+            self.task_starts.can_start()?
+        } else {
+            self.can_start_task()?
+        };
+        if !room {
             intent.log_task_limit_reached();
             return Ok(TaskStartOutcome::Skipped);
         }
@@ -919,9 +945,19 @@ where
                 mention,
                 task,
             } => self.start_mention_task(notification, mention, task).await,
-            TaskIntent::AutoReviewPullRequest { pr, task } => {
-                self.start_auto_review_task(pr, task).await
-            }
+            TaskIntent::AutoReviewPullRequest {
+                pr,
+                task,
+                marker,
+                plus_one,
+            } => Ok(TaskStartOutcome::Started(Box::new(
+                StartedTask::AutoReviewPullRequest {
+                    pr,
+                    task,
+                    marker,
+                    plus_one,
+                },
+            ))),
         }
     }
 
@@ -947,15 +983,24 @@ where
         })))
     }
 
-    async fn finish_task(&self, task: Box<StartedTask>) -> Result<()> {
+    async fn finish_task(&self, task: Box<StartedTask>) -> Result<TaskFinish> {
         match *task {
             StartedTask::Mention {
                 notification,
                 mention,
                 task,
-            } => self.finish_mention_task(notification, mention, task).await,
-            StartedTask::AutoReviewPullRequest { pr, task } => {
-                self.finish_auto_review_task(pr, task).await
+            } => self
+                .finish_mention_task(notification, mention, task)
+                .await
+                .map(|()| TaskFinish::Completed),
+            StartedTask::AutoReviewPullRequest {
+                pr,
+                task,
+                marker,
+                plus_one,
+            } => {
+                self.finish_auto_review_task(pr, task, marker, plus_one)
+                    .await
             }
         }
     }
@@ -1008,25 +1053,13 @@ where
         self.cleanup_worktree(worktree, result).await
     }
 
-    async fn start_auto_review_task(
+    async fn finish_auto_review_task(
         &self,
         pr: PullRequest,
         task: CodexTask,
-    ) -> Result<TaskStartOutcome> {
-        self.github.mark_pr_started(&pr).await?;
-        info!(
-            pr = %pr.html_url,
-            author = %pr.author,
-            task_kind = task.task_kind(),
-            "started handling auto-review pull request"
-        );
-
-        Ok(TaskStartOutcome::Started(Box::new(
-            StartedTask::AutoReviewPullRequest { pr, task },
-        )))
-    }
-
-    async fn finish_auto_review_task(&self, pr: PullRequest, task: CodexTask) -> Result<()> {
+        marker: bool,
+        plus_one: bool,
+    ) -> Result<TaskFinish> {
         let started_unix = unix_seconds(SystemTime::now())?;
         let target = WorkTarget::PullRequest(pr.clone());
         let worktree = self.worktrees.prepare(&target, &task).await?;
@@ -1037,6 +1070,38 @@ where
                     .context("checked out pull request has no head")?,
             )?;
             let pr_url = PrUrl::parse(&pr.html_url)?;
+            let runs = self.reviews.runs(&pr_url, &head)?;
+            let mut action = crate::pr_review::plan(
+                &runs,
+                ReviewAgent::Codex,
+                &Observation {
+                    pr: pr_url.clone(),
+                    sha: Some(head.clone()),
+                    marker,
+                    plus_one,
+                },
+                self.continuous_review,
+                self.max_failures_per_head,
+            );
+            if action == Action::Review && covered_by(&runs, ReviewAgent::Codex) {
+                action = Action::RetryPlusOne;
+            }
+            if action != Action::Review {
+                let mut observed = HashSet::new();
+                self.apply_review_action(&pr, action, marker, plus_one, &mut observed)
+                    .await?;
+                return Ok(TaskFinish::Skipped);
+            }
+            if !self.can_start_task()? {
+                return Ok(TaskFinish::Skipped);
+            }
+            self.github.mark_pr_started(&pr).await?;
+            info!(
+                pr = %pr.html_url,
+                author = %pr.author,
+                task_kind = task.task_kind(),
+                "started handling auto-review pull request"
+            );
             let facts = self.codex.review_facts(&task)?;
             let model = ModelName::parse(&facts.model)?;
             let effort = EffortName::parse(&facts.effort)?;
@@ -1094,7 +1159,7 @@ where
                 );
             }
             recorded?;
-            Ok(())
+            Ok(TaskFinish::Completed)
         }
         .await;
 
@@ -1144,15 +1209,15 @@ where
         )
     }
 
-    async fn cleanup_worktree(
+    async fn cleanup_worktree<T>(
         &self,
         worktree: PreparedWorktree,
-        task_result: Result<()>,
-    ) -> Result<()> {
+        task_result: Result<T>,
+    ) -> Result<T> {
         let cleanup_result = self.worktrees.cleanup(worktree).await;
         match (task_result, cleanup_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(err)) => Err(err),
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(err)) => Err(err),
             (Err(err), Ok(())) => Err(err),
             (Err(err), Err(cleanup_err)) => {
                 error!(
@@ -1440,6 +1505,11 @@ enum TaskStartOutcome {
     Skipped,
 }
 
+enum TaskFinish {
+    Completed,
+    Skipped,
+}
+
 #[derive(Clone, Debug)]
 enum TaskIntent {
     Mention {
@@ -1450,6 +1520,8 @@ enum TaskIntent {
     AutoReviewPullRequest {
         pr: PullRequest,
         task: CodexTask,
+        marker: bool,
+        plus_one: bool,
     },
 }
 
@@ -1493,6 +1565,8 @@ enum StartedTask {
     AutoReviewPullRequest {
         pr: PullRequest,
         task: CodexTask,
+        marker: bool,
+        plus_one: bool,
     },
 }
 
@@ -1618,7 +1692,9 @@ mod tests {
         mention: Arc<StdMutex<FakeMentionResult>>,
         mentions: Arc<StdMutex<FakeMentionsResult>>,
         pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
+        later_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         list_orders: Arc<StdMutex<Vec<OpenPullRequestOrder>>>,
+        listed_all_pages: Arc<StdMutex<Vec<bool>>>,
         recently_updated_pull_requests: Arc<StdMutex<Option<Vec<PullRequest>>>>,
         requested_teams: Arc<StdMutex<HashMap<String, Vec<TeamSlug>>>>,
         pull_created_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
@@ -1670,14 +1746,19 @@ mod tests {
             &self,
             _repo: &RepoSlug,
             order: OpenPullRequestOrder,
+            all_pages: bool,
         ) -> Result<Vec<OpenPullRequest>> {
             self.list_orders.lock().unwrap().push(order);
+            self.listed_all_pages.lock().unwrap().push(all_pages);
             let created = self.pull_requests.lock().unwrap().clone();
             let updated = self.recently_updated_pull_requests.lock().unwrap().clone();
-            let pull_requests = match order {
+            let mut pull_requests = match order {
                 OpenPullRequestOrder::NewestCreated => created,
                 OpenPullRequestOrder::RecentlyUpdated => updated.unwrap_or(created),
             };
+            if all_pages {
+                pull_requests.extend(self.later_pull_requests.lock().unwrap().clone());
+            }
             Ok(pull_requests
                 .into_iter()
                 .map(|pull_request| self.open_pull(pull_request))
@@ -1956,6 +2037,14 @@ mod tests {
     }
 
     impl TaskStartRecorder for FixedTaskStartRecorder {
+        fn can_start(&self) -> Result<bool> {
+            let allowed = !matches!(self.decision, TaskStartDecision::AtLimit { .. });
+            if !allowed {
+                *self.calls.lock().unwrap() += 1;
+            }
+            Ok(allowed)
+        }
+
         fn try_record_started(&self) -> Result<TaskStartDecision> {
             *self.calls.lock().unwrap() += 1;
             Ok(self.decision)
@@ -3003,6 +3092,7 @@ mod tests {
                 .is_empty()
         );
         assert!(github.pull_gets.lock().unwrap().is_empty());
+        assert_eq!(*github.listed_all_pages.lock().unwrap(), vec![false]);
         assert_eq!(
             *github.pr_state_calls.lock().unwrap(),
             vec![handled.html_url.clone(), pending.html_url.clone()]
@@ -3138,14 +3228,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flag_off_posted_run_still_reviews_without_a_plus_one() {
+    async fn flag_off_posted_checkout_does_not_review_again() {
         let (report, github, codex, starts) =
             poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(1), true, false).await;
 
-        assert_eq!(report.responded, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(report.responded, 0);
+        assert_eq!(*starts.calls.lock().unwrap(), 0);
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.pull_gets.lock().unwrap().is_empty());
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["handled_pr".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -3169,9 +3264,146 @@ mod tests {
             .unwrap();
 
         assert!(github.pull_gets.lock().unwrap().is_empty());
-        assert_eq!(report.responded, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(report.responded, 0);
+        assert_eq!(*starts.calls.lock().unwrap(), 0);
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert!(github.posts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_author_failure_cap_runs_codex_once() {
+        for continuous_review in [true, false] {
+            let github = FakeGithub::default();
+            let pull_request = pr();
+            *github.public_pull_requests.lock().unwrap() = vec![pull_request.clone()];
+            set_head(&github, &pull_request, FAKE_HEAD_SHA);
+            let reviews = MemoryReviewLedger::default();
+            let starts = recording_recorder();
+            let codex = FakeCodex {
+                error: Arc::new(StdMutex::new(Some("codex failed".to_string()))),
+                ..FakeCodex::default()
+            };
+            let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+                .with_public_auto_review_accounts(["dionysuzx"])
+                .with_continuous_review(continuous_review)
+                .with_max_failures_per_head(NonZeroUsize::new(1))
+                .with_review_ledger(reviews.clone())
+                .with_task_start_recorder(starts.clone());
+
+            for _ in 0..3 {
+                maid.run_once().await.unwrap();
+            }
+
+            assert_eq!(codex.calls.lock().unwrap().len(), 1);
+            assert_eq!(*starts.calls.lock().unwrap(), 1);
+            assert!(github.posts.lock().unwrap().is_empty());
+            if !continuous_review {
+                assert!(github.pull_gets.lock().unwrap().is_empty());
+            }
+            let runs = reviews
+                .runs(
+                    &PrUrl::parse(&pull_request.html_url).unwrap(),
+                    &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].outcome(), &Outcome::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checkout_of_a_covered_head_is_not_reviewed_again() {
+        for continuous_review in [true, false] {
+            for plus_one in [true, false] {
+                for has_marker in [true, false] {
+                    let github = FakeGithub::default();
+                    let pull_request = pr();
+                    *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+                    set_head(&github, &pull_request, OTHER_HEAD_SHA);
+                    if plus_one {
+                        github
+                            .handled_prs
+                            .lock()
+                            .unwrap()
+                            .insert(pull_request.html_url.clone());
+                    }
+                    let reviews = MemoryReviewLedger::default();
+                    record_posted_run(&reviews, &pull_request, FAKE_HEAD_SHA);
+                    let markers = MemoryPendingHandledMarkerStore::default();
+                    if has_marker {
+                        markers
+                            .record(&PendingHandledMarker::for_pull_request(&pull_request))
+                            .unwrap();
+                    }
+                    let starts = recording_recorder();
+                    let codex = FakeCodex::default();
+
+                    maid(github.clone(), idle_worktrees(), codex.clone())
+                        .with_continuous_review(continuous_review)
+                        .with_review_ledger(reviews.clone())
+                        .with_pending_handled_marker_store(markers)
+                        .with_task_start_recorder(starts.clone())
+                        .run_once()
+                        .await
+                        .unwrap();
+
+                    assert!(codex.calls.lock().unwrap().is_empty());
+                    assert!(github.posts.lock().unwrap().is_empty());
+                    assert_eq!(*starts.calls.lock().unwrap(), 0);
+                    assert_eq!(
+                        reviews
+                            .runs(
+                                &PrUrl::parse(&pull_request.html_url).unwrap(),
+                                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+                            )
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_review_reaches_an_uncovered_pull_request_past_the_first_page() {
+        let first = pr_with_number(1);
+        let second = pr_with_number(2);
+        for (continuous_review, reviewed) in [(false, false), (true, true)] {
+            let github = FakeGithub::default();
+            *github.pull_requests.lock().unwrap() = vec![first.clone()];
+            *github.later_pull_requests.lock().unwrap() = vec![second.clone()];
+            set_head(&github, &first, FAKE_HEAD_SHA);
+            set_head(&github, &second, FAKE_HEAD_SHA);
+            let reviews = MemoryReviewLedger::default();
+            record_posted_run(&reviews, &first, FAKE_HEAD_SHA);
+            github
+                .handled_prs
+                .lock()
+                .unwrap()
+                .insert(first.html_url.clone());
+            let codex = FakeCodex::default();
+
+            maid(github.clone(), idle_worktrees(), codex.clone())
+                .with_continuous_review(continuous_review)
+                .with_review_ledger(reviews)
+                .run_once()
+                .await
+                .unwrap();
+
+            assert_eq!(codex.calls.lock().unwrap().len(), usize::from(reviewed));
+            assert!(
+                github
+                    .listed_all_pages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|all_pages| *all_pages == continuous_review)
+            );
+            if reviewed {
+                assert_eq!(codex.calls.lock().unwrap()[0].1.pr_url, second.html_url);
+            }
+        }
     }
 
     async fn poll_capped_head(
@@ -3346,8 +3578,8 @@ mod tests {
 
         assert_eq!(report.started, 1);
         assert_eq!(report.skipped, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
         entered.wait().await;
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
         assert!(github.pull_gets.lock().unwrap().is_empty());
 

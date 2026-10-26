@@ -335,14 +335,33 @@ impl GithubClient for GitHubRestClient {
         &self,
         repo: &RepoSlug,
         order: OpenPullRequestOrder,
+        all_pages: bool,
     ) -> Result<Vec<OpenPullRequest>> {
-        let pull_requests = self
-            .get::<Vec<ApiPullRequest>>(&open_pull_requests_url(repo, order))
-            .await?;
-        pull_requests
-            .into_iter()
-            .map(Self::open_pull_request_from_api)
-            .collect()
+        if !all_pages {
+            let pull_requests = self
+                .get::<Vec<ApiPullRequest>>(&open_pull_requests_url(repo, order))
+                .await?;
+            return pull_requests
+                .into_iter()
+                .map(Self::open_pull_request_from_api)
+                .collect();
+        }
+
+        let mut page = 1;
+        let mut pull_requests = Vec::new();
+        loop {
+            let batch = self
+                .get::<Vec<ApiPullRequest>>(&open_pull_requests_page_url(repo, order, page))
+                .await?;
+            let done = batch.len() < SEARCH_PAGE_SIZE;
+            for pull_request in batch {
+                pull_requests.push(Self::open_pull_request_from_api(pull_request)?);
+            }
+            if done {
+                return Ok(pull_requests);
+            }
+            page += 1;
+        }
     }
 
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>> {
@@ -751,6 +770,10 @@ mod tests {
         assert_eq!(
             open_pull_requests_url(&repo, OpenPullRequestOrder::RecentlyUpdated),
             "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=updated&direction=desc&per_page=50"
+        );
+        assert_eq!(
+            open_pull_requests_page_url(&repo, OpenPullRequestOrder::NewestCreated, 2),
+            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=created&direction=desc&per_page=100&page=2"
         );
     }
 
@@ -1355,14 +1378,28 @@ fn reaction_page_url(reactions_url: &str, page: u64) -> String {
 fn open_pull_requests_url(repo: &RepoSlug, order: OpenPullRequestOrder) -> String {
     // GitHub defaults sort=updated to ascending, so direction=desc is required
     // for the team-review page to be the most recently updated pull requests.
-    let sort = match order {
+    format!(
+        "https://api.github.com/repos/{}/{}/pulls?state=open&sort={}&direction=desc&per_page=50",
+        repo.owner,
+        repo.repo,
+        pull_request_sort(order)
+    )
+}
+
+fn open_pull_requests_page_url(repo: &RepoSlug, order: OpenPullRequestOrder, page: u64) -> String {
+    format!(
+        "https://api.github.com/repos/{}/{}/pulls?state=open&sort={}&direction=desc&per_page={SEARCH_PAGE_SIZE}&page={page}",
+        repo.owner,
+        repo.repo,
+        pull_request_sort(order)
+    )
+}
+
+fn pull_request_sort(order: OpenPullRequestOrder) -> &'static str {
+    match order {
         OpenPullRequestOrder::NewestCreated => "created",
         OpenPullRequestOrder::RecentlyUpdated => "updated",
-    };
-    format!(
-        "https://api.github.com/repos/{}/{}/pulls?state=open&sort={sort}&direction=desc&per_page=50",
-        repo.owner, repo.repo
-    )
+    }
 }
 
 fn timestamp_from_api(value: &str) -> Option<DateTime<Utc>> {
