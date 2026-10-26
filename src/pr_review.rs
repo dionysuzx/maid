@@ -203,17 +203,11 @@ impl ReviewRun {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Observation {
-    Legacy {
-        marker: bool,
-        plus_one: bool,
-    },
-    Head {
-        pr: PrUrl,
-        sha: HeadSha,
-        marker: bool,
-        plus_one: bool,
-    },
+pub struct Observation {
+    pub pr: PrUrl,
+    pub sha: Option<HeadSha>,
+    pub marker: bool,
+    pub plus_one: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,31 +231,26 @@ pub fn plan(
     runs_at_head: &[ReviewRun],
     agent: ReviewAgent,
     observation: &Observation,
+    continuous_review: bool,
     max_failures: Option<NonZeroUsize>,
 ) -> Action {
-    match observation {
-        Observation::Legacy {
-            plus_one: true,
-            marker: true,
-        } => Action::ForgetMarker,
-        Observation::Legacy { plus_one: true, .. } => Action::Idle,
-        Observation::Legacy { marker: true, .. } => Action::RetryPlusOne,
-        Observation::Legacy { .. } => Action::Review,
-        Observation::Head {
-            plus_one, marker, ..
-        } => {
-            if covered_by(runs_at_head, agent) {
-                match (*plus_one, *marker) {
-                    (true, true) => Action::ForgetMarker,
-                    (true, false) => Action::Idle,
-                    (false, _) => Action::RetryPlusOne,
-                }
-            } else if failures_reached(runs_at_head, agent, max_failures) {
-                Action::Idle
-            } else {
-                Action::Review
-            }
-        }
+    let covered = covered_by(runs_at_head, agent);
+    let needs_review = if continuous_review {
+        !covered
+    } else {
+        !observation.plus_one && !observation.marker
+    };
+    if !needs_review {
+        return match (observation.plus_one, observation.marker) {
+            (true, true) => Action::ForgetMarker,
+            (true, false) => Action::Idle,
+            (false, _) => Action::RetryPlusOne,
+        };
+    }
+    if !covered && failures_reached(runs_at_head, agent, max_failures) {
+        Action::Idle
+    } else {
+        Action::Review
     }
 }
 
@@ -301,6 +290,7 @@ pub trait ReviewLedger: Send + Sync {
         &self,
         agent: ReviewAgent,
         observation: &Observation,
+        continuous_review: bool,
         max_failures: Option<NonZeroUsize>,
     ) -> Result<Action>;
     fn record(&self, pr: &PrUrl, sha: &HeadSha, run: ReviewRun) -> Result<()>;
@@ -322,10 +312,17 @@ impl ReviewLedger for MemoryReviewLedger {
         &self,
         agent: ReviewAgent,
         observation: &Observation,
+        continuous_review: bool,
         max_failures: Option<NonZeroUsize>,
     ) -> Result<Action> {
         let state = self.lock()?;
-        Ok(plan_state(&state, agent, observation, max_failures))
+        Ok(plan_state(
+            &state,
+            agent,
+            observation,
+            continuous_review,
+            max_failures,
+        ))
     }
 
     fn record(&self, pr: &PrUrl, sha: &HeadSha, run: ReviewRun) -> Result<()> {
@@ -375,11 +372,18 @@ impl ReviewLedger for FileReviewLedger {
         &self,
         agent: ReviewAgent,
         observation: &Observation,
+        continuous_review: bool,
         max_failures: Option<NonZeroUsize>,
     ) -> Result<Action> {
         let _guard = self.file_lock()?;
         let state = ReviewFile::read(&self.path)?.into_state()?;
-        Ok(plan_state(&state, agent, observation, max_failures))
+        Ok(plan_state(
+            &state,
+            agent,
+            observation,
+            continuous_review,
+            max_failures,
+        ))
     }
 
     fn record(&self, pr: &PrUrl, sha: &HeadSha, run: ReviewRun) -> Result<()> {
@@ -414,13 +418,15 @@ fn plan_state(
     state: &ReviewState,
     agent: ReviewAgent,
     observation: &Observation,
+    continuous_review: bool,
     max_failures: Option<NonZeroUsize>,
 ) -> Action {
-    let runs = match observation {
-        Observation::Legacy { .. } => Vec::new(),
-        Observation::Head { pr, sha, .. } => state.runs(pr, sha),
-    };
-    plan(&runs, agent, observation, max_failures)
+    let runs = observation
+        .sha
+        .as_ref()
+        .map(|sha| state.runs(&observation.pr, sha))
+        .unwrap_or_default();
+    plan(&runs, agent, observation, continuous_review, max_failures)
 }
 
 #[derive(Debug, Default)]
@@ -632,21 +638,56 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plan_matches_today() {
+    fn flag_off_plan_matches_today() {
+        let posted = [posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")];
         assert_eq!(
-            plan(&[], ReviewAgent::Codex, &legacy(true, true), None),
+            plan(
+                &[],
+                ReviewAgent::Codex,
+                &observe(Some(SHA_A), true, true),
+                false,
+                None
+            ),
             Action::ForgetMarker
         );
         assert_eq!(
-            plan(&[], ReviewAgent::Codex, &legacy(false, true), None),
+            plan(
+                &[],
+                ReviewAgent::Codex,
+                &observe(Some(SHA_A), false, true),
+                false,
+                None
+            ),
             Action::Idle
         );
         assert_eq!(
-            plan(&[], ReviewAgent::Codex, &legacy(true, false), None),
+            plan(
+                &[],
+                ReviewAgent::Codex,
+                &observe(Some(SHA_A), true, false),
+                false,
+                None
+            ),
             Action::RetryPlusOne
         );
         assert_eq!(
-            plan(&[], ReviewAgent::Codex, &legacy(false, false), None),
+            plan(
+                &[],
+                ReviewAgent::Codex,
+                &observe(Some(SHA_A), false, false),
+                false,
+                None
+            ),
+            Action::Review
+        );
+        assert_eq!(
+            plan(
+                &posted,
+                ReviewAgent::Codex,
+                &observe(Some(SHA_A), false, false),
+                false,
+                None
+            ),
             Action::Review
         );
     }
@@ -654,14 +695,20 @@ mod tests {
     #[test]
     fn head_plan_reviews_an_uncovered_sha() {
         let covered = posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt");
-        let head = head_obs(SHA_A, true, true);
+        let head = observe(Some(SHA_A), true, true);
 
         assert_eq!(
-            plan(&[covered], ReviewAgent::Codex, &head, None),
+            plan(&[covered], ReviewAgent::Codex, &head, true, None),
             Action::ForgetMarker
         );
         assert_eq!(
-            plan(&[], ReviewAgent::Codex, &head_obs(SHA_A, true, true), None),
+            plan(
+                &[],
+                ReviewAgent::Codex,
+                &observe(Some(SHA_A), true, true),
+                true,
+                None
+            ),
             Action::Review
         );
         let ledger = MemoryReviewLedger::default();
@@ -675,7 +722,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             ledger
-                .plan(ReviewAgent::Codex, &head_obs(SHA_B, false, false), None)
+                .plan(
+                    ReviewAgent::Codex,
+                    &observe(Some(SHA_B), false, false),
+                    true,
+                    None
+                )
                 .unwrap(),
             Action::Review
         );
@@ -683,7 +735,8 @@ mod tests {
             plan(
                 &[posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")],
                 ReviewAgent::Codex,
-                &head_obs(SHA_A, true, false),
+                &observe(Some(SHA_A), true, false),
+                true,
                 None,
             ),
             Action::RetryPlusOne
@@ -692,7 +745,8 @@ mod tests {
             plan(
                 &[posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")],
                 ReviewAgent::Codex,
-                &head_obs(SHA_A, false, true),
+                &observe(Some(SHA_A), false, true),
+                true,
                 None,
             ),
             Action::Idle
@@ -707,42 +761,67 @@ mod tests {
     #[test]
     fn failure_cap_idles_only_the_capped_head() {
         let cap = NonZeroUsize::new(2);
-        let head = head_obs(SHA_A, false, false);
+        let head = observe(Some(SHA_A), false, false);
         let one_failure = [failed_run()];
         let two_failures = [failed_run(), failed_run()];
+        let posted_after_failure = [
+            failed_run(),
+            posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt"),
+        ];
 
         assert_eq!(
-            plan(&two_failures, ReviewAgent::Codex, &head, None),
+            plan(&two_failures, ReviewAgent::Codex, &head, true, None),
             Action::Review
         );
         assert_eq!(
-            plan(&one_failure, ReviewAgent::Codex, &head, cap),
+            plan(&two_failures, ReviewAgent::Codex, &head, false, None),
             Action::Review
         );
         assert_eq!(
-            plan(&two_failures, ReviewAgent::Codex, &head, cap),
+            plan(&one_failure, ReviewAgent::Codex, &head, true, cap),
+            Action::Review
+        );
+        assert_eq!(
+            plan(&one_failure, ReviewAgent::Codex, &head, false, cap),
+            Action::Review
+        );
+        assert_eq!(
+            plan(&two_failures, ReviewAgent::Codex, &head, true, cap),
+            Action::Idle
+        );
+        assert_eq!(
+            plan(&two_failures, ReviewAgent::Codex, &head, false, cap),
             Action::Idle
         );
         assert_eq!(
             plan(
-                &[
-                    failed_run(),
-                    posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")
-                ],
+                &posted_after_failure,
                 ReviewAgent::Codex,
-                &head_obs(SHA_A, false, false),
+                &head,
+                true,
                 NonZeroUsize::new(1),
             ),
             Action::RetryPlusOne
         );
         assert_eq!(
             plan(
-                &two_failures,
+                &posted_after_failure,
                 ReviewAgent::Codex,
-                &legacy(false, false),
-                cap
+                &head,
+                false,
+                NonZeroUsize::new(1),
             ),
             Action::Review
+        );
+        assert_eq!(
+            plan(
+                &two_failures,
+                ReviewAgent::Codex,
+                &observe(Some(SHA_A), true, false),
+                false,
+                cap,
+            ),
+            Action::RetryPlusOne
         );
 
         let ledger = MemoryReviewLedger::default();
@@ -750,18 +829,30 @@ mod tests {
         let sha_a = HeadSha::parse(SHA_A).unwrap();
         ledger.record(&pr, &sha_a, failed_run()).unwrap();
         ledger.record(&pr, &sha_a, failed_run()).unwrap();
-        assert_eq!(
-            ledger
-                .plan(ReviewAgent::Codex, &head_obs(SHA_A, false, false), cap)
-                .unwrap(),
-            Action::Idle
-        );
-        assert_eq!(
-            ledger
-                .plan(ReviewAgent::Codex, &head_obs(SHA_B, false, false), cap)
-                .unwrap(),
-            Action::Review
-        );
+        for continuous_review in [true, false] {
+            assert_eq!(
+                ledger
+                    .plan(
+                        ReviewAgent::Codex,
+                        &observe(Some(SHA_A), false, false),
+                        continuous_review,
+                        cap
+                    )
+                    .unwrap(),
+                Action::Idle
+            );
+            assert_eq!(
+                ledger
+                    .plan(
+                        ReviewAgent::Codex,
+                        &observe(Some(SHA_B), false, false),
+                        continuous_review,
+                        cap
+                    )
+                    .unwrap(),
+                Action::Review
+            );
+        }
     }
 
     #[test]
@@ -802,7 +893,12 @@ mod tests {
         assert_eq!(runs, vec![run]);
         assert_eq!(
             reloaded
-                .plan(ReviewAgent::Codex, &legacy(false, false), None)
+                .plan(
+                    ReviewAgent::Codex,
+                    &observe(Some(SHA_A), false, false),
+                    false,
+                    None
+                )
                 .unwrap(),
             Action::Review
         );
@@ -832,14 +928,10 @@ mod tests {
         assert!(path.exists());
     }
 
-    fn legacy(marker: bool, plus_one: bool) -> Observation {
-        Observation::Legacy { marker, plus_one }
-    }
-
-    fn head_obs(sha: &str, marker: bool, plus_one: bool) -> Observation {
-        Observation::Head {
+    fn observe(sha: Option<&str>, marker: bool, plus_one: bool) -> Observation {
+        Observation {
             pr: PrUrl::parse("https://github.com/o/r/pull/1").unwrap(),
-            sha: HeadSha::parse(sha).unwrap(),
+            sha: sha.map(|sha| HeadSha::parse(sha).unwrap()),
             marker,
             plus_one,
         }

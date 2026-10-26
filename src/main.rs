@@ -62,14 +62,14 @@ async fn main() -> Result<()> {
     ))
     .with_review_ledger(FileReviewLedger::new(config.pr_review_ledger_path.clone()))
     .with_continuous_review(config.continuous_review)
-    .with_continuous_review_max_failures_per_head(config.continuous_review_max_failures_per_head)
+    .with_max_failures_per_head(config.max_failures_per_head)
     .into_concurrent(config.max_concurrent_requests);
 
     let task_limit_per_24h = config
         .task_limit_per_24h
         .map_or_else(|| "none".to_string(), |limit| limit.to_string());
-    let continuous_review_max_failures_per_head = config
-        .continuous_review_max_failures_per_head
+    let max_failures_per_head = config
+        .max_failures_per_head
         .map_or_else(|| "none".to_string(), |limit| limit.get().to_string());
     let poller_metrics = polling_metrics.clone();
     let poller = tokio::spawn(async move {
@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
         github_notification_window_hours = config.github_notification_window.as_hours(),
         task_limit_per_24h = %task_limit_per_24h,
         continuous_review = config.continuous_review,
-        continuous_review_max_failures_per_head = %continuous_review_max_failures_per_head,
+        max_failures_per_head = %max_failures_per_head,
         max_concurrent_requests = config.max_concurrent_requests,
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),

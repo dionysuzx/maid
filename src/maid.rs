@@ -152,7 +152,7 @@ pub struct Maid<G, R, C> {
     observed_notifications: Arc<dyn ObservedNotificationStore>,
     reviews: Arc<dyn ReviewLedger>,
     continuous_review: bool,
-    continuous_review_max_failures_per_head: Option<NonZeroUsize>,
+    max_failures_per_head: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -262,7 +262,7 @@ where
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
             reviews: Arc::new(MemoryReviewLedger::default()),
             continuous_review: false,
-            continuous_review_max_failures_per_head: None,
+            max_failures_per_head: None,
         }
     }
 
@@ -318,11 +318,8 @@ where
         self
     }
 
-    pub fn with_continuous_review_max_failures_per_head(
-        mut self,
-        max_failures: Option<NonZeroUsize>,
-    ) -> Self {
-        self.continuous_review_max_failures_per_head = max_failures;
+    pub fn with_max_failures_per_head(mut self, max_failures: Option<NonZeroUsize>) -> Self {
+        self.max_failures_per_head = max_failures;
         self
     }
 
@@ -781,7 +778,7 @@ where
         let marker = PendingHandledMarker::for_pull_request(pr);
         let has_pending_marker = self.pending_handled_markers.contains(&marker)?;
         let plus_one = state == ReviewState::Handled;
-        let observation = if self.continuous_review {
+        let sha = if self.continuous_review {
             let Some(sha) = self.head_for_continuous_review(candidate).await? else {
                 info!(
                     pr = %pr.html_url,
@@ -789,22 +786,21 @@ where
                 );
                 return Ok(TaskAssessment::Skipped);
             };
-            Observation::Head {
-                pr: PrUrl::parse(&pr.html_url)?,
-                sha,
-                marker: has_pending_marker,
-                plus_one,
-            }
+            Some(sha)
         } else {
-            Observation::Legacy {
-                marker: has_pending_marker,
-                plus_one,
-            }
+            candidate.head_sha.clone()
+        };
+        let observation = Observation {
+            pr: PrUrl::parse(&pr.html_url)?,
+            sha,
+            marker: has_pending_marker,
+            plus_one,
         };
         let action = self.reviews.plan(
             ReviewAgent::Codex,
             &observation,
-            self.continuous_review_max_failures_per_head,
+            self.continuous_review,
+            self.max_failures_per_head,
         )?;
         self.apply_review_action(pr, action, observed_pending_markers)
             .await
@@ -2894,7 +2890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unset_continuous_review_keeps_the_old_poll() {
+    async fn flag_off_poll_makes_the_same_calls_and_decisions() {
         let github = FakeGithub::default();
         let handled = pr_with_number(1);
         let pending = pr_with_number(2);
@@ -2970,52 +2966,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuous_review_stops_after_the_failure_cap() {
-        let (report, github, codex, starts) =
-            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(1), false).await;
+    async fn failure_cap_idles_a_head_with_the_flag_on_and_off() {
+        for continuous_review in [true, false] {
+            let (report, github, codex, starts) = poll_capped_head(
+                FAKE_HEAD_SHA,
+                &[FAKE_HEAD_SHA],
+                Some(1),
+                false,
+                continuous_review,
+            )
+            .await;
 
-        assert_eq!(report.skipped, 1);
-        assert_eq!(report.responded, 0);
-        assert_eq!(*starts.calls.lock().unwrap(), 0);
-        assert!(codex.calls.lock().unwrap().is_empty());
-        assert!(github.events.lock().unwrap().is_empty());
+            assert_eq!(report.skipped, 1);
+            assert_eq!(report.responded, 0);
+            assert_eq!(*starts.calls.lock().unwrap(), 0);
+            assert!(codex.calls.lock().unwrap().is_empty());
+            assert!(github.events.lock().unwrap().is_empty());
+            assert!(github.pull_gets.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
-    async fn continuous_review_retries_one_failure_below_the_cap() {
-        let (report, _github, codex, starts) =
-            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(2), false).await;
+    async fn one_failure_below_the_cap_is_still_reviewed() {
+        for continuous_review in [true, false] {
+            let (report, github, codex, starts) = poll_capped_head(
+                FAKE_HEAD_SHA,
+                &[FAKE_HEAD_SHA],
+                Some(2),
+                false,
+                continuous_review,
+            )
+            .await;
 
-        assert_eq!(report.responded, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+            assert_eq!(report.responded, 1);
+            assert_eq!(*starts.calls.lock().unwrap(), 1);
+            assert_eq!(codex.calls.lock().unwrap().len(), 1);
+            assert!(github.pull_gets.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
-    async fn continuous_review_reviews_a_new_head_after_a_capped_head() {
-        let (report, _github, codex, starts) =
-            poll_capped_head(FAKE_HEAD_SHA, &[OTHER_HEAD_SHA], Some(1), false).await;
+    async fn a_new_head_resets_the_failure_count() {
+        for continuous_review in [true, false] {
+            let (report, github, codex, starts) = poll_capped_head(
+                FAKE_HEAD_SHA,
+                &[OTHER_HEAD_SHA],
+                Some(1),
+                false,
+                continuous_review,
+            )
+            .await;
 
-        assert_eq!(report.responded, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+            assert_eq!(report.responded, 1);
+            assert_eq!(*starts.calls.lock().unwrap(), 1);
+            assert_eq!(codex.calls.lock().unwrap().len(), 1);
+            assert!(github.pull_gets.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
-    async fn continuous_review_retries_failures_when_the_cap_is_unset() {
-        let (report, _github, codex, starts) =
-            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA, FAKE_HEAD_SHA], None, false).await;
+    async fn an_unset_failure_cap_retries_the_head() {
+        for continuous_review in [true, false] {
+            let (report, _github, codex, starts) = poll_capped_head(
+                FAKE_HEAD_SHA,
+                &[FAKE_HEAD_SHA, FAKE_HEAD_SHA],
+                None,
+                false,
+                continuous_review,
+            )
+            .await;
 
-        assert_eq!(report.responded, 1);
-        assert_eq!(*starts.calls.lock().unwrap(), 1);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+            assert_eq!(report.responded, 1);
+            assert_eq!(*starts.calls.lock().unwrap(), 1);
+            assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
-    async fn continuous_review_posted_run_covers_a_head_past_the_failure_cap() {
+    async fn a_posted_run_covers_a_head_past_the_failure_cap() {
         let pull_request = pr();
         let (report, github, codex, starts) =
-            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(1), true).await;
+            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(1), true, true).await;
 
         assert_eq!(report.responded, 0);
         assert_eq!(*starts.calls.lock().unwrap(), 0);
@@ -3033,11 +3064,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn flag_off_posted_run_still_reviews_without_a_plus_one() {
+        let (report, github, codex, starts) =
+            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(1), true, false).await;
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert!(github.pull_gets.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn flag_off_public_author_does_not_fetch_the_pull_request() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.public_pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        set_head(&github, &pull_request, FAKE_HEAD_SHA);
+        let reviews = MemoryReviewLedger::default();
+        record_failed_run(&reviews, &pull_request, FAKE_HEAD_SHA);
+        let starts = recording_recorder();
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_public_auto_review_accounts(["dionysuzx"])
+            .with_max_failures_per_head(NonZeroUsize::new(1))
+            .with_review_ledger(reviews)
+            .with_task_start_recorder(starts.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert!(github.pull_gets.lock().unwrap().is_empty());
+        assert_eq!(report.responded, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+    }
+
     async fn poll_capped_head(
         head: &str,
         failed_shas: &[&str],
         cap: Option<usize>,
         posted: bool,
+        continuous_review: bool,
     ) -> (PollReport, FakeGithub, FakeCodex, FixedTaskStartRecorder) {
         let github = FakeGithub::default();
         let pull_request = pr();
@@ -3053,8 +3122,8 @@ mod tests {
         let starts = recording_recorder();
         let codex = FakeCodex::default();
         let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_continuous_review(true)
-            .with_continuous_review_max_failures_per_head(cap.and_then(NonZeroUsize::new))
+            .with_continuous_review(continuous_review)
+            .with_max_failures_per_head(cap.and_then(NonZeroUsize::new))
             .with_review_ledger(reviews)
             .with_task_start_recorder(starts.clone())
             .run_once()

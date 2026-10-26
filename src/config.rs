@@ -32,7 +32,7 @@ pub struct Config {
     pub pr_review_ledger_path: PathBuf,
     pub task_limit_per_24h: Option<usize>,
     pub continuous_review: bool,
-    pub continuous_review_max_failures_per_head: Option<NonZeroUsize>,
+    pub max_failures_per_head: Option<NonZeroUsize>,
     pub max_concurrent_requests: usize,
     pub github_api_requests_per_hour: GitHubApiRequestRate,
     pub github_notification_window: GitHubNotificationWindow,
@@ -85,8 +85,7 @@ impl Config {
             .unwrap_or_else(|| maid_home.join("git"));
         let task_limit_per_24h = file.task_limit_per_24h;
         let continuous_review = file.continuous_review.unwrap_or(false);
-        let continuous_review_max_failures_per_head =
-            parse_max_failures_per_head(file.continuous_review_max_failures_per_head)?;
+        let max_failures_per_head = parse_max_failures_per_head(file.max_failures_per_head)?;
         let max_concurrent_requests = file.max_concurrent_requests.unwrap_or(1);
         if max_concurrent_requests == 0 {
             bail!("max_concurrent_requests must be at least 1");
@@ -141,7 +140,7 @@ impl Config {
             pr_review_ledger_path: maid_home.join("pr-reviews.json"),
             task_limit_per_24h,
             continuous_review,
-            continuous_review_max_failures_per_head,
+            max_failures_per_head,
             max_concurrent_requests,
             github_api_requests_per_hour,
             github_notification_window,
@@ -166,7 +165,7 @@ struct ConfigFile {
     git_dir: Option<String>,
     task_limit_per_24h: Option<usize>,
     continuous_review: Option<bool>,
-    continuous_review_max_failures_per_head: Option<usize>,
+    max_failures_per_head: Option<usize>,
     max_concurrent_requests: Option<usize>,
     github_api_requests_per_hour: Option<u32>,
     github_notification_window_hours: Option<u32>,
@@ -386,7 +385,7 @@ fn parse_max_failures_per_head(value: Option<usize>) -> Result<Option<NonZeroUsi
     };
     NonZeroUsize::new(limit)
         .map(Some)
-        .ok_or_else(|| anyhow!("continuous_review_max_failures_per_head must be at least 1"))
+        .ok_or_else(|| anyhow!("max_failures_per_head must be at least 1"))
 }
 
 #[cfg(test)]
@@ -409,7 +408,7 @@ auto_review_teams = ["Some-Org/eng-infra"]
 git_dir = "~/.maid/git"
 task_limit_per_24h = 5
 continuous_review = true
-continuous_review_max_failures_per_head = 2
+max_failures_per_head = 2
 max_concurrent_requests = 3
 github_api_requests_per_hour = 1200
 github_notification_window_hours = 96
@@ -450,7 +449,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.git_dir.as_deref(), Some("~/.maid/git"));
         assert_eq!(config.task_limit_per_24h, Some(5));
         assert_eq!(config.continuous_review, Some(true));
-        assert_eq!(config.continuous_review_max_failures_per_head, Some(2));
+        assert_eq!(config.max_failures_per_head, Some(2));
         assert_eq!(config.max_concurrent_requests, Some(3));
         assert_eq!(config.github_api_requests_per_hour, Some(1200));
         assert_eq!(config.github_notification_window_hours, Some(96));
@@ -490,7 +489,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.git_dir, None);
         assert_eq!(config.task_limit_per_24h, None);
         assert_eq!(config.continuous_review, None);
-        assert_eq!(config.continuous_review_max_failures_per_head, None);
+        assert_eq!(config.max_failures_per_head, None);
         assert_eq!(config.github_api_requests_per_hour, None);
         assert_eq!(config.github_notification_window_hours, None);
         assert_eq!(config.metrics_bind_address, None);
@@ -653,7 +652,7 @@ operator_mention = "operator {{{{request_text}}}}"
     }
 
     #[test]
-    fn continuous_review_failure_cap_rejects_zero() {
+    fn max_failures_per_head_rejects_zero() {
         assert_eq!(parse_max_failures_per_head(None).unwrap(), None);
         assert_eq!(
             parse_max_failures_per_head(Some(2)).unwrap(),
