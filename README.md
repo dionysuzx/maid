@@ -55,6 +55,10 @@ has no request timestamp, and the timeline is a separate oldest-first history.
 GitHub rewrites notification reasons, and the bot only receives
 `review_requested` when it is on the team.
 
+A normal shutdown waits until a posted review is written to the ledger, including
+while that write is still failing. Killing the process after the GitHub comment
+and before the write can review the same head once more.
+
 ## Metrics
 
 Maid serves Prometheus metrics at `http://127.0.0.1:9464/metrics` by default.

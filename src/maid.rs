@@ -25,7 +25,10 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
 use tracing::{error, info};
 
 #[async_trait]
@@ -307,6 +310,7 @@ where
         ConcurrentMaid {
             maid: self,
             work: WorkQueue::new(max_concurrent_requests),
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1174,6 +1178,7 @@ where
 pub struct ConcurrentMaid<G, R, C> {
     maid: Maid<G, R, C>,
     work: WorkQueue,
+    tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl<G, R, C> ConcurrentMaid<G, R, C>
@@ -1259,6 +1264,26 @@ where
         Ok(report)
     }
 
+    pub async fn drain(&self) {
+        loop {
+            let task = self
+                .tasks
+                .lock()
+                .expect("in-flight task lock is poisoned")
+                .pop();
+            let Some(task) = task else {
+                break;
+            };
+            let _ = task.await;
+        }
+    }
+
+    fn track(&self, task: JoinHandle<()>) {
+        let mut tasks = self.tasks.lock().expect("in-flight task lock is poisoned");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
     async fn start_auto_review(
         &self,
         candidate: &AutoReviewCandidate,
@@ -1269,7 +1294,7 @@ where
             report.skipped += 1;
             return;
         }
-        let Some(mut reservation) = self
+        let Some(reservation) = self
             .work
             .try_reserve_key(task_key_for_trigger(&candidate.pr.html_url))
         else {
@@ -1308,72 +1333,36 @@ where
             }
         };
 
-        let session = match self.maid.open_auto_review(pr, task).await {
-            Ok(Some(session)) => session,
-            Ok(None) => {
-                report.skipped += 1;
-                return;
-            }
-            Err(err) => {
-                report.failed += 1;
-                error!(
-                    pr = %candidate.pr.html_url,
-                    error = ?err,
-                    "failed to handle auto-review pull request"
-                );
-                return;
-            }
-        };
-
-        let Some(permit) = self.work.try_acquire_permit() else {
-            self.skip_or_fail_discard(session, report).await;
-            return;
-        };
-        match self.maid.can_start_task() {
-            Ok(true) => {}
-            Ok(false) => {
-                self.skip_or_fail_discard(session, report).await;
-                return;
-            }
-            Err(err) => {
-                report.failed += 1;
-                error!(
-                    pr = %session.pr.html_url,
-                    error = ?err,
-                    "failed to record auto-review task start"
-                );
-                let _ = self.maid.discard_auto_review(session).await;
-                return;
-            }
-        }
-
-        reservation.permit = Some(permit);
         report.started += 1;
-        let maid = self.maid.clone();
-        let pr_url = session.pr.html_url.clone();
-        tokio::spawn(async move {
+        let runner = self.clone();
+        let pr_url = pr.html_url.clone();
+        self.track(tokio::spawn(async move {
             let _reservation = reservation;
-            if let Err(err) = maid.run_auto_review(session).await {
+            if let Err(err) = runner.finish_reserved_auto_review(pr, task).await {
                 error!(
                     pr = %pr_url,
                     error = ?err,
                     "failed to handle auto-review pull request task"
                 );
             }
-        });
+        }));
     }
 
-    async fn skip_or_fail_discard(&self, session: AutoReviewSession, report: &mut PollReport) {
-        let pr_url = session.pr.html_url.clone();
-        if let Err(err) = self.maid.discard_auto_review(session).await {
-            report.failed += 1;
-            error!(
-                pr = %pr_url,
-                error = ?err,
-                "failed to clean up auto-review worktree"
-            );
-        } else {
-            report.skipped += 1;
+    async fn finish_reserved_auto_review(&self, pr: PullRequest, task: CodexTask) -> Result<()> {
+        let Some(session) = self.maid.open_auto_review(pr, task).await? else {
+            return Ok(());
+        };
+        let Some(permit) = self.work.try_acquire_permit() else {
+            return self.maid.discard_auto_review(session).await;
+        };
+        let _permit = permit;
+        match self.maid.can_start_task() {
+            Ok(true) => self.maid.run_auto_review(session).await.map(|_| ()),
+            Ok(false) => self.maid.discard_auto_review(session).await,
+            Err(err) => {
+                let _ = self.maid.discard_auto_review(session).await;
+                Err(err)
+            }
         }
     }
 
@@ -1422,12 +1411,12 @@ where
             Ok(TaskStartOutcome::Started(task)) => {
                 report.started += 1;
                 let maid = self.maid.clone();
-                tokio::spawn(async move {
+                self.track(tokio::spawn(async move {
                     let _reservation = reservation;
                     if let Err(err) = maid.finish_task(task.clone()).await {
                         task.log_failure(&err);
                     }
-                });
+                }));
             }
             Ok(TaskStartOutcome::Skipped) => report.skipped += 1,
             Err(err) => {
@@ -1706,7 +1695,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
-    use tokio::sync::{Barrier, Notify};
+    use tokio::sync::{Barrier, Notify, watch};
 
     type FakeMentionResult = Option<Result<Option<CommentMention>, String>>;
     type FakeMentionsResult = Option<Result<Vec<CommentMention>, String>>;
@@ -1987,6 +1976,70 @@ mod tests {
                 .push((worktree.to_path_buf(), task.clone()));
             if let Some(message) = self.error.lock().unwrap().take() {
                 return Err(anyhow!(message));
+            }
+            Ok(CodexRun {
+                response: "codex response".to_string(),
+                session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct GatedWorktrees {
+        inner: FakeWorktrees,
+        blocked_url: String,
+        gate: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Worktrees for GatedWorktrees {
+        async fn prepare(&self, target: &WorkTarget, task: &CodexTask) -> Result<PreparedWorktree> {
+            if target.html_url() == self.blocked_url {
+                self.gate.notified().await;
+            }
+            self.inner.prepare(target, task).await
+        }
+
+        async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()> {
+            self.inner.cleanup(worktree).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct HoldCodex {
+        calls: Arc<StdMutex<Vec<String>>>,
+        entered: Arc<Notify>,
+        release: watch::Receiver<bool>,
+    }
+
+    impl HoldCodex {
+        fn new() -> (Self, watch::Sender<bool>) {
+            let (release, receiver) = watch::channel(false);
+            (
+                Self {
+                    calls: Arc::new(StdMutex::new(Vec::new())),
+                    entered: Arc::new(Notify::new()),
+                    release: receiver,
+                },
+                release,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl CodexRunner for HoldCodex {
+        fn review_facts(&self, _task: &CodexTask) -> Result<ReviewFacts> {
+            Ok(fake_review_facts())
+        }
+
+        async fn run(&self, _worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
+            self.calls.lock().unwrap().push(task.pr_url.clone());
+            self.entered.notify_one();
+            let mut release = self.release.clone();
+            while !*release.borrow() {
+                if release.changed().await.is_err() {
+                    break;
+                }
             }
             Ok(CodexRun {
                 response: "codex response".to_string(),
@@ -2649,7 +2702,6 @@ mod tests {
         assert_eq!(report.seen, 1);
         assert_eq!(report.started, 1);
         assert_eq!(report.responded, 0);
-        assert_eq!(report.in_flight, 1);
         assert!(github.posts.lock().unwrap().is_empty());
 
         entered.wait().await;
@@ -2713,11 +2765,16 @@ mod tests {
         let first_report = maid.run_once().await.unwrap();
 
         assert_eq!(first_report.seen, 2);
-        assert_eq!(first_report.started, 1);
-        assert_eq!(first_report.skipped, 1);
-        assert_eq!(first_report.in_flight, 1);
+        assert_eq!(first_report.started, 2);
+        assert_eq!(first_report.skipped, 0);
         assert!(github.pr_state_calls.lock().unwrap().is_empty());
         entered.wait().await;
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+
+        let during = maid.run_once().await.unwrap();
+        assert_eq!(during.started, 0);
+        assert_eq!(during.skipped, 2);
+        assert_eq!(during.in_flight, 1);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
 
         release.notify_waiters();
@@ -2725,11 +2782,12 @@ mod tests {
 
         let second_report = maid.run_once().await.unwrap();
 
-        assert_eq!(second_report.started, 1);
-        assert_eq!(second_report.skipped, 1);
+        assert_eq!(second_report.started, 2);
+        assert_eq!(second_report.skipped, 0);
         entered.wait().await;
         release.notify_waiters();
         wait_until(|| github.handled_prs.lock().unwrap().len() == 2).await;
+        assert_eq!(codex.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2957,6 +3015,116 @@ mod tests {
         wait_until(|| reviews.runs(&pr_url, &sha).unwrap().len() == 1).await;
         assert_eq!(github.posts.lock().unwrap().len(), 1);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_posted_review_to_reach_the_ledger() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("state");
+        std::fs::create_dir(&directory).unwrap();
+        let reviews = crate::pr_review::FileReviewLedger::new(directory.join("pr-reviews.json"));
+        let markers = crate::handled_marker::FilePendingHandledMarkerStore::new(
+            directory.join("pending-handled-markers.json"),
+        );
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_review_ledger(reviews.clone())
+            .with_pending_handled_marker_store(markers)
+            .into_concurrent(1);
+        let _restore = RestoreWriteAccess(&directory);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let poll = tokio::spawn({
+            let maid = maid.clone();
+            async move { maid.run_once().await }
+        });
+        wait_until(|| github.posts.lock().unwrap().len() == 1).await;
+        poll.abort();
+
+        let draining = tokio::spawn({
+            let maid = maid.clone();
+            async move { maid.drain().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !draining.is_finished(),
+            "shutdown returned before the ledger write could succeed"
+        );
+        let pr_url = PrUrl::parse(&pull_request.html_url).unwrap();
+        let sha = HeadSha::parse(FAKE_HEAD_SHA).unwrap();
+        assert!(reviews.runs(&pr_url, &sha).unwrap().is_empty());
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), draining)
+            .await
+            .expect("shutdown did not finish after the ledger became writable")
+            .unwrap();
+        let _ = poll.await;
+
+        let runs = reviews.runs(&pr_url, &sha).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(matches!(runs[0].outcome(), Outcome::Posted { .. }));
+
+        let second = maid.run_once().await.unwrap();
+        maid.drain().await;
+        assert_eq!(second.responded, 0);
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(reviews.runs(&pr_url, &sha).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_checkout_does_not_stop_another_pull_request() {
+        let github = FakeGithub::default();
+        let blocked = pr_with_number(1);
+        let other = pr_with_number(2);
+        *github.pull_requests.lock().unwrap() = vec![blocked.clone(), other.clone()];
+        let gate = Arc::new(Notify::new());
+        let worktrees = GatedWorktrees {
+            inner: idle_worktrees(),
+            blocked_url: blocked.html_url.clone(),
+            gate: gate.clone(),
+        };
+        let (codex, release) = HoldCodex::new();
+        let entered = codex.entered.clone();
+        let calls = codex.calls.clone();
+        let maid = Maid::new(
+            github,
+            worktrees,
+            codex,
+            "maid-bot",
+            ["dionysuzx"],
+            ["dionysuzx"],
+            [RepoSlug {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+            }],
+        )
+        .into_concurrent(2);
+
+        let poll = tokio::spawn({
+            let maid = maid.clone();
+            async move { maid.run_once().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), poll)
+            .await
+            .expect("poll waited on checkout")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("unrelated pull request did not start");
+        assert_eq!(*calls.lock().unwrap(), vec![other.html_url]);
+
+        gate.notify_one();
+        release.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), maid.drain())
+            .await
+            .expect("blocked checkout did not finish");
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     struct RestoreWriteAccess<'a>(&'a Path);
