@@ -3964,42 +3964,45 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_head_lookup_leaves_the_other_pull_request_reviewed() {
-        let github = FakeGithub::default();
-        let healthy = pr_with_number(1);
-        let missing = pr_with_author_and_number("public-author", 2);
-        list_head(&github, &healthy);
-        *github.pull_requests.lock().unwrap() = vec![healthy.clone()];
-        *github.public_pull_requests.lock().unwrap() = vec![missing.clone()];
-        github
-            .head_errors
-            .lock()
-            .unwrap()
-            .insert(missing.html_url.clone(), "404 not found".to_string());
-        let worktrees = idle_worktrees();
-        let codex = FakeCodex::default();
+        for continuous_review in [false, true] {
+            let github = FakeGithub::default();
+            let healthy = pr_with_number(1);
+            let missing = pr_with_author_and_number("public-author", 2);
+            list_head(&github, &healthy);
+            *github.pull_requests.lock().unwrap() = vec![healthy.clone()];
+            *github.public_pull_requests.lock().unwrap() = vec![missing.clone()];
+            github
+                .head_errors
+                .lock()
+                .unwrap()
+                .insert(missing.html_url.clone(), "404 not found".to_string());
+            let worktrees = idle_worktrees();
+            let codex = FakeCodex::default();
 
-        let report = Maid::new(
-            github.clone(),
-            worktrees.clone(),
-            codex.clone(),
-            "maid-bot",
-            ["dionysuzx", "public-author"],
-            ["dionysuzx"],
-            [RepoSlug {
-                owner: "o".to_string(),
-                repo: "r".to_string(),
-            }],
-        )
-        .with_public_auto_review_accounts(["public-author"])
-        .run_once()
-        .await
-        .unwrap();
+            let report = Maid::new(
+                github.clone(),
+                worktrees.clone(),
+                codex.clone(),
+                "maid-bot",
+                ["dionysuzx", "public-author"],
+                ["dionysuzx"],
+                [RepoSlug {
+                    owner: "o".to_string(),
+                    repo: "r".to_string(),
+                }],
+            )
+            .with_public_auto_review_accounts(["public-author"])
+            .with_continuous_review(continuous_review)
+            .run_once()
+            .await
+            .unwrap();
 
-        assert_eq!(report.responded, 1);
-        assert_eq!(report.failed, 0);
-        assert_eq!(*github.head_reads.lock().unwrap(), vec![missing.html_url]);
-        assert_eq!(codex.calls.lock().unwrap()[0].1.pr_url, healthy.html_url);
-        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r".to_string()]);
+            assert_eq!(report.responded, 1);
+            assert_eq!(report.failed, 0);
+            assert_eq!(*github.head_reads.lock().unwrap(), vec![missing.html_url]);
+            assert_eq!(codex.calls.lock().unwrap()[0].1.pr_url, healthy.html_url);
+            assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r".to_string()]);
+        }
     }
 
     #[tokio::test]
