@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -201,30 +201,10 @@ impl ReviewRun {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Observation {
-    Legacy {
-        marker: bool,
-        plus_one: bool,
-    },
-    Head {
-        pr: PrUrl,
-        sha: HeadSha,
-        marker: bool,
-        plus_one: bool,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     Idle,
-    ForgetMarker,
-    RetryPlusOne,
     Review,
-}
-
-pub fn weight(runs: &[ReviewRun]) -> u32 {
-    posted_identities(runs).len() as u32
 }
 
 pub fn covered_by(runs: &[ReviewRun], agent: ReviewAgent) -> bool {
@@ -232,50 +212,16 @@ pub fn covered_by(runs: &[ReviewRun], agent: ReviewAgent) -> bool {
         .any(|run| run.agent == agent && matches!(run.outcome, Outcome::Posted { .. }))
 }
 
-pub fn plan(runs_at_head: &[ReviewRun], agent: ReviewAgent, observation: &Observation) -> Action {
-    match observation {
-        Observation::Legacy {
-            plus_one: true,
-            marker: true,
-        } => Action::ForgetMarker,
-        Observation::Legacy { plus_one: true, .. } => Action::Idle,
-        Observation::Legacy { marker: true, .. } => Action::RetryPlusOne,
-        Observation::Legacy { .. } => Action::Review,
-        Observation::Head {
-            plus_one, marker, ..
-        } => {
-            if covered_by(runs_at_head, agent) {
-                match (*plus_one, *marker) {
-                    (true, true) => Action::ForgetMarker,
-                    (true, false) => Action::Idle,
-                    (false, _) => Action::RetryPlusOne,
-                }
-            } else {
-                Action::Review
-            }
-        }
+pub fn plan(runs_at_head: &[ReviewRun], agent: ReviewAgent) -> Action {
+    if covered_by(runs_at_head, agent) {
+        Action::Idle
+    } else {
+        Action::Review
     }
-}
-
-fn posted_identities(
-    runs: &[ReviewRun],
-) -> BTreeSet<(ReviewAgent, ModelName, PromptHash, EffortName)> {
-    runs.iter()
-        .filter(|run| matches!(run.outcome, Outcome::Posted { .. }))
-        .map(|run| {
-            (
-                run.agent,
-                run.model.clone(),
-                run.prompt_hash.clone(),
-                run.effort.clone(),
-            )
-        })
-        .collect()
 }
 
 pub trait ReviewLedger: Send + Sync {
     fn ensure_readable(&self) -> Result<()>;
-    fn plan(&self, agent: ReviewAgent, observation: &Observation) -> Result<Action>;
     fn record(&self, pr: &PrUrl, sha: &HeadSha, run: ReviewRun) -> Result<()>;
     fn runs(&self, pr: &PrUrl, sha: &HeadSha) -> Result<Vec<ReviewRun>>;
     fn is_empty(&self) -> Result<bool>;
@@ -289,11 +235,6 @@ pub struct MemoryReviewLedger {
 impl ReviewLedger for MemoryReviewLedger {
     fn ensure_readable(&self) -> Result<()> {
         Ok(())
-    }
-
-    fn plan(&self, agent: ReviewAgent, observation: &Observation) -> Result<Action> {
-        let state = self.lock()?;
-        Ok(plan_state(&state, agent, observation))
     }
 
     fn record(&self, pr: &PrUrl, sha: &HeadSha, run: ReviewRun) -> Result<()> {
@@ -339,12 +280,6 @@ impl ReviewLedger for FileReviewLedger {
         ReviewFile::read(&self.path).map(|_| ())
     }
 
-    fn plan(&self, agent: ReviewAgent, observation: &Observation) -> Result<Action> {
-        let _guard = self.file_lock()?;
-        let state = ReviewFile::read(&self.path)?.into_state()?;
-        Ok(plan_state(&state, agent, observation))
-    }
-
     fn record(&self, pr: &PrUrl, sha: &HeadSha, run: ReviewRun) -> Result<()> {
         let _guard = self.file_lock()?;
         let mut file = ReviewFile::read(&self.path)?;
@@ -371,14 +306,6 @@ impl FileReviewLedger {
             .lock()
             .map_err(|_| anyhow!("review ledger lock is poisoned"))
     }
-}
-
-fn plan_state(state: &ReviewState, agent: ReviewAgent, observation: &Observation) -> Action {
-    let runs = match observation {
-        Observation::Legacy { .. } => Vec::new(),
-        Observation::Head { pr, sha, .. } => state.runs(pr, sha),
-    };
-    plan(&runs, agent, observation)
 }
 
 #[derive(Debug, Default)]
@@ -569,95 +496,30 @@ mod tests {
     const SHA_B: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
 
     #[test]
-    fn weight_counts_distinct_posted_identities() {
+    fn a_posted_run_covers_only_that_head() {
         let posted = posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt");
-        let duplicate = posted.clone();
-        let other_effort = posted_run(ReviewAgent::Codex, "gpt-5.5", "low", "prompt");
-        let failed = failed_run();
-
-        assert_eq!(weight(&[]), 0);
-        assert_eq!(weight(&[failed]), 0);
-        assert_eq!(weight(std::slice::from_ref(&posted)), 1);
-        assert_eq!(weight(&[posted, duplicate]), 1);
-        assert_eq!(weight(std::slice::from_ref(&other_effort)), 1);
+        assert_eq!(plan(&[], ReviewAgent::Codex), Action::Review);
+        assert_eq!(plan(&[failed_run()], ReviewAgent::Codex), Action::Review);
         assert_eq!(
-            weight(&[
-                posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt"),
-                other_effort
-            ]),
-            2
-        );
-    }
-
-    #[test]
-    fn legacy_plan_matches_today() {
-        assert_eq!(
-            plan(&[], ReviewAgent::Codex, &legacy(true, true)),
-            Action::ForgetMarker
-        );
-        assert_eq!(
-            plan(&[], ReviewAgent::Codex, &legacy(false, true)),
+            plan(std::slice::from_ref(&posted), ReviewAgent::Codex),
             Action::Idle
         );
-        assert_eq!(
-            plan(&[], ReviewAgent::Codex, &legacy(true, false)),
-            Action::RetryPlusOne
-        );
-        assert_eq!(
-            plan(&[], ReviewAgent::Codex, &legacy(false, false)),
-            Action::Review
-        );
-    }
 
-    #[test]
-    fn head_plan_reviews_an_uncovered_sha() {
-        let covered = posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt");
-        let head = head_obs(SHA_A, true, true);
-
-        assert_eq!(
-            plan(&[covered], ReviewAgent::Codex, &head),
-            Action::ForgetMarker
-        );
-        assert_eq!(
-            plan(&[], ReviewAgent::Codex, &head_obs(SHA_A, true, true)),
-            Action::Review
-        );
         let ledger = MemoryReviewLedger::default();
         let pr = PrUrl::parse("https://github.com/o/r/pull/1").unwrap();
-        ledger
-            .record(
-                &pr,
-                &HeadSha::parse(SHA_A).unwrap(),
-                posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt"),
-            )
-            .unwrap();
+        let sha_a = HeadSha::parse(SHA_A).unwrap();
+        ledger.record(&pr, &sha_a, posted).unwrap();
         assert_eq!(
-            ledger
-                .plan(ReviewAgent::Codex, &head_obs(SHA_B, false, false))
-                .unwrap(),
-            Action::Review
-        );
-        assert_eq!(
-            plan(
-                &[posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")],
-                ReviewAgent::Codex,
-                &head_obs(SHA_A, true, false)
-            ),
-            Action::RetryPlusOne
-        );
-        assert_eq!(
-            plan(
-                &[posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")],
-                ReviewAgent::Codex,
-                &head_obs(SHA_A, false, true)
-            ),
+            plan(&ledger.runs(&pr, &sha_a).unwrap(), ReviewAgent::Codex),
             Action::Idle
         );
-        assert!(!covered_by(&[failed_run()], ReviewAgent::Codex));
-        assert!(covered_by(
-            &[posted_run(ReviewAgent::Codex, "gpt-5.5", "high", "prompt")],
-            ReviewAgent::Codex
-        ));
+        assert_eq!(
+            plan(
+                &ledger.runs(&pr, &HeadSha::parse(SHA_B).unwrap()).unwrap(),
+                ReviewAgent::Codex
+            ),
+            Action::Review
+        );
     }
 
     #[test]
@@ -697,10 +559,8 @@ mod tests {
         let runs = reloaded.runs(&pr, &sha).unwrap();
         assert_eq!(runs, vec![run]);
         assert_eq!(
-            reloaded
-                .plan(ReviewAgent::Codex, &legacy(false, false))
-                .unwrap(),
-            Action::Review
+            plan(&reloaded.runs(&pr, &sha).unwrap(), ReviewAgent::Codex),
+            Action::Idle
         );
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"version\": 1"));
@@ -726,19 +586,6 @@ mod tests {
         fs::write(&path, "{\"version\": 2, \"pulls\": {}}").unwrap();
         assert!(FileReviewLedger::new(&path).ensure_readable().is_err());
         assert!(path.exists());
-    }
-
-    fn legacy(marker: bool, plus_one: bool) -> Observation {
-        Observation::Legacy { marker, plus_one }
-    }
-
-    fn head_obs(sha: &str, marker: bool, plus_one: bool) -> Observation {
-        Observation::Head {
-            pr: PrUrl::parse("https://github.com/o/r/pull/1").unwrap(),
-            sha: HeadSha::parse(sha).unwrap(),
-            marker,
-            plus_one,
-        }
     }
 
     fn posted_run(agent: ReviewAgent, model: &str, effort: &str, prompt: &str) -> ReviewRun {

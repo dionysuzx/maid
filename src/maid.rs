@@ -12,8 +12,8 @@ use crate::mention_thread::{
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::pr_review::{
-    Action, CommentUrl, EffortName, HeadSha, MemoryReviewLedger, ModelName, Observation, Outcome,
-    PrUrl, PromptHash, ReviewAgent, ReviewLedger, ReviewRun,
+    Action, CommentUrl, EffortName, HeadSha, MemoryReviewLedger, ModelName, Outcome, PrUrl,
+    PromptHash, ReviewAgent, ReviewLedger, ReviewRun, plan,
 };
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::{Context, Result};
@@ -385,7 +385,8 @@ where
             {
                 Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
                     Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
-                        Ok(()) => report.responded += 1,
+                        Ok(TaskFinish::Completed) => report.responded += 1,
+                        Ok(TaskFinish::Skipped) => report.skipped += 1,
                         Err(err) => {
                             report.failed += 1;
                             error!(
@@ -497,7 +498,8 @@ where
             match assessment {
                 TaskAssessment::Ready(intent) => match self.start_task(intent).await {
                     Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
-                        Ok(()) => report.responded += 1,
+                        Ok(TaskFinish::Completed) => report.responded += 1,
+                        Ok(TaskFinish::Skipped) => report.skipped += 1,
                         Err(err) => {
                             report.failed += 1;
                             error!(
@@ -725,7 +727,7 @@ where
     async fn task_for_auto_review_candidate(
         &self,
         candidate: &AutoReviewCandidate,
-        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
+        _observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<TaskAssessment> {
         let pr = &candidate.pr;
         let author_allowed = candidate.has_allowed_author(
@@ -754,18 +756,17 @@ where
             return Ok(TaskAssessment::Skipped);
         }
 
-        let state = self.github.pr_state(pr, &self.bot_login).await?;
-        let marker = PendingHandledMarker::for_pull_request(pr);
-        let has_pending_marker = self.pending_handled_markers.contains(&marker)?;
-        let action = self.reviews.plan(
-            ReviewAgent::Codex,
-            &Observation::Legacy {
-                marker: has_pending_marker,
-                plus_one: state == ReviewState::Handled,
+        Ok(TaskAssessment::Ready(Box::new(
+            TaskIntent::AutoReviewPullRequest {
+                pr: pr.clone(),
+                task: CodexTask {
+                    pr_url: pr.html_url.clone(),
+                    origin: CodexTaskOrigin::PullRequestOpened {
+                        author: pr.author.clone(),
+                    },
+                },
             },
-        )?;
-        self.apply_review_action(pr, action, observed_pending_markers)
-            .await
+        )))
     }
 
     async fn auto_review_candidates(&self) -> Result<Vec<AutoReviewCandidate>> {
@@ -809,54 +810,8 @@ where
         ))
     }
 
-    async fn apply_review_action(
-        &self,
-        pr: &PullRequest,
-        action: Action,
-        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
-    ) -> Result<TaskAssessment> {
-        let marker = PendingHandledMarker::for_pull_request(pr);
-        match action {
-            Action::Review => Ok(TaskAssessment::Ready(Box::new(
-                TaskIntent::AutoReviewPullRequest {
-                    pr: pr.clone(),
-                    task: CodexTask {
-                        pr_url: pr.html_url.clone(),
-                        origin: CodexTaskOrigin::PullRequestOpened {
-                            author: pr.author.clone(),
-                        },
-                    },
-                },
-            ))),
-            Action::RetryPlusOne => {
-                observed_pending_markers.insert(marker);
-                self.github.mark_pr_handled(pr).await?;
-                info!(
-                    pr = %pr.html_url,
-                    "refreshed pending completed auto-review pull request handled marker"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-            Action::ForgetMarker => {
-                self.pending_handled_markers.remove(&marker)?;
-                info!(
-                    pr = %pr.html_url,
-                    "skipping already handled auto-review pull request"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-            Action::Idle => {
-                info!(
-                    pr = %pr.html_url,
-                    "skipping already handled auto-review pull request"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-        }
-    }
-
     async fn start_task(&self, intent: Box<TaskIntent>) -> Result<TaskStartOutcome> {
-        if !self.can_start_task()? {
+        if matches!(intent.as_ref(), TaskIntent::Mention { .. }) && !self.can_start_task()? {
             intent.log_task_limit_reached();
             return Ok(TaskStartOutcome::Skipped);
         }
@@ -867,9 +822,9 @@ where
                 mention,
                 task,
             } => self.start_mention_task(notification, mention, task).await,
-            TaskIntent::AutoReviewPullRequest { pr, task } => {
-                self.start_auto_review_task(pr, task).await
-            }
+            TaskIntent::AutoReviewPullRequest { pr, task } => Ok(TaskStartOutcome::Started(
+                Box::new(StartedTask::AutoReviewPullRequest { pr, task }),
+            )),
         }
     }
 
@@ -894,14 +849,29 @@ where
             task,
         })))
     }
+}
 
-    async fn finish_task(&self, task: Box<StartedTask>) -> Result<()> {
+enum TaskFinish {
+    Completed,
+    Skipped,
+}
+
+impl<G, R, C> Maid<G, R, C>
+where
+    G: GithubClient,
+    R: Worktrees,
+    C: CodexRunner,
+{
+    async fn finish_task(&self, task: Box<StartedTask>) -> Result<TaskFinish> {
         match *task {
             StartedTask::Mention {
                 notification,
                 mention,
                 task,
-            } => self.finish_mention_task(notification, mention, task).await,
+            } => self
+                .finish_mention_task(notification, mention, task)
+                .await
+                .map(|()| TaskFinish::Completed),
             StartedTask::AutoReviewPullRequest { pr, task } => {
                 self.finish_auto_review_task(pr, task).await
             }
@@ -956,42 +926,104 @@ where
         self.cleanup_worktree(worktree, result).await
     }
 
-    async fn start_auto_review_task(
+    async fn finish_auto_review_task(
         &self,
         pr: PullRequest,
         task: CodexTask,
-    ) -> Result<TaskStartOutcome> {
-        self.github.mark_pr_started(&pr).await?;
-        info!(
-            pr = %pr.html_url,
-            author = %pr.author,
-            task_kind = task.task_kind(),
-            "started handling auto-review pull request"
-        );
-
-        Ok(TaskStartOutcome::Started(Box::new(
-            StartedTask::AutoReviewPullRequest { pr, task },
-        )))
+    ) -> Result<TaskFinish> {
+        let Some(session) = self.open_auto_review(pr, task).await? else {
+            return Ok(TaskFinish::Skipped);
+        };
+        match self.can_start_task() {
+            Ok(true) => self.run_auto_review(session).await,
+            Ok(false) => {
+                self.discard_auto_review(session).await?;
+                Ok(TaskFinish::Skipped)
+            }
+            Err(err) => {
+                let _ = self.discard_auto_review(session).await;
+                Err(err)
+            }
+        }
     }
 
-    async fn finish_auto_review_task(&self, pr: PullRequest, task: CodexTask) -> Result<()> {
+    async fn open_auto_review(
+        &self,
+        pr: PullRequest,
+        task: CodexTask,
+    ) -> Result<Option<AutoReviewSession>> {
+        if !self.task_starts.can_start()? {
+            info!(
+                pr = %pr.html_url,
+                author = %pr.author,
+                "skipping auto-review pull request because the 24-hour task limit is reached"
+            );
+            return Ok(None);
+        }
+
         let started_unix = unix_seconds(SystemTime::now())?;
         let target = WorkTarget::PullRequest(pr.clone());
         let worktree = self.worktrees.prepare(&target, &task).await?;
-        let result = async {
+        let decision = async {
             let head = HeadSha::parse(
                 worktree
                     .head()
                     .context("checked out pull request has no head")?,
             )?;
             let pr_url = PrUrl::parse(&pr.html_url)?;
+            let runs = self.reviews.runs(&pr_url, &head)?;
+            if plan(&runs, ReviewAgent::Codex) == Action::Idle {
+                info!(
+                    pr = %pr.html_url,
+                    head = head.as_str(),
+                    "skipping covered pull request head"
+                );
+                return Ok(None);
+            }
+            Ok(Some((pr_url, head)))
+        }
+        .await;
+
+        match decision {
+            Ok(Some((pr_url, head))) => Ok(Some(AutoReviewSession {
+                pr,
+                task,
+                worktree,
+                pr_url,
+                head,
+                started_unix,
+            })),
+            Ok(None) => self.cleanup_worktree(worktree, Ok(())).await.map(|()| None),
+            Err(err) => {
+                let result: Result<Option<AutoReviewSession>> = Err(err);
+                self.cleanup_worktree(worktree, result).await
+            }
+        }
+    }
+
+    async fn run_auto_review(&self, session: AutoReviewSession) -> Result<TaskFinish> {
+        let AutoReviewSession {
+            pr,
+            task,
+            worktree,
+            pr_url,
+            head,
+            started_unix,
+        } = session;
+        let result = async {
+            self.github.mark_pr_started(&pr).await?;
+            info!(
+                pr = %pr.html_url,
+                author = %pr.author,
+                task_kind = task.task_kind(),
+                "started handling auto-review pull request"
+            );
             let facts = self.codex.review_facts(&task)?;
             let model = ModelName::parse(&facts.model)?;
             let effort = EffortName::parse(&facts.effort)?;
             let prompt_hash = PromptHash::of(&facts.prompt);
             let codex_result = self.codex.run(worktree.path(), &task).await;
             let finished_unix = unix_seconds(SystemTime::now())?.max(started_unix);
-
             let identity = RunIdentity {
                 model,
                 prompt_hash,
@@ -1006,7 +1038,6 @@ where
                     return Err(err);
                 }
             };
-
             let comment_url = match self.github.post_pr_comment(&pr, &codex_run.response).await {
                 Ok(comment_url) => comment_url,
                 Err(err) => {
@@ -1014,17 +1045,16 @@ where
                     return Err(err);
                 }
             };
-            let outcome = match CommentUrl::parse(&comment_url) {
-                Ok(comment_url) => Outcome::Posted { comment_url },
-                Err(err) => {
-                    self.complete_posted_review(&pr, &pr_url, &head, &identity, Outcome::Failed)
-                        .await?;
-                    return Err(err);
-                }
-            };
-            let recorded = self
-                .complete_posted_review(&pr, &pr_url, &head, &identity, outcome)
-                .await;
+            self.record_posted_review(
+                &pr,
+                &pr_url,
+                &head,
+                &identity,
+                Outcome::Posted {
+                    comment_url: CommentUrl::parse(&comment_url)?,
+                },
+            )
+            .await;
 
             if let Some((session_id, resume_command)) = codex_run.resume_command() {
                 info!(
@@ -1041,25 +1071,39 @@ where
                     "responded to auto-review pull request"
                 );
             }
-            recorded?;
-            Ok(())
+            Ok(TaskFinish::Completed)
         }
         .await;
 
         self.cleanup_worktree(worktree, result).await
     }
 
-    async fn complete_posted_review(
+    async fn discard_auto_review(&self, session: AutoReviewSession) -> Result<()> {
+        self.cleanup_worktree(session.worktree, Ok(())).await
+    }
+
+    async fn record_posted_review(
         &self,
         pr: &PullRequest,
         pr_url: &PrUrl,
         head: &HeadSha,
         identity: &RunIdentity,
         outcome: Outcome,
-    ) -> Result<()> {
-        let recorded = self.record_finished_review(pr_url, head, identity, outcome);
-        let marker = PendingHandledMarker::for_pull_request(pr);
-        self.pending_handled_markers.record(&marker)?;
+    ) {
+        loop {
+            match self.record_finished_review(pr_url, head, identity, outcome.clone()) {
+                Ok(()) => break,
+                Err(err) => {
+                    error!(
+                        pr = %pr.html_url,
+                        head = head.as_str(),
+                        error = ?err,
+                        "retrying review ledger write after posting"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
         if let Err(err) = self.github.mark_pr_handled(pr).await {
             error!(
                 pr = %pr.html_url,
@@ -1067,7 +1111,6 @@ where
                 "failed to mark auto-review pull request handled after posting response"
             );
         }
-        recorded
     }
 
     fn record_finished_review(
@@ -1092,15 +1135,15 @@ where
         )
     }
 
-    async fn cleanup_worktree(
+    async fn cleanup_worktree<T>(
         &self,
         worktree: PreparedWorktree,
-        task_result: Result<()>,
-    ) -> Result<()> {
+        task_result: Result<T>,
+    ) -> Result<T> {
         let cleanup_result = self.worktrees.cleanup(worktree).await;
         match (task_result, cleanup_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(err)) => Err(err),
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(err)) => Err(err),
             (Err(err), Ok(())) => Err(err),
             (Err(err), Err(cleanup_err)) => {
                 error!(
@@ -1202,32 +1245,9 @@ where
             );
         } else {
             for candidate in self.maid.auto_review_candidates().await? {
-                let pr = &candidate.pr;
                 report.seen += 1;
-                let Some(reservation) = self.work.try_reserve(task_key_for_trigger(&pr.html_url))
-                else {
-                    report.skipped += 1;
-                    continue;
-                };
-
-                match self
-                    .maid
-                    .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
-                    .await
-                {
-                    Ok(TaskAssessment::Ready(intent)) => {
-                        self.start_reserved(intent, reservation, &mut report).await;
-                    }
-                    Ok(TaskAssessment::Skipped) => report.skipped += 1,
-                    Err(err) => {
-                        report.failed += 1;
-                        error!(
-                            pr = %pr.html_url,
-                            error = ?err,
-                            "failed to handle auto-review pull request"
-                        );
-                    }
-                }
+                self.start_auto_review(&candidate, &mut observed_pending_markers, &mut report)
+                    .await;
             }
         }
 
@@ -1237,6 +1257,124 @@ where
             .await?;
         report.in_flight = self.work.in_flight();
         Ok(report)
+    }
+
+    async fn start_auto_review(
+        &self,
+        candidate: &AutoReviewCandidate,
+        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
+        report: &mut PollReport,
+    ) {
+        if !self.work.has_capacity() {
+            report.skipped += 1;
+            return;
+        }
+        let Some(mut reservation) = self
+            .work
+            .try_reserve_key(task_key_for_trigger(&candidate.pr.html_url))
+        else {
+            report.skipped += 1;
+            return;
+        };
+
+        let (pr, task) = match self
+            .maid
+            .task_for_auto_review_candidate(candidate, observed_pending_markers)
+            .await
+        {
+            Ok(TaskAssessment::Ready(intent)) => match *intent {
+                TaskIntent::AutoReviewPullRequest { pr, task } => (pr, task),
+                TaskIntent::Mention { .. } => {
+                    report.failed += 1;
+                    error!(
+                        pr = %candidate.pr.html_url,
+                        "auto-review candidate produced a mention task"
+                    );
+                    return;
+                }
+            },
+            Ok(TaskAssessment::Skipped) => {
+                report.skipped += 1;
+                return;
+            }
+            Err(err) => {
+                report.failed += 1;
+                error!(
+                    pr = %candidate.pr.html_url,
+                    error = ?err,
+                    "failed to handle auto-review pull request"
+                );
+                return;
+            }
+        };
+
+        let session = match self.maid.open_auto_review(pr, task).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                report.skipped += 1;
+                return;
+            }
+            Err(err) => {
+                report.failed += 1;
+                error!(
+                    pr = %candidate.pr.html_url,
+                    error = ?err,
+                    "failed to handle auto-review pull request"
+                );
+                return;
+            }
+        };
+
+        let Some(permit) = self.work.try_acquire_permit() else {
+            self.skip_or_fail_discard(session, report).await;
+            return;
+        };
+        match self.maid.can_start_task() {
+            Ok(true) => {}
+            Ok(false) => {
+                self.skip_or_fail_discard(session, report).await;
+                return;
+            }
+            Err(err) => {
+                report.failed += 1;
+                error!(
+                    pr = %session.pr.html_url,
+                    error = ?err,
+                    "failed to record auto-review task start"
+                );
+                let _ = self.maid.discard_auto_review(session).await;
+                return;
+            }
+        }
+
+        reservation.permit = Some(permit);
+        report.started += 1;
+        let maid = self.maid.clone();
+        let pr_url = session.pr.html_url.clone();
+        tokio::spawn(async move {
+            let _reservation = reservation;
+            if let Err(err) = maid.run_auto_review(session).await {
+                error!(
+                    pr = %pr_url,
+                    error = ?err,
+                    "failed to handle auto-review pull request task"
+                );
+            }
+        });
+    }
+
+    async fn skip_or_fail_discard(&self, session: AutoReviewSession, report: &mut PollReport) {
+        let pr_url = session.pr.html_url.clone();
+        if let Err(err) = self.maid.discard_auto_review(session).await {
+            report.failed += 1;
+            error!(
+                pr = %pr_url,
+                error = ?err,
+                "failed to clean up auto-review worktree"
+            );
+        } else {
+            report.skipped += 1;
+        }
     }
 
     async fn handle_assessments(
@@ -1317,22 +1455,30 @@ impl WorkQueue {
         }
     }
 
-    fn try_reserve(&self, key: String) -> Option<WorkReservation> {
-        let mut running = self.running.lock().expect("work queue lock is poisoned");
-        if running.contains(&key) {
-            return None;
-        }
+    fn has_capacity(&self) -> bool {
+        self.slots.available_permits() > 0
+    }
 
-        let permit = self.slots.clone().try_acquire_owned().ok()?;
+    fn try_reserve_key(&self, key: String) -> Option<WorkReservation> {
+        let mut running = self.running.lock().expect("work queue lock is poisoned");
         if !running.insert(key.clone()) {
             return None;
         }
-
         Some(WorkReservation {
             keys: vec![key],
             running: self.running.clone(),
-            _permit: permit,
+            permit: None,
         })
+    }
+
+    fn try_acquire_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.slots.clone().try_acquire_owned().ok()
+    }
+
+    fn try_reserve(&self, key: String) -> Option<WorkReservation> {
+        let mut reservation = self.try_reserve_key(key)?;
+        reservation.permit = Some(self.try_acquire_permit()?);
+        Some(reservation)
     }
 
     fn in_flight(&self) -> usize {
@@ -1343,7 +1489,7 @@ impl WorkQueue {
 struct WorkReservation {
     keys: Vec<String>,
     running: Arc<std::sync::Mutex<HashSet<String>>>,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl WorkReservation {
@@ -1488,6 +1634,15 @@ fn is_permanent_pending_marker_error(err: &anyhow::Error) -> bool {
         let message = cause.to_string().to_ascii_lowercase();
         message.contains(" 404") || message.contains("404:") || message.contains("not found")
     })
+}
+
+struct AutoReviewSession {
+    pr: PullRequest,
+    task: CodexTask,
+    worktree: PreparedWorktree,
+    pr_url: PrUrl,
+    head: HeadSha,
+    started_unix: u64,
 }
 
 struct RunIdentity {
@@ -1884,6 +2039,14 @@ mod tests {
     }
 
     impl TaskStartRecorder for FixedTaskStartRecorder {
+        fn can_start(&self) -> Result<bool> {
+            let at_limit = matches!(self.decision, TaskStartDecision::AtLimit { .. });
+            if at_limit {
+                *self.calls.lock().unwrap() += 1;
+            }
+            Ok(!at_limit)
+        }
+
         fn try_record_started(&self) -> Result<TaskStartDecision> {
             *self.calls.lock().unwrap() += 1;
             Ok(self.decision)
@@ -2553,10 +2716,7 @@ mod tests {
         assert_eq!(first_report.started, 1);
         assert_eq!(first_report.skipped, 1);
         assert_eq!(first_report.in_flight, 1);
-        assert_eq!(
-            *github.pr_state_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/1"]
-        );
+        assert!(github.pr_state_calls.lock().unwrap().is_empty());
         entered.wait().await;
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
 
@@ -2661,7 +2821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_a_posted_auto_review_and_leaves_the_marker() {
+    async fn records_a_posted_auto_review_and_does_not_review_that_head_again() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
         let reviews = MemoryReviewLedger::default();
@@ -2694,7 +2854,7 @@ mod tests {
             }
         );
         assert!(
-            markers
+            !markers
                 .contains(&PendingHandledMarker::for_pull_request(&pr()))
                 .unwrap()
         );
@@ -2706,29 +2866,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unwritable_ledger_still_posts_one_comment_and_does_not_review_again() {
+    async fn unwritable_ledger_and_marker_files_post_one_comment() {
         let github = FakeGithub::default();
         let pull_request = pr();
         *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("reviews");
+        let directory = temp.path().join("state");
         std::fs::create_dir(&directory).unwrap();
-        let ledger_path = directory.join("pr-reviews.json");
-        let reviews = crate::pr_review::FileReviewLedger::new(&ledger_path);
-        let markers = MemoryPendingHandledMarkerStore::default();
+        let reviews = crate::pr_review::FileReviewLedger::new(directory.join("pr-reviews.json"));
+        let markers = crate::handled_marker::FilePendingHandledMarkerStore::new(
+            directory.join("pending-handled-markers.json"),
+        );
         let codex = FakeCodex::default();
         let maid = maid(github.clone(), idle_worktrees(), codex.clone())
             .with_review_ledger(reviews.clone())
-            .with_pending_handled_marker_store(markers.clone());
+            .with_pending_handled_marker_store(markers);
         let _restore = RestoreWriteAccess(&directory);
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let report = maid.run_once().await.unwrap();
-
-        assert_eq!(report.responded, 0);
-        assert_eq!(report.failed, 1);
+        let running = tokio::spawn({
+            let maid = maid.clone();
+            async move { maid.run_once().await }
+        });
+        wait_until(|| github.posts.lock().unwrap().len() == 1).await;
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let report = running.await.unwrap().unwrap();
+        assert_eq!(report.responded, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
         assert!(
             github
                 .handled_prs
@@ -2736,21 +2903,60 @@ mod tests {
                 .unwrap()
                 .contains(&pull_request.html_url)
         );
-        assert!(
-            markers
-                .contains(&PendingHandledMarker::for_pull_request(&pull_request))
-                .unwrap()
-        );
-        assert!(reviews.is_empty().unwrap());
 
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
         let second = maid.run_once().await.unwrap();
-
         assert_eq!(second.responded, 0);
-        assert_eq!(second.failed, 0);
+        assert_eq!(second.skipped, 1);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
         assert_eq!(github.posts.lock().unwrap().len(), 1);
-        assert!(reviews.is_empty().unwrap());
+        let runs = reviews
+            .runs(
+                &PrUrl::parse(&pull_request.html_url).unwrap(),
+                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(matches!(runs[0].outcome(), Outcome::Posted { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_overlapping_poll_does_not_review_a_posted_head_twice() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("state");
+        std::fs::create_dir(&directory).unwrap();
+        let reviews = crate::pr_review::FileReviewLedger::new(directory.join("pr-reviews.json"));
+        let markers = crate::handled_marker::FilePendingHandledMarkerStore::new(
+            directory.join("pending-handled-markers.json"),
+        );
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_review_ledger(reviews.clone())
+            .with_pending_handled_marker_store(markers)
+            .into_concurrent(2);
+        let _restore = RestoreWriteAccess(&directory);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let running = tokio::spawn({
+            let maid = maid.clone();
+            async move { maid.run_once().await }
+        });
+        wait_until(|| github.posts.lock().unwrap().len() == 1).await;
+
+        let overlapping = maid.run_once().await.unwrap();
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(overlapping.responded, 0);
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        running.await.unwrap().unwrap();
+        let pr_url = PrUrl::parse(&pull_request.html_url).unwrap();
+        let sha = HeadSha::parse(FAKE_HEAD_SHA).unwrap();
+        wait_until(|| reviews.runs(&pr_url, &sha).unwrap().len() == 1).await;
+        assert_eq!(github.posts.lock().unwrap().len(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
     }
 
     struct RestoreWriteAccess<'a>(&'a Path);
@@ -3011,10 +3217,7 @@ mod tests {
             .map(|(_, task)| task.pr_url.clone())
             .collect::<Vec<_>>();
         assert_eq!(urls, vec!["https://github.com/o/r/pull/3".to_string()]);
-        assert_eq!(
-            *github.pr_state_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/3".to_string()]
-        );
+        assert!(github.pr_state_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3157,22 +3360,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_opened_pr_with_durable_handled_marker_after_restart() {
+    async fn a_posted_head_is_not_reviewed_again() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
-        github
-            .handled_prs
-            .lock()
-            .unwrap()
-            .insert("https://github.com/o/r/pull/1".to_string());
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/unused"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
+        let reviews = MemoryReviewLedger::default();
+        reviews
+            .record(
+                &PrUrl::parse(&pr().html_url).unwrap(),
+                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+                ReviewRun::new(
+                    ReviewAgent::Codex,
+                    ModelName::parse("gpt-5.5").unwrap(),
+                    PromptHash::of("please review"),
+                    EffortName::parse("high").unwrap(),
+                    1,
+                    2,
+                    Outcome::Posted {
+                        comment_url: CommentUrl::parse(
+                            "https://github.com/o/r/pull/1#issuecomment-1",
+                        )
+                        .unwrap(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let codex = FakeCodex::default();
 
-        let report = maid(github.clone(), worktrees.clone(), codex.clone())
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_review_ledger(reviews)
             .run_once()
             .await
             .unwrap();
@@ -3180,9 +3396,7 @@ mod tests {
         assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.marks.lock().unwrap().is_empty());
         assert!(github.events.lock().unwrap().is_empty());
-        assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
     }
 
@@ -4203,7 +4417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_pending_auto_review_marker_without_rerunning_codex() {
+    async fn a_failed_plus_one_is_not_retried_and_the_head_stays_covered() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("pending-handled-markers.json");
         let github = FakeGithub::default();
@@ -4227,13 +4441,7 @@ mod tests {
         assert_eq!(second_report.skipped, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert!(
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .contains("https://github.com/o/r/pull/1")
-        );
+        assert!(github.handled_prs.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

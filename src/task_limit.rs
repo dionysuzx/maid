@@ -10,6 +10,10 @@ use std::{
 const TASK_LIMIT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub trait TaskStartRecorder: Send + Sync {
+    fn can_start(&self) -> Result<bool> {
+        Ok(true)
+    }
+
     fn try_record_started(&self) -> Result<TaskStartDecision>;
 }
 
@@ -61,7 +65,20 @@ impl FileTaskStartRecorder {
 }
 
 impl TaskStartRecorder for FileTaskStartRecorder {
+    fn can_start(&self) -> Result<bool> {
+        Ok(!matches!(
+            self.decide(false)?,
+            TaskStartDecision::AtLimit { .. }
+        ))
+    }
+
     fn try_record_started(&self) -> Result<TaskStartDecision> {
+        self.decide(true)
+    }
+}
+
+impl FileTaskStartRecorder {
+    fn decide(&self, record: bool) -> Result<TaskStartDecision> {
         let Some(limit) = self.limit else {
             return Ok(TaskStartDecision::Recorded);
         };
@@ -82,8 +99,10 @@ impl TaskStartRecorder for FileTaskStartRecorder {
             });
         }
 
-        ledger.started_at_unix_seconds.push(now);
-        ledger.write(&self.path)?;
+        if record {
+            ledger.started_at_unix_seconds.push(now);
+            ledger.write(&self.path)?;
+        }
         Ok(TaskStartDecision::Recorded)
     }
 }
