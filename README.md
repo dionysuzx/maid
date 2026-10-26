@@ -61,7 +61,10 @@ posted Codex run is not reviewed again, and a pull request outside the tracked
 scopes is still ignored. Omit the flag to keep the current behavior: a pull
 request with the bot's +1 stays handled, including after new commits. Turning
 the flag on reviews tracked open pull requests that lack a Codex run at the
-tip, and `task_limit_per_24h` spreads that catch-up.
+tip, and `task_limit_per_24h` spreads that catch-up. Set
+`continuous_review_max_failures_per_head` to stop retrying one head after that
+many failed runs. Omit it for no cap. A new head has its own count, and a
+posted Codex run still covers that head.
 
 ## Metrics
 

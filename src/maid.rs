@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -151,6 +152,7 @@ pub struct Maid<G, R, C> {
     observed_notifications: Arc<dyn ObservedNotificationStore>,
     reviews: Arc<dyn ReviewLedger>,
     continuous_review: bool,
+    continuous_review_max_failures_per_head: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,6 +262,7 @@ where
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
             reviews: Arc::new(MemoryReviewLedger::default()),
             continuous_review: false,
+            continuous_review_max_failures_per_head: None,
         }
     }
 
@@ -312,6 +315,14 @@ where
 
     pub fn with_continuous_review(mut self, continuous_review: bool) -> Self {
         self.continuous_review = continuous_review;
+        self
+    }
+
+    pub fn with_continuous_review_max_failures_per_head(
+        mut self,
+        max_failures: Option<NonZeroUsize>,
+    ) -> Self {
+        self.continuous_review_max_failures_per_head = max_failures;
         self
     }
 
@@ -790,7 +801,11 @@ where
                 plus_one,
             }
         };
-        let action = self.reviews.plan(ReviewAgent::Codex, &observation)?;
+        let action = self.reviews.plan(
+            ReviewAgent::Codex,
+            &observation,
+            self.continuous_review_max_failures_per_head,
+        )?;
         self.apply_review_action(pr, action, observed_pending_markers)
             .await
     }
@@ -2058,6 +2073,25 @@ mod tests {
             .unwrap();
     }
 
+    fn record_failed_run(reviews: &MemoryReviewLedger, pr: &PullRequest, sha: &str) {
+        reviews
+            .record(
+                &PrUrl::parse(&pr.html_url).unwrap(),
+                &HeadSha::parse(sha).unwrap(),
+                ReviewRun::new(
+                    ReviewAgent::Codex,
+                    ModelName::parse("gpt-5.5").unwrap(),
+                    PromptHash::of("please review"),
+                    EffortName::parse("high").unwrap(),
+                    1,
+                    2,
+                    Outcome::Failed,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
     fn recording_recorder() -> FixedTaskStartRecorder {
         FixedTaskStartRecorder {
             decision: TaskStartDecision::Recorded,
@@ -2933,6 +2967,100 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn continuous_review_stops_after_the_failure_cap() {
+        let (report, github, codex, starts) =
+            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(1), false).await;
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.responded, 0);
+        assert_eq!(*starts.calls.lock().unwrap(), 0);
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert!(github.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuous_review_retries_one_failure_below_the_cap() {
+        let (report, _github, codex, starts) =
+            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(2), false).await;
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn continuous_review_reviews_a_new_head_after_a_capped_head() {
+        let (report, _github, codex, starts) =
+            poll_capped_head(FAKE_HEAD_SHA, &[OTHER_HEAD_SHA], Some(1), false).await;
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn continuous_review_retries_failures_when_the_cap_is_unset() {
+        let (report, _github, codex, starts) =
+            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA, FAKE_HEAD_SHA], None, false).await;
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn continuous_review_posted_run_covers_a_head_past_the_failure_cap() {
+        let pull_request = pr();
+        let (report, github, codex, starts) =
+            poll_capped_head(FAKE_HEAD_SHA, &[FAKE_HEAD_SHA], Some(1), true).await;
+
+        assert_eq!(report.responded, 0);
+        assert_eq!(*starts.calls.lock().unwrap(), 0);
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            *github.events.lock().unwrap(),
+            vec!["handled_pr".to_string()]
+        );
+        assert!(
+            github
+                .handled_prs
+                .lock()
+                .unwrap()
+                .contains(&pull_request.html_url)
+        );
+    }
+
+    async fn poll_capped_head(
+        head: &str,
+        failed_shas: &[&str],
+        cap: Option<usize>,
+        posted: bool,
+    ) -> (PollReport, FakeGithub, FakeCodex, FixedTaskStartRecorder) {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        set_head(&github, &pull_request, head);
+        let reviews = MemoryReviewLedger::default();
+        for sha in failed_shas {
+            record_failed_run(&reviews, &pull_request, sha);
+        }
+        if posted {
+            record_posted_run(&reviews, &pull_request, head);
+        }
+        let starts = recording_recorder();
+        let codex = FakeCodex::default();
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_continuous_review(true)
+            .with_continuous_review_max_failures_per_head(cap.and_then(NonZeroUsize::new))
+            .with_review_ledger(reviews)
+            .with_task_start_recorder(starts.clone())
+            .run_once()
+            .await
+            .unwrap();
+        (report, github, codex, starts)
     }
 
     #[tokio::test]

@@ -47,6 +47,11 @@ codex_reasoning_effort = "high"
 # spread by task_limit_per_24h.
 # continuous_review = false
 
+# Optional. Omitted means no cap. When continuous_review is on, stop retrying a
+# head after this many failed runs. A new head starts a fresh count. A posted
+# run still covers the head. Must be at least 1.
+# continuous_review_max_failures_per_head = 3
+
 # Optional. Leave omitted unless you need to pin api.github.com.
 # github_api_ip = "127.0.0.1"
 
