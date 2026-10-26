@@ -56,8 +56,9 @@ GitHub rewrites notification reasons, and the bot only receives
 `review_requested` when it is on the team.
 
 A normal shutdown waits until a posted review is written to the ledger, including
-while that write is still failing. Killing the process after the GitHub comment
-and before the write can review the same head once more.
+while that write is still failing. `just stop` waits for that shutdown. Killing
+the process after the GitHub comment and before the write can review the same
+head once more.
 
 ## Metrics
 
