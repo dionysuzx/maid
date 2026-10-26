@@ -1,6 +1,6 @@
 use crate::{
     domain::{CodexPromptTemplates, CodexTask},
-    maid::{CodexRun, CodexRunner},
+    maid::{CodexRun, CodexRunner, ReviewFacts},
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -59,6 +59,14 @@ impl CodexCli {
 
 #[async_trait]
 impl CodexRunner for CodexCli {
+    fn review_facts(&self, task: &CodexTask) -> Result<ReviewFacts> {
+        Ok(ReviewFacts {
+            model: self.model.clone(),
+            effort: self.reasoning_effort.clone(),
+            prompt: task.prompt(&self.prompts)?,
+        })
+    }
+
     async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
         let output_file = NamedTempFile::new().context("failed to create Codex output file")?;
         let output_path = output_file.path().to_path_buf();

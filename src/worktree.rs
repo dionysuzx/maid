@@ -52,7 +52,7 @@ impl GitWorktrees {
             .join(worktree_key(task)))
     }
 
-    async fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<()> {
+    async fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {
         let mut command = Command::new("git");
         command
             .args(args)
@@ -68,7 +68,8 @@ impl GitWorktrees {
 
         let output = command.output().await.context("failed to run git")?;
         if output.status.success() {
-            return Ok(());
+            let stdout = String::from_utf8(output.stdout).context("git output was not utf-8")?;
+            return Ok(stdout.trim().to_string());
         }
 
         Err(anyhow!(
@@ -123,18 +124,21 @@ impl Worktrees for GitWorktrees {
 
         if !repo.join("HEAD").exists() {
             let repo_string = repo.to_string_lossy().to_string();
-            self.run_git(None, &["clone", "--bare", target.clone_url(), &repo_string])
+            let _stdout = self
+                .run_git(None, &["clone", "--bare", target.clone_url(), &repo_string])
                 .await
                 .with_context(|| format!("failed to clone bare repo {}", target.repo_key()))?;
         }
 
-        self.run_git(
-            Some(&repo),
-            &["remote", "set-url", "origin", target.clone_url()],
-        )
-        .await?;
+        let _stdout = self
+            .run_git(
+                Some(&repo),
+                &["remote", "set-url", "origin", target.clone_url()],
+            )
+            .await?;
         let fetch_ref = target.fetch_ref();
-        self.run_git(Some(&repo), &["fetch", "--prune", "origin", &fetch_ref])
+        let _stdout = self
+            .run_git(Some(&repo), &["fetch", "--prune", "origin", &fetch_ref])
             .await
             .with_context(|| format!("failed to fetch {}", target.html_url()))?;
 
@@ -153,20 +157,25 @@ impl Worktrees for GitWorktrees {
             }
         }
 
-        self.run_git(Some(&repo), &["worktree", "prune"]).await?;
-        self.run_git(
-            Some(&repo),
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                &worktree_string,
-                "FETCH_HEAD",
-            ],
-        )
-        .await?;
+        let _stdout = self.run_git(Some(&repo), &["worktree", "prune"]).await?;
+        let _stdout = self
+            .run_git(
+                Some(&repo),
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    &worktree_string,
+                    "FETCH_HEAD",
+                ],
+            )
+            .await?;
+        let head = self
+            .run_git(Some(&worktree), &["rev-parse", "HEAD"])
+            .await
+            .context("failed to read checked out head")?;
 
-        Ok(PreparedWorktree::git_worktree(repo, worktree))
+        Ok(PreparedWorktree::git_worktree(repo, worktree).with_head(head))
     }
 
     async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()> {
@@ -181,13 +190,14 @@ impl Worktrees for GitWorktrees {
                 Some(&repo),
                 &["worktree", "remove", "--force", &worktree_string],
             )
-            .await;
+            .await
+            .map(|_| ());
         if worktree.path().exists() {
             tokio::fs::remove_dir_all(worktree.path())
                 .await
                 .with_context(|| format!("failed to remove {}", worktree.path().display()))?;
         }
-        self.run_git(Some(&repo), &["worktree", "prune"]).await?;
+        let _stdout = self.run_git(Some(&repo), &["worktree", "prune"]).await?;
         if worktree.path().exists() {
             return remove_result;
         }

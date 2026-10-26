@@ -9,5 +9,6 @@ pub mod maid;
 pub mod mention_thread;
 pub mod observed_notification;
 pub mod polling_metrics;
+pub mod pr_review;
 pub mod task_limit;
 pub mod worktree;

@@ -144,11 +144,18 @@ impl GitHubRestClient {
     where
         T: Serialize + Sync,
     {
-        let _: serde::de::IgnoredAny = self
-            .request(Method::POST, url, Some(body), HeaderMap::new())
-            .await?
-            .into_json()?;
+        let _: serde::de::IgnoredAny = self.post_json_parsed(url, body).await?;
         Ok(())
+    }
+
+    async fn post_json_parsed<T, B>(&self, url: &str, body: &B) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+        B: Serialize + Sync,
+    {
+        self.request(Method::POST, url, Some(body), HeaderMap::new())
+            .await?
+            .into_json()
     }
 
     async fn request<T, B>(
@@ -395,9 +402,13 @@ impl GithubClient for GitHubRestClient {
         self.post_json(&url, &PostComment { body }).await
     }
 
-    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
-        self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
-            .await
+    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<String> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/issues/{}/comments",
+            pr.owner, pr.repo, pr.number
+        );
+        let comment: ApiComment = self.post_json_parsed(&url, &PostComment { body }).await?;
+        Ok(comment.html_url)
     }
 
     async fn mention_state(
