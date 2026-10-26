@@ -758,6 +758,10 @@ mod tests {
         assert_eq!(open.pull_request.author, "octocat");
         assert_eq!(open.pull_request.number, 7);
         assert_eq!(
+            open.head_sha.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
             open.requested_teams,
             vec![TeamSlug::parse("some-org/eng-infra").unwrap()]
         );
@@ -783,6 +787,7 @@ mod tests {
         )
         .unwrap();
         assert!(missing_teams.requested_teams.is_empty());
+        assert!(missing_teams.head_sha.is_none());
 
         let null_teams = GitHubRestClient::open_pull_request_from_api(
             serde_json::from_str(PULL_REQUEST_WITH_NULL_TEAMS_FIXTURE).unwrap(),
@@ -920,6 +925,7 @@ mod tests {
   "user": { "login": "octocat" },
   "created_at": "2026-10-01T00:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
+  "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "requested_teams": [
     {
       "name": "Engineering Infra",
@@ -1165,11 +1171,21 @@ impl GitHubRestClient {
             );
         }
 
+        let head_sha = pr.head.and_then(|head| {
+            let sha = head.sha.trim();
+            if sha.is_empty() {
+                None
+            } else {
+                Some(sha.to_string())
+            }
+        });
+
         Ok(OpenPullRequest {
             requested_teams: requested_teams_from_api(pr.requested_teams),
             created_at,
             updated_at,
             pull_request,
+            head_sha,
         })
     }
 
@@ -1499,7 +1515,14 @@ struct ApiPullRequest {
     updated_at: String,
     #[serde(default)]
     requested_teams: Option<Vec<ApiRequestedTeam>>,
+    #[serde(default)]
+    head: Option<ApiPullRequestHead>,
     base: ApiPullRequestBase,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiPullRequestHead {
+    sha: String,
 }
 
 #[derive(Debug, Deserialize)]
