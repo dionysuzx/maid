@@ -30,6 +30,7 @@ pub struct Config {
     pub observed_notification_ledger_path: PathBuf,
     pub pr_review_ledger_path: PathBuf,
     pub task_limit_per_24h: Option<usize>,
+    pub continuous_review: bool,
     pub max_concurrent_requests: usize,
     pub github_api_requests_per_hour: GitHubApiRequestRate,
     pub github_notification_window: GitHubNotificationWindow,
@@ -81,6 +82,7 @@ impl Config {
             .transpose()?
             .unwrap_or_else(|| maid_home.join("git"));
         let task_limit_per_24h = file.task_limit_per_24h;
+        let continuous_review = file.continuous_review.unwrap_or(false);
         let max_concurrent_requests = file.max_concurrent_requests.unwrap_or(1);
         if max_concurrent_requests == 0 {
             bail!("max_concurrent_requests must be at least 1");
@@ -134,6 +136,7 @@ impl Config {
             observed_notification_ledger_path: maid_home.join("observed-notifications.json"),
             pr_review_ledger_path: maid_home.join("pr-reviews.json"),
             task_limit_per_24h,
+            continuous_review,
             max_concurrent_requests,
             github_api_requests_per_hour,
             github_notification_window,
@@ -157,6 +160,7 @@ struct ConfigFile {
     auto_review_teams: Option<Vec<String>>,
     git_dir: Option<String>,
     task_limit_per_24h: Option<usize>,
+    continuous_review: Option<bool>,
     max_concurrent_requests: Option<usize>,
     github_api_requests_per_hour: Option<u32>,
     github_notification_window_hours: Option<u32>,
@@ -389,6 +393,7 @@ auto_review_repos = ["dionysuzx/maid"]
 auto_review_teams = ["Some-Org/eng-infra"]
 git_dir = "~/.maid/git"
 task_limit_per_24h = 5
+continuous_review = true
 max_concurrent_requests = 3
 github_api_requests_per_hour = 1200
 github_notification_window_hours = 96
@@ -428,6 +433,7 @@ operator_mention = "operator {{{{request_text}}}}"
         );
         assert_eq!(config.git_dir.as_deref(), Some("~/.maid/git"));
         assert_eq!(config.task_limit_per_24h, Some(5));
+        assert_eq!(config.continuous_review, Some(true));
         assert_eq!(config.max_concurrent_requests, Some(3));
         assert_eq!(config.github_api_requests_per_hour, Some(1200));
         assert_eq!(config.github_notification_window_hours, Some(96));
@@ -466,6 +472,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.auto_review_teams, None);
         assert_eq!(config.git_dir, None);
         assert_eq!(config.task_limit_per_24h, None);
+        assert_eq!(config.continuous_review, None);
         assert_eq!(config.github_api_requests_per_hour, None);
         assert_eq!(config.github_notification_window_hours, None);
         assert_eq!(config.metrics_bind_address, None);

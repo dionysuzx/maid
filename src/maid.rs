@@ -41,6 +41,7 @@ pub trait GithubClient: Send + Sync {
         order: OpenPullRequestOrder,
     ) -> Result<Vec<OpenPullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
+    async fn open_pull_request(&self, pr: &PullRequest) -> Result<OpenPullRequest>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<String>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -149,6 +150,7 @@ pub struct Maid<G, R, C> {
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
     observed_notifications: Arc<dyn ObservedNotificationStore>,
     reviews: Arc<dyn ReviewLedger>,
+    continuous_review: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +166,7 @@ struct AutoReviewCandidate {
     source: AutoReviewSource,
     requested_teams: Vec<TeamSlug>,
     updated_at: Option<DateTime<Utc>>,
+    head_sha: Option<String>,
 }
 
 impl AutoReviewCandidate {
@@ -173,6 +176,7 @@ impl AutoReviewCandidate {
             source: AutoReviewSource::Repository,
             requested_teams: open.requested_teams,
             updated_at: open.updated_at,
+            head_sha: open.head_sha,
         }
     }
 
@@ -182,6 +186,7 @@ impl AutoReviewCandidate {
             source: AutoReviewSource::TeamActivity,
             requested_teams: open.requested_teams,
             updated_at: open.updated_at,
+            head_sha: open.head_sha,
         }
     }
 
@@ -193,6 +198,7 @@ impl AutoReviewCandidate {
             },
             requested_teams: Vec::new(),
             updated_at: None,
+            head_sha: None,
         }
     }
 
@@ -253,6 +259,7 @@ where
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
             reviews: Arc::new(MemoryReviewLedger::default()),
+            continuous_review: false,
         }
     }
 
@@ -300,6 +307,11 @@ where
 
     pub fn with_review_ledger(mut self, reviews: impl ReviewLedger + 'static) -> Self {
         self.reviews = Arc::new(reviews);
+        self
+    }
+
+    pub fn with_continuous_review(mut self, continuous_review: bool) -> Self {
+        self.continuous_review = continuous_review;
         self
     }
 
@@ -757,15 +769,52 @@ where
         let state = self.github.pr_state(pr, &self.bot_login).await?;
         let marker = PendingHandledMarker::for_pull_request(pr);
         let has_pending_marker = self.pending_handled_markers.contains(&marker)?;
-        let action = self.reviews.plan(
-            ReviewAgent::Codex,
-            &Observation::Legacy {
+        let plus_one = state == ReviewState::Handled;
+        let observation = if self.continuous_review {
+            let Some(sha) = self.head_for_continuous_review(candidate).await? else {
+                info!(
+                    pr = %pr.html_url,
+                    "skipping pull request with no head sha"
+                );
+                return Ok(TaskAssessment::Skipped);
+            };
+            let Ok(sha) = HeadSha::parse(&sha) else {
+                info!(
+                    pr = %pr.html_url,
+                    head = %sha,
+                    "skipping pull request with an unreadable head sha"
+                );
+                return Ok(TaskAssessment::Skipped);
+            };
+            Observation::Head {
+                pr: PrUrl::parse(&pr.html_url)?,
+                sha,
                 marker: has_pending_marker,
-                plus_one: state == ReviewState::Handled,
-            },
-        )?;
+                plus_one,
+            }
+        } else {
+            Observation::Legacy {
+                marker: has_pending_marker,
+                plus_one,
+            }
+        };
+        let action = self.reviews.plan(ReviewAgent::Codex, &observation)?;
         self.apply_review_action(pr, action, observed_pending_markers)
             .await
+    }
+
+    async fn head_for_continuous_review(
+        &self,
+        candidate: &AutoReviewCandidate,
+    ) -> Result<Option<String>> {
+        if let Some(sha) = &candidate.head_sha {
+            return Ok(Some(sha.clone()));
+        }
+        if !matches!(candidate.source, AutoReviewSource::PublicAuthor { .. }) {
+            return Ok(None);
+        }
+
+        Ok(self.github.open_pull_request(&candidate.pr).await?.head_sha)
     }
 
     async fn auto_review_candidates(&self) -> Result<Vec<AutoReviewCandidate>> {
@@ -1512,6 +1561,10 @@ fn deduplicate_auto_review_candidates(
             if !existing.has_allowed_author(repository_accounts, public_accounts)
                 && candidate.has_allowed_author(repository_accounts, public_accounts)
             {
+                let mut candidate = candidate;
+                if candidate.head_sha.is_none() {
+                    candidate.head_sha.clone_from(&existing.head_sha);
+                }
                 deduplicated[index] = candidate;
             }
         } else {
@@ -1528,6 +1581,7 @@ mod tests {
     use super::*;
 
     const FAKE_HEAD_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER_HEAD_SHA: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
     use crate::domain::{CodexTaskOrigin, Issue, TeamSlug};
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -1549,6 +1603,8 @@ mod tests {
         requested_teams: Arc<StdMutex<HashMap<String, Vec<TeamSlug>>>>,
         pull_created_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         pull_updated_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
+        head_shas: Arc<StdMutex<HashMap<String, String>>>,
+        pull_gets: Arc<StdMutex<Vec<String>>>,
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         posts: Arc<StdMutex<Vec<String>>>,
@@ -1602,23 +1658,9 @@ mod tests {
                 OpenPullRequestOrder::NewestCreated => created,
                 OpenPullRequestOrder::RecentlyUpdated => updated.unwrap_or(created),
             };
-            let requested_teams = self.requested_teams.lock().unwrap().clone();
-            let created_at = self.pull_created_at.lock().unwrap().clone();
-            let updated_at = self.pull_updated_at.lock().unwrap().clone();
             Ok(pull_requests
                 .into_iter()
-                .map(|pull_request| {
-                    let teams = requested_teams
-                        .get(&pull_request.html_url)
-                        .cloned()
-                        .unwrap_or_default();
-                    OpenPullRequest {
-                        requested_teams: teams,
-                        created_at: created_at.get(&pull_request.html_url).copied(),
-                        updated_at: updated_at.get(&pull_request.html_url).copied(),
-                        pull_request,
-                    }
-                })
+                .map(|pull_request| self.open_pull(pull_request))
                 .collect())
         }
 
@@ -1631,6 +1673,11 @@ mod tests {
                 .unwrap()
                 .push(author.to_string());
             Ok(self.public_pull_requests.lock().unwrap().clone())
+        }
+
+        async fn open_pull_request(&self, pr: &PullRequest) -> Result<OpenPullRequest> {
+            self.pull_gets.lock().unwrap().push(pr.api_url.clone());
+            Ok(self.open_pull(pr.clone()))
         }
 
         async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
@@ -1762,6 +1809,23 @@ mod tests {
     }
 
     impl FakeGithub {
+        fn open_pull(&self, pull_request: PullRequest) -> OpenPullRequest {
+            let html_url = pull_request.html_url.clone();
+            OpenPullRequest {
+                requested_teams: self
+                    .requested_teams
+                    .lock()
+                    .unwrap()
+                    .get(&html_url)
+                    .cloned()
+                    .unwrap_or_default(),
+                created_at: self.pull_created_at.lock().unwrap().get(&html_url).copied(),
+                updated_at: self.pull_updated_at.lock().unwrap().get(&html_url).copied(),
+                head_sha: self.head_shas.lock().unwrap().get(&html_url).cloned(),
+                pull_request,
+            }
+        }
+
         fn take_mention(&self) -> Result<Option<CommentMention>> {
             match self.mention.lock().unwrap().take().unwrap_or(Ok(None)) {
                 Ok(value) => Ok(value),
@@ -1965,6 +2029,43 @@ mod tests {
 
     fn team_slug(value: &str) -> TeamSlug {
         TeamSlug::parse(value).unwrap()
+    }
+
+    fn set_head(github: &FakeGithub, pr: &PullRequest, sha: &str) {
+        github
+            .head_shas
+            .lock()
+            .unwrap()
+            .insert(pr.html_url.clone(), sha.to_string());
+    }
+
+    fn record_posted_run(reviews: &MemoryReviewLedger, pr: &PullRequest, sha: &str) {
+        reviews
+            .record(
+                &PrUrl::parse(&pr.html_url).unwrap(),
+                &HeadSha::parse(sha).unwrap(),
+                ReviewRun::new(
+                    ReviewAgent::Codex,
+                    ModelName::parse("gpt-5.5").unwrap(),
+                    PromptHash::of("please review"),
+                    EffortName::parse("high").unwrap(),
+                    1,
+                    2,
+                    Outcome::Posted {
+                        comment_url: CommentUrl::parse(&format!("{}#issuecomment-9", pr.html_url))
+                            .unwrap(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn recording_recorder() -> FixedTaskStartRecorder {
+        FixedTaskStartRecorder {
+            decision: TaskStartDecision::Recorded,
+            calls: Arc::new(StdMutex::new(0)),
+        }
     }
 
     fn request_team(github: &FakeGithub, pr: &PullRequest, updated_at: DateTime<Utc>) {
@@ -2759,6 +2860,259 @@ mod tests {
         assert_eq!(second.responded, 0);
         assert_eq!(second.skipped, 1);
         assert_eq!(github.posts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn continuous_review_off_ignores_a_new_head_on_a_handled_pull_request() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        github
+            .handled_prs
+            .lock()
+            .unwrap()
+            .insert(pull_request.html_url.clone());
+        set_head(&github, &pull_request, OTHER_HEAD_SHA);
+        let reviews = MemoryReviewLedger::default();
+        record_posted_run(&reviews, &pull_request, FAKE_HEAD_SHA);
+        let starts = recording_recorder();
+
+        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+            .with_review_ledger(reviews)
+            .with_task_start_recorder(starts.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.responded, 0);
+        assert_eq!(*starts.calls.lock().unwrap(), 0);
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert!(github.pull_gets.lock().unwrap().is_empty());
+        assert!(
+            github
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| event != "start_pr")
+        );
+    }
+
+    #[tokio::test]
+    async fn continuous_review_does_not_rereview_a_covered_team_head() {
+        let github = FakeGithub::default();
+        let pull_request = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        request_team(&github, &pull_request, recent_pr_time());
+        github
+            .handled_prs
+            .lock()
+            .unwrap()
+            .insert(pull_request.html_url.clone());
+        set_head(&github, &pull_request, FAKE_HEAD_SHA);
+        let reviews = MemoryReviewLedger::default();
+        record_posted_run(&reviews, &pull_request, FAKE_HEAD_SHA);
+        let markers = MemoryPendingHandledMarkerStore::default();
+        markers
+            .record(&PendingHandledMarker::for_pull_request(&pull_request))
+            .unwrap();
+        let starts = recording_recorder();
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_continuous_review(true)
+            .with_review_ledger(reviews)
+            .with_pending_handled_marker_store(markers.clone())
+            .with_task_start_recorder(starts.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.responded, 0);
+        assert_eq!(*starts.calls.lock().unwrap(), 0);
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert!(github.pull_gets.lock().unwrap().is_empty());
+        assert!(github.posts.lock().unwrap().is_empty());
+        assert!(
+            !markers
+                .contains(&PendingHandledMarker::for_pull_request(&pull_request))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn continuous_review_rereviews_an_uncovered_team_head() {
+        let github = FakeGithub::default();
+        let pull_request = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        request_team(&github, &pull_request, recent_pr_time());
+        github
+            .handled_prs
+            .lock()
+            .unwrap()
+            .insert(pull_request.html_url.clone());
+        set_head(&github, &pull_request, FAKE_HEAD_SHA);
+        let reviews = MemoryReviewLedger::default();
+        record_posted_run(&reviews, &pull_request, OTHER_HEAD_SHA);
+        let markers = MemoryPendingHandledMarkerStore::default();
+        let marker = PendingHandledMarker::for_pull_request(&pull_request);
+        markers.record(&marker).unwrap();
+        let starts = recording_recorder();
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_continuous_review(true)
+            .with_review_ledger(reviews.clone())
+            .with_pending_handled_marker_store(markers.clone())
+            .with_task_start_recorder(starts.clone());
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert!(github.pull_gets.lock().unwrap().is_empty());
+        let runs = reviews
+            .runs(
+                &PrUrl::parse(&pull_request.html_url).unwrap(),
+                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(matches!(runs[0].outcome(), Outcome::Posted { .. }));
+
+        let second = maid.run_once().await.unwrap();
+        assert_eq!(second.responded, 0);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn continuous_review_zero_task_limit_starts_nothing() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        set_head(&github, &pull_request, FAKE_HEAD_SHA);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("task-starts.json");
+        let starts = crate::task_limit::FileTaskStartRecorder::new(Some(0), &path);
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_continuous_review(true)
+            .with_task_start_recorder(starts)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.responded, 0);
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert!(github.events.lock().unwrap().is_empty());
+        let reloaded = crate::task_limit::FileTaskStartRecorder::new(Some(1), &path);
+        assert_eq!(
+            reloaded.try_record_started().unwrap(),
+            TaskStartDecision::Recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn continuous_review_full_semaphore_consumes_no_start() {
+        let github = FakeGithub::default();
+        let first = pr_with_number(1);
+        let second = pr_with_number(2);
+        *github.pull_requests.lock().unwrap() = vec![first.clone(), second.clone()];
+        set_head(&github, &first, FAKE_HEAD_SHA);
+        set_head(&github, &second, FAKE_HEAD_SHA);
+        let codex = BlockingCodex::new();
+        let entered = codex.entered.clone();
+        let release = codex.release.clone();
+        let starts = recording_recorder();
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_continuous_review(true)
+            .with_task_start_recorder(starts.clone())
+            .into_concurrent(1);
+
+        let report = maid.run_once().await.unwrap();
+
+        assert_eq!(report.started, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 1);
+        entered.wait().await;
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert!(github.pull_gets.lock().unwrap().is_empty());
+
+        release.notify_waiters();
+        wait_until(|| github.handled_prs.lock().unwrap().len() == 1).await;
+    }
+
+    #[tokio::test]
+    async fn continuous_review_fetches_a_public_pull_request_once() {
+        let github = FakeGithub::default();
+        let pull_request = pr();
+        *github.public_pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        set_head(&github, &pull_request, FAKE_HEAD_SHA);
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_public_auto_review_accounts(["dionysuzx"])
+            .with_continuous_review(true)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            *github.pull_gets.lock().unwrap(),
+            vec![pull_request.api_url.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn continuous_review_skips_a_list_pull_request_with_no_head() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let starts = recording_recorder();
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_continuous_review(true)
+            .with_task_start_recorder(starts.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 0);
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert!(github.pull_gets.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuous_review_ignores_an_untracked_pull_request() {
+        let github = FakeGithub::default();
+        let pull_request = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
+        set_head(&github, &pull_request, FAKE_HEAD_SHA);
+        let starts = recording_recorder();
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_continuous_review(true)
+            .with_task_start_recorder(starts.clone())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(*starts.calls.lock().unwrap(), 0);
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert!(github.pull_gets.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

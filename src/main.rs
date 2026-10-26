@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
         config.observed_notification_ledger_path.clone(),
     ))
     .with_review_ledger(FileReviewLedger::new(config.pr_review_ledger_path.clone()))
+    .with_continuous_review(config.continuous_review)
     .into_concurrent(config.max_concurrent_requests);
 
     let task_limit_per_24h = config
@@ -97,6 +98,7 @@ async fn main() -> Result<()> {
         github_api_requests_per_hour = config.github_api_requests_per_hour.requests_per_hour(),
         github_notification_window_hours = config.github_notification_window.as_hours(),
         task_limit_per_24h = %task_limit_per_24h,
+        continuous_review = config.continuous_review,
         max_concurrent_requests = config.max_concurrent_requests,
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),

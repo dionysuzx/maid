@@ -39,6 +39,14 @@ codex_reasoning_effort = "high"
 # Optional. Omitted by default for no task limit. Set to 0 to pause new starts.
 # task_limit_per_24h = 5
 
+# Optional. Omitted means false. When true, an open pull request in any tracked
+# scope (auto_review_repos accounts, auto_review_public_accounts, or
+# auto_review_teams) is reviewed again when its head commit has no posted Codex
+# run. A head that already has a posted Codex run is left alone. Turning this
+# on reviews tracked open pull requests that lack a Codex run at the tip,
+# spread by task_limit_per_24h.
+# continuous_review = false
+
 # Optional. Leave omitted unless you need to pin api.github.com.
 # github_api_ip = "127.0.0.1"
 
