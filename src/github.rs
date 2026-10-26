@@ -392,6 +392,13 @@ impl GithubClient for GitHubRestClient {
         Ok(pull_requests)
     }
 
+    async fn pull_request_head(&self, pr: &PullRequest) -> Result<String> {
+        self.open_pull_request_at(&pr.api_url)
+            .await?
+            .head_sha
+            .context("pull request has no head sha")
+    }
+
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/issues/{}/comments",
@@ -1143,8 +1150,11 @@ impl GitHubRestClient {
     }
 
     async fn pull_request_from_url(&self, pr_url: &str) -> Result<PullRequest> {
-        let pr = self.get::<ApiPullRequest>(pr_url).await?;
-        Ok(Self::open_pull_request_from_api(pr)?.pull_request)
+        Ok(self.open_pull_request_at(pr_url).await?.pull_request)
+    }
+
+    async fn open_pull_request_at(&self, url: &str) -> Result<OpenPullRequest> {
+        Self::open_pull_request_from_api(self.get(url).await?)
     }
 
     fn open_pull_request_from_api(pr: ApiPullRequest) -> Result<OpenPullRequest> {
