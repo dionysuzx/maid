@@ -171,11 +171,19 @@ struct AutoReviewCandidate {
     source: AutoReviewSource,
     requested_teams: Vec<TeamSlug>,
     updated_at: Option<DateTime<Utc>>,
+    listed_head: Option<HeadSha>,
+}
+
+fn listed_head(open: &OpenPullRequest) -> Option<HeadSha> {
+    open.head_sha
+        .as_deref()
+        .and_then(|sha| HeadSha::parse(sha).ok())
 }
 
 impl AutoReviewCandidate {
     fn repository(open: OpenPullRequest) -> Self {
         Self {
+            listed_head: listed_head(&open),
             pr: open.pull_request,
             source: AutoReviewSource::Repository,
             requested_teams: open.requested_teams,
@@ -185,6 +193,7 @@ impl AutoReviewCandidate {
 
     fn team_activity(open: OpenPullRequest) -> Self {
         Self {
+            listed_head: listed_head(&open),
             pr: open.pull_request,
             source: AutoReviewSource::TeamActivity,
             requested_teams: open.requested_teams,
@@ -200,6 +209,7 @@ impl AutoReviewCandidate {
             },
             requested_teams: Vec::new(),
             updated_at: None,
+            listed_head: None,
         }
     }
 
@@ -402,6 +412,22 @@ where
         for candidate in self.auto_review_candidates().await? {
             let pr = &candidate.pr;
             report.seen += 1;
+            match self.listed_head_is_idle(&candidate) {
+                Ok(true) => {
+                    report.skipped += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    report.failed += 1;
+                    error!(
+                        pr = %pr.html_url,
+                        error = ?err,
+                        "failed to handle auto-review pull request"
+                    );
+                    continue;
+                }
+            }
             match self
                 .task_for_auto_review_candidate(&candidate, observed_pending_markers)
                 .await
@@ -1002,8 +1028,7 @@ where
                     .context("checked out pull request has no head")?,
             )?;
             let pr_url = PrUrl::parse(&pr.html_url)?;
-            let runs = self.reviews.runs(&pr_url, &head)?;
-            if plan(&runs, ReviewAgent::Codex, self.max_failures_per_head) == Action::Idle {
+            if self.plan_for_head(&pr_url, &head)? == Action::Idle {
                 info!(
                     pr = %pr.html_url,
                     head = head.as_str(),
@@ -1029,6 +1054,31 @@ where
                 let result: Result<Option<AutoReviewSession>> = Err(err);
                 self.cleanup_worktree(worktree, result).await
             }
+        }
+    }
+
+    fn plan_for_head(&self, pr_url: &PrUrl, head: &HeadSha) -> Result<Action> {
+        Ok(plan(
+            &self.reviews.runs(pr_url, head)?,
+            ReviewAgent::Codex,
+            self.max_failures_per_head,
+        ))
+    }
+
+    fn listed_head_is_idle(&self, candidate: &AutoReviewCandidate) -> Result<bool> {
+        let Some(head) = candidate.listed_head.as_ref() else {
+            return Ok(false);
+        };
+        let pr_url = PrUrl::parse(&candidate.pr.html_url)?;
+        if self.plan_for_head(&pr_url, head)? == Action::Idle {
+            info!(
+                pr = %candidate.pr.html_url,
+                head = head.as_str(),
+                "skipping covered pull request head"
+            );
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -1317,6 +1367,23 @@ where
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
         report: &mut PollReport,
     ) {
+        match self.maid.listed_head_is_idle(candidate) {
+            Ok(true) => {
+                report.skipped += 1;
+                return;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                report.failed += 1;
+                error!(
+                    pr = %candidate.pr.html_url,
+                    error = ?err,
+                    "failed to handle auto-review pull request"
+                );
+                return;
+            }
+        }
+
         let Some(reservation) = self
             .work
             .try_reserve_key(task_key_for_trigger(&candidate.pr.html_url))
@@ -1734,6 +1801,7 @@ mod tests {
         requested_teams: Arc<StdMutex<HashMap<String, Vec<TeamSlug>>>>,
         pull_created_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         pull_updated_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
+        pull_heads: Arc<StdMutex<HashMap<String, String>>>,
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         posts: Arc<StdMutex<Vec<String>>>,
@@ -1794,6 +1862,7 @@ mod tests {
             let requested_teams = self.requested_teams.lock().unwrap().clone();
             let created_at = self.pull_created_at.lock().unwrap().clone();
             let updated_at = self.pull_updated_at.lock().unwrap().clone();
+            let heads = self.pull_heads.lock().unwrap().clone();
             Ok(pull_requests
                 .into_iter()
                 .map(|pull_request| {
@@ -1805,6 +1874,7 @@ mod tests {
                         requested_teams: teams,
                         created_at: created_at.get(&pull_request.html_url).copied(),
                         updated_at: updated_at.get(&pull_request.html_url).copied(),
+                        head_sha: heads.get(&pull_request.html_url).cloned(),
                         pull_request,
                     }
                 })
@@ -2038,6 +2108,31 @@ mod tests {
                 }
             }
             *self.active.lock().unwrap() -= 1;
+            self.inner.prepare(target, task).await
+        }
+
+        async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()> {
+            self.inner.cleanup(worktree).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct OpenedPullRequestGate {
+        inner: FakeWorktrees,
+        prepares: Arc<StdMutex<Vec<String>>>,
+        gate: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Worktrees for OpenedPullRequestGate {
+        async fn prepare(&self, target: &WorkTarget, task: &CodexTask) -> Result<PreparedWorktree> {
+            if matches!(task.origin, CodexTaskOrigin::PullRequestOpened { .. }) {
+                self.prepares
+                    .lock()
+                    .unwrap()
+                    .push(target.html_url().to_string());
+                self.gate.notified().await;
+            }
             self.inner.prepare(target, task).await
         }
 
@@ -3707,6 +3802,119 @@ mod tests {
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.events.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    fn cover_head(reviews: &MemoryReviewLedger, pr: &PullRequest) {
+        reviews
+            .record(
+                &PrUrl::parse(&pr.html_url).unwrap(),
+                &HeadSha::parse(FAKE_HEAD_SHA).unwrap(),
+                ReviewRun::new(
+                    ReviewAgent::Codex,
+                    ModelName::parse("gpt-5.5").unwrap(),
+                    PromptHash::of("please review"),
+                    EffortName::parse("high").unwrap(),
+                    1,
+                    2,
+                    Outcome::Posted {
+                        comment_url: CommentUrl::parse(
+                            "https://github.com/o/r/pull/1#issuecomment-1",
+                        )
+                        .unwrap(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn list_head(github: &FakeGithub, pr: &PullRequest) {
+        github
+            .pull_heads
+            .lock()
+            .unwrap()
+            .insert(pr.html_url.clone(), FAKE_HEAD_SHA.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_covered_listed_head_is_not_checked_out() {
+        let github = FakeGithub::default();
+        let covered = pr_with_number(1);
+        let fresh = pr_with_number(2);
+        *github.pull_requests.lock().unwrap() = vec![covered.clone(), fresh.clone()];
+        list_head(&github, &covered);
+        list_head(&github, &fresh);
+        let reviews = MemoryReviewLedger::default();
+        cover_head(&reviews, &covered);
+        let worktrees = idle_worktrees();
+        let codex = FakeCodex::default();
+
+        let report = maid(github, worktrees.clone(), codex.clone())
+            .with_review_ledger(reviews)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.seen, 2);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.responded, 1);
+        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r".to_string()]);
+        let calls = codex.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.pr_url, fresh.html_url);
+    }
+
+    #[tokio::test]
+    async fn covered_heads_do_not_starve_a_mention() {
+        let github = FakeGithub::default();
+        let first = pr_with_number(1);
+        let second = pr_with_number(2);
+        *github.pull_requests.lock().unwrap() = vec![first.clone(), second.clone()];
+        list_head(&github, &first);
+        list_head(&github, &second);
+        let reviews = MemoryReviewLedger::default();
+        cover_head(&reviews, &first);
+        cover_head(&reviews, &second);
+        let prepares = Arc::new(StdMutex::new(Vec::new()));
+        let worktrees = OpenedPullRequestGate {
+            inner: idle_worktrees(),
+            prepares: prepares.clone(),
+            gate: Arc::new(Notify::new()),
+        };
+        let codex = FakeCodex::default();
+        let maid = Maid::new(
+            github.clone(),
+            worktrees,
+            codex.clone(),
+            "maid-bot",
+            ["dionysuzx"],
+            ["dionysuzx"],
+            [RepoSlug {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+            }],
+        )
+        .with_review_ledger(reviews)
+        .into_concurrent(1);
+
+        maid.run_once().await.unwrap();
+        assert!(prepares.lock().unwrap().is_empty());
+
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
+        for _ in 0..10 {
+            maid.run_once().await.unwrap();
+        }
+
+        wait_until(|| !codex.calls.lock().unwrap().is_empty()).await;
+        assert!(prepares.lock().unwrap().is_empty());
+        assert!(matches!(
+            codex.calls.lock().unwrap()[0].1.origin,
+            CodexTaskOrigin::Mention { .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(1), maid.drain())
+            .await
+            .expect("covered pull requests stayed queued");
     }
 
     #[tokio::test]
