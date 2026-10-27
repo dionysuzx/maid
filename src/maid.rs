@@ -673,7 +673,8 @@ where
         candidate: &AutoReviewCandidate,
     ) -> Result<TaskAssessment> {
         let pr = &candidate.pr;
-        match self.auto_review_author(candidate) {
+        let last_reviewed = self.reviewed_heads.last_reviewed(pr)?;
+        match self.auto_review_author(candidate, last_reviewed.is_some()) {
             AutoReviewAuthor::Bot => return Ok(TaskAssessment::Skipped),
             AutoReviewAuthor::NotAllowed => {
                 info!(
@@ -686,7 +687,6 @@ where
             AutoReviewAuthor::Allowed => {}
         }
 
-        let last_reviewed = self.reviewed_heads.last_reviewed(pr)?;
         if !self
             .review_cadence
             .needs_review(&pr.head, last_reviewed.as_ref())
@@ -702,7 +702,11 @@ where
         )))
     }
 
-    fn auto_review_author(&self, candidate: &AutoReviewCandidate) -> AutoReviewAuthor {
+    fn auto_review_author(
+        &self,
+        candidate: &AutoReviewCandidate,
+        previously_reviewed: bool,
+    ) -> AutoReviewAuthor {
         let author_allowed = candidate.has_allowed_author(
             &self.auto_review_accounts,
             &self.auto_review_public_accounts,
@@ -715,10 +719,12 @@ where
             self.team_review_window,
         )
         .is_some();
+        // A reviewed pull request stays in scope: GitHub clears a team's review
+        // request once a member reviews, before the author pushes again.
         classify_auto_review_author(
             &candidate.pr,
             &self.bot_login,
-            author_allowed || team_authorized,
+            previously_reviewed || author_allowed || team_authorized,
         )
     }
 
@@ -2798,6 +2804,27 @@ mod tests {
                 .iter()
                 .all(|order| *order == OpenPullRequestOrder::RecentlyUpdated)
         );
+    }
+
+    #[tokio::test]
+    async fn continuous_review_follows_a_team_request_after_github_clears_it() {
+        let github = FakeGithub::default();
+        let team_pr = pr_with_author("contributor");
+        *github.pull_requests.lock().unwrap() = vec![team_pr.clone()];
+        request_team(&github, &team_pr, recent_pr_time());
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_review_cadence(ReviewCadence::EveryHead);
+
+        let first = maid.run_once().await.unwrap();
+        github.requested_teams.lock().unwrap().clear();
+        *github.pull_requests.lock().unwrap() = vec![pushed(&team_pr, "b")];
+        let after_push = maid.run_once().await.unwrap();
+
+        assert_eq!(first.responded, 1);
+        assert_eq!(after_push.responded, 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
