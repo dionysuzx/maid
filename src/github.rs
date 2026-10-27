@@ -1,7 +1,7 @@
 use crate::{
     domain::{
-        CommentMention, Issue, Notification, OpenPullRequest, OpenPullRequestOrder, PullRequest,
-        RepoSlug, ReviewState, TeamSlug, WorkTarget,
+        CommentMention, CommitSha, Issue, Notification, OpenPullRequest, OpenPullRequestOrder,
+        PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
     },
     maid::GithubClient,
 };
@@ -362,18 +362,17 @@ impl GithubClient for GitHubRestClient {
             let done = search.items.len() < SEARCH_PAGE_SIZE;
 
             for item in search.items {
-                let Some(repository_url) = item.repository_url.as_deref() else {
+                let Some(repository_url) = item.repository_url.clone() else {
                     continue;
                 };
-                if !repositories.contains_key(repository_url) {
-                    let repository = self.get::<ApiRepo>(repository_url).await?;
-                    repositories.insert(repository_url.to_string(), repository);
+                if !repositories.contains_key(&repository_url) {
+                    let repository = self.get::<ApiRepo>(&repository_url).await?;
+                    repositories.insert(repository_url.clone(), repository);
                 }
-                let repository = &repositories[repository_url];
-                if let Some(pull_request) =
-                    Self::public_pull_request_from_search_item(item, repository)?
+                if let Some(pull_request_url) =
+                    public_pull_request_url(item, &repositories[&repository_url])?
                 {
-                    pull_requests.push(pull_request);
+                    pull_requests.push(self.pull_request_from_url(&pull_request_url).await?);
                 }
             }
 
@@ -428,35 +427,13 @@ impl GithubClient for GitHubRestClient {
             .await
     }
 
-    async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState> {
-        if self
-            .pr_has_reaction(pr, bot_login, HANDLED_REACTION)
-            .await?
-        {
-            Ok(ReviewState::Handled)
-        } else {
-            Ok(ReviewState::Pending)
-        }
-    }
-
-    async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()> {
-        self.add_pr_reaction(pr, STARTED_REACTION).await
-    }
-
-    async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()> {
-        self.add_pr_reaction(pr, HANDLED_REACTION).await
-    }
-
-    async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()> {
-        let (owner, repo, number) = parse_pull_request_html_url(html_url)?;
-        let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/reactions");
-        self.post_json(
-            &url,
-            &PostReaction {
-                content: HANDLED_REACTION,
-            },
-        )
-        .await
+    async fn has_legacy_review(&self, pr: &PullRequest, bot_login: &str) -> Result<bool> {
+        let reactions_url = format!(
+            "https://api.github.com/repos/{}/{}/issues/{}/reactions",
+            pr.owner, pr.repo, pr.number
+        );
+        self.reactions_include(&reactions_url, bot_login, HANDLED_REACTION)
+            .await
     }
 
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
@@ -819,25 +796,18 @@ mod tests {
     fn public_author_discovery_requires_explicitly_public_base_repository() {
         for visibility in [None, Some(ApiRepoVisibility::NonPublic)] {
             assert!(
-                GitHubRestClient::public_pull_request_from_search_item(
-                    api_pull_request_search_item(),
-                    &api_repo(visibility)
-                )
-                .unwrap()
-                .is_none()
+                public_pull_request_url(api_pull_request_search_item(), &api_repo(visibility))
+                    .unwrap()
+                    .is_none()
             );
         }
 
         let public_repo = api_repo(Some(ApiRepoVisibility::Public));
         assert_eq!(
-            GitHubRestClient::public_pull_request_from_search_item(
-                api_pull_request_search_item(),
-                &public_repo
-            )
-            .unwrap()
-            .unwrap()
-            .html_url,
-            "https://github.com/o/r/pull/1"
+            public_pull_request_url(api_pull_request_search_item(), &public_repo)
+                .unwrap()
+                .as_deref(),
+            Some("https://api.github.com/repos/o/r/pulls/1")
         );
     }
 
@@ -921,6 +891,7 @@ mod tests {
       "html_url": "https://github.com/orgs/Some-Org/teams/eng-infra"
     }
   ],
+  "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "base": {
     "repo": {
       "name": "maid",
@@ -939,6 +910,7 @@ mod tests {
   "user": { "login": "octocat" },
   "created_at": "2026-10-21T18:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
+  "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "base": {
     "repo": {
       "name": "maid",
@@ -958,6 +930,7 @@ mod tests {
   "created_at": "2026-10-21T18:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
   "requested_teams": null,
+  "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "base": {
     "repo": {
       "name": "maid",
@@ -986,6 +959,7 @@ mod tests {
       "html_url": "https://github.com/orgs/Some-Org/teams/docs"
     }
   ],
+  "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "base": {
     "repo": {
       "name": "maid",
@@ -1143,6 +1117,7 @@ impl GitHubRestClient {
             api_url: pr.url,
             html_url: pr.html_url,
             clone_url: pr.base.repo.clone_url,
+            head: CommitSha::parse(&pr.head.sha)?,
         };
         let created_at = timestamp_from_api(&pr.created_at);
         let updated_at = timestamp_from_api(&pr.updated_at);
@@ -1160,39 +1135,6 @@ impl GitHubRestClient {
             updated_at,
             pull_request,
         })
-    }
-
-    fn public_pull_request_from_search_item(
-        item: ApiIssue,
-        repo: &ApiRepo,
-    ) -> Result<Option<PullRequest>> {
-        if repo.visibility != Some(ApiRepoVisibility::Public) {
-            return Ok(None);
-        }
-
-        let owner = repo
-            .owner
-            .as_ref()
-            .ok_or_else(|| anyhow!("pull request base repo has no owner"))?;
-        Ok(Some(PullRequest {
-            owner: owner.login.clone(),
-            repo: repo.name.clone(),
-            number: item
-                .number
-                .ok_or_else(|| anyhow!("pull request search result has no number"))?,
-            author: item
-                .user
-                .ok_or_else(|| anyhow!("pull request search result has no author"))?
-                .login,
-            api_url: item
-                .pull_request
-                .ok_or_else(|| anyhow!("pull request search result has no pull request URL"))?
-                .url,
-            html_url: item
-                .html_url
-                .ok_or_else(|| anyhow!("pull request search result has no HTML URL"))?,
-            clone_url: repo.clone_url.clone(),
-        }))
     }
 
     async fn issue_from_api(&self, issue: ApiIssue) -> Result<Issue> {
@@ -1248,28 +1190,6 @@ impl GitHubRestClient {
         self.post_json(&url, &PostReaction { content }).await
     }
 
-    async fn pr_has_reaction(
-        &self,
-        pr: &PullRequest,
-        bot_login: &str,
-        content: &str,
-    ) -> Result<bool> {
-        self.reactions_include(&self.pr_reactions_url(pr), bot_login, content)
-            .await
-    }
-
-    async fn add_pr_reaction(&self, pr: &PullRequest, content: &str) -> Result<()> {
-        self.post_json(&self.pr_reactions_url(pr), &PostReaction { content })
-            .await
-    }
-
-    fn pr_reactions_url(&self, pr: &PullRequest) -> String {
-        format!(
-            "https://api.github.com/repos/{}/{}/issues/{}/reactions",
-            pr.owner, pr.repo, pr.number
-        )
-    }
-
     async fn reactions_include(
         &self,
         reactions_url: &str,
@@ -1293,6 +1213,19 @@ impl GitHubRestClient {
 
         Ok(false)
     }
+}
+
+/// The pull request API URL of a search hit whose base repository is public.
+fn public_pull_request_url(item: ApiIssue, repo: &ApiRepo) -> Result<Option<String>> {
+    if repo.visibility != Some(ApiRepoVisibility::Public) {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        item.pull_request
+            .ok_or_else(|| anyhow!("pull request search result has no pull request URL"))?
+            .url,
+    ))
 }
 
 fn reaction_page_url(reactions_url: &str, page: u64) -> String {
@@ -1388,35 +1321,6 @@ fn comment_mention(comment: ApiComment, target: &WorkTarget) -> CommentMention {
     }
 }
 
-fn parse_pull_request_html_url(html_url: &str) -> Result<(&str, &str, u64)> {
-    let Some(path) = html_url.strip_prefix("https://github.com/") else {
-        bail!("pull request URL must start with https://github.com/: {html_url}");
-    };
-    let mut parts = path.split('/');
-    let owner = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .ok_or_else(|| anyhow!("pull request URL is missing owner: {html_url}"))?;
-    let repo = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .ok_or_else(|| anyhow!("pull request URL is missing repo: {html_url}"))?;
-    match parts.next() {
-        Some("pull") => {}
-        _ => bail!("pull request URL must contain /pull/: {html_url}"),
-    }
-    let number = parts
-        .next()
-        .ok_or_else(|| anyhow!("pull request URL is missing number: {html_url}"))?
-        .parse()
-        .with_context(|| format!("pull request URL has invalid number: {html_url}"))?;
-    if parts.next().is_some() {
-        bail!("pull request URL has unexpected path after number: {html_url}");
-    }
-
-    Ok((owner, repo, number))
-}
-
 #[derive(Debug, Deserialize)]
 struct ApiNotification {
     id: String,
@@ -1488,7 +1392,13 @@ struct ApiPullRequest {
     updated_at: String,
     #[serde(default)]
     requested_teams: Option<Vec<ApiRequestedTeam>>,
+    head: ApiCommitRef,
     base: ApiPullRequestBase,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCommitRef {
+    sha: String,
 }
 
 #[derive(Debug, Deserialize)]

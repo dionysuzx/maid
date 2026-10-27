@@ -1,4 +1,5 @@
 use crate::{
+    auto_review::ReviewCadence,
     domain::{CodexPromptTemplates, RepoSlug, TeamSlug},
     github::{
         DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
@@ -23,11 +24,13 @@ pub struct Config {
     pub auto_review_public_accounts: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
     pub auto_review_teams: Vec<TeamSlug>,
+    pub review_cadence: ReviewCadence,
     pub git_dir: PathBuf,
     pub daemon_pid_path: PathBuf,
     pub task_start_ledger_path: PathBuf,
     pub pending_handled_marker_ledger_path: PathBuf,
     pub observed_notification_ledger_path: PathBuf,
+    pub reviewed_head_ledger_path: PathBuf,
     pub task_limit_per_24h: Option<usize>,
     pub max_concurrent_requests: usize,
     pub github_api_requests_per_hour: GitHubApiRequestRate,
@@ -73,6 +76,8 @@ impl Config {
         )?;
         let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
         let auto_review_teams = optional_teams(file.auto_review_teams, "auto_review_teams")?;
+        let review_cadence =
+            ReviewCadence::from_continuous_review(file.continuous_review.unwrap_or(false));
         let git_dir = non_empty(file.git_dir)
             .map(|path| expand_home(&path))
             .transpose()?
@@ -126,11 +131,13 @@ impl Config {
             auto_review_public_accounts,
             auto_review_repos,
             auto_review_teams,
+            review_cadence,
             git_dir,
             daemon_pid_path: maid_home.join("maid.pid"),
             task_start_ledger_path: maid_home.join("task-starts.json"),
             pending_handled_marker_ledger_path: maid_home.join("pending-handled-markers.json"),
             observed_notification_ledger_path: maid_home.join("observed-notifications.json"),
+            reviewed_head_ledger_path: maid_home.join("reviewed-heads.json"),
             task_limit_per_24h,
             max_concurrent_requests,
             github_api_requests_per_hour,
@@ -153,6 +160,7 @@ struct ConfigFile {
     auto_review_public_accounts: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
     auto_review_teams: Option<Vec<String>>,
+    continuous_review: Option<bool>,
     git_dir: Option<String>,
     task_limit_per_24h: Option<usize>,
     max_concurrent_requests: Option<usize>,
@@ -385,6 +393,7 @@ auto_review_accounts = ["dionysuzx"]
 auto_review_public_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
 auto_review_teams = ["Some-Org/eng-infra"]
+continuous_review = true
 git_dir = "~/.maid/git"
 task_limit_per_24h = 5
 max_concurrent_requests = 3
@@ -424,6 +433,7 @@ operator_mention = "operator {{{{request_text}}}}"
             config.auto_review_teams,
             Some(vec!["Some-Org/eng-infra".to_string()])
         );
+        assert_eq!(config.continuous_review, Some(true));
         assert_eq!(config.git_dir.as_deref(), Some("~/.maid/git"));
         assert_eq!(config.task_limit_per_24h, Some(5));
         assert_eq!(config.max_concurrent_requests, Some(3));

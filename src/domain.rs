@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const OPERATOR_TRIGGER: &str = "/operate";
@@ -146,6 +147,46 @@ pub struct OpenPullRequest {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+/// A full, lowercase git commit SHA.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct CommitSha(String);
+
+impl CommitSha {
+    pub fn parse(value: &str) -> Result<Self> {
+        let valid = value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if valid {
+            Ok(Self(value.to_string()))
+        } else {
+            Err(anyhow!("invalid commit SHA: {value:?}"))
+        }
+    }
+}
+
+impl TryFrom<String> for CommitSha {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        Self::parse(&value)
+    }
+}
+
+impl From<CommitSha> for String {
+    fn from(sha: CommitSha) -> Self {
+        sha.0
+    }
+}
+
+impl fmt::Display for CommitSha {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// An open pull request as GitHub reported it, including the commit at its head.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PullRequest {
     pub owner: String,
@@ -155,6 +196,7 @@ pub struct PullRequest {
     pub api_url: String,
     pub html_url: String,
     pub clone_url: String,
+    pub head: CommitSha,
 }
 
 impl PullRequest {
@@ -236,7 +278,8 @@ impl WorkTarget {
 
     pub fn fetch_ref(&self) -> String {
         match self {
-            Self::PullRequest(pr) => format!("pull/{}/head", pr.number),
+            // The listed head, not pull/N/head, so a later push cannot change what is reviewed.
+            Self::PullRequest(pr) => pr.head.to_string(),
             Self::Issue(issue) => issue.default_branch.clone(),
         }
     }

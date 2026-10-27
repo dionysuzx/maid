@@ -8,6 +8,7 @@ use maid::{
     maid::Maid,
     observed_notification::FileObservedNotificationStore,
     polling_metrics::{PollingMetrics, PollingMetricsEndpoint},
+    reviewed_head::FileReviewedHeadStore,
     task_limit::FileTaskStartRecorder,
     worktree::GitWorktrees,
 };
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
     .with_public_auto_review_accounts(config.auto_review_public_accounts.clone())
     .with_auto_review_teams(config.auto_review_teams.clone())
     .with_team_review_window_hours(config.github_notification_window.as_hours())
+    .with_review_cadence(config.review_cadence)
     .with_task_start_recorder(FileTaskStartRecorder::new(
         config.task_limit_per_24h,
         config.task_start_ledger_path.clone(),
@@ -58,6 +60,9 @@ async fn main() -> Result<()> {
     ))
     .with_observed_notification_store(FileObservedNotificationStore::new(
         config.observed_notification_ledger_path.clone(),
+    ))
+    .with_reviewed_head_store(FileReviewedHeadStore::new(
+        config.reviewed_head_ledger_path.clone(),
     ))
     .into_concurrent(config.max_concurrent_requests);
 
@@ -91,6 +96,7 @@ async fn main() -> Result<()> {
         task_start_ledger = %config.task_start_ledger_path.display(),
         pending_handled_marker_ledger = %config.pending_handled_marker_ledger_path.display(),
         observed_notification_ledger = %config.observed_notification_ledger_path.display(),
+        reviewed_head_ledger = %config.reviewed_head_ledger_path.display(),
         github_api_requests_per_hour = config.github_api_requests_per_hour.requests_per_hour(),
         github_notification_window_hours = config.github_notification_window.as_hours(),
         task_limit_per_24h = %task_limit_per_24h,
@@ -100,6 +106,7 @@ async fn main() -> Result<()> {
         auto_review_public_accounts = config.auto_review_public_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),
         auto_review_teams = config.auto_review_teams.len(),
+        review_cadence = ?config.review_cadence,
         metrics_bind_address = %config.metrics_bind_address,
         "maid started"
     );

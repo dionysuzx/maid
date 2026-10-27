@@ -229,7 +229,7 @@ fn stable_hash(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Issue, PullRequest};
+    use crate::domain::{CommitSha, Issue, PullRequest};
     use std::process::Command as StdCommand;
 
     fn pr(owner: &str, repo: &str) -> PullRequest {
@@ -241,6 +241,7 @@ mod tests {
             api_url: "https://api.github.com/repos/o/r/pulls/46".to_string(),
             html_url: "https://github.com/o/r/pull/46".to_string(),
             clone_url: "https://github.com/o/r.git".to_string(),
+            head: CommitSha::parse(&"a".repeat(40)).unwrap(),
         }
     }
 
@@ -276,7 +277,7 @@ mod tests {
         }
     }
 
-    fn run_git(cwd: &Path, args: &[&str]) {
+    fn run_git(cwd: &Path, args: &[&str]) -> String {
         let output = StdCommand::new("git")
             .current_dir(cwd)
             .args(args)
@@ -288,6 +289,7 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     #[test]
@@ -336,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepares_and_cleans_up_distinct_git_worktrees_from_bare_repo() {
+    async fn prepares_and_cleans_up_distinct_git_worktrees_at_the_listed_head() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -346,11 +348,15 @@ mod tests {
         std::fs::write(source.join("file.txt"), "hello\n").unwrap();
         run_git(&source, &["add", "file.txt"]);
         run_git(&source, &["commit", "-m", "initial"]);
+        let listed_head = CommitSha::parse(&run_git(&source, &["rev-parse", "HEAD"])).unwrap();
+        std::fs::write(source.join("file.txt"), "pushed after listing\n").unwrap();
+        run_git(&source, &["commit", "-am", "pushed after listing"]);
         run_git(&source, &["update-ref", "refs/pull/46/head", "HEAD"]);
 
         let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
         let pr = WorkTarget::PullRequest(PullRequest {
             clone_url: source.to_string_lossy().to_string(),
+            head: listed_head,
             ..pr("o", "r")
         });
 
