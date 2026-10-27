@@ -2,9 +2,9 @@
 //!
 //! The types match `docs/continuous-review-design.md`. The bodies are the
 //! naive stand-in the invariant tests reject: a posted head is still started,
-//! checkout follows the moving PR ref, a queued worker report is not applied
-//! before the next admit, covered heads take a slot, the poll awaits checkout
-//! and aborts the batch on one error, paging ignores the flag, drain does not
+//! checkout follows the moving PR ref, a queued result is not applied before
+//! the next admit, covered heads take a slot, the poll awaits checkout and
+//! aborts the batch on one error, paging ignores the flag, drain does not
 //! wait, and every listed author is in scope. Replacing these bodies is the
 //! implementation. Weakening the tests is not.
 
@@ -68,7 +68,7 @@ pub enum ListSource {
     PublicAuthor { login: String },
 }
 
-/// Scope inputs. `authorize` is the only reader.
+/// Scope inputs for `in_scope`. The naive poll does not read them.
 #[derive(Clone, Debug)]
 pub struct AutoReviewPolicy {
     pub bot_login: String,
@@ -78,109 +78,18 @@ pub struct AutoReviewPolicy {
     pub team_window: ChronoDuration,
 }
 
-/// In-scope head. Only `authorize` constructs it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthorizedHead {
-    sha: HeadSha,
-    pr: PullRequest,
-    author: String,
-}
-
-impl AuthorizedHead {
-    pub fn sha(&self) -> &HeadSha {
-        &self.sha
-    }
-
-    pub fn html_url(&self) -> &str {
-        &self.pr.html_url
-    }
-
-    fn pull_number(&self) -> u64 {
-        self.pr.number
-    }
-}
-
-/// Naive: every row is in scope, so an outsider still becomes a head.
-pub fn authorize(
-    row: ListedPull,
-    policy: &AutoReviewPolicy,
-    now: DateTime<Utc>,
-) -> Option<AuthorizedHead> {
-    let _ = (policy, now);
-    let author = row.pr.author.clone();
-    Some(AuthorizedHead {
-        sha: row.head,
-        pr: row.pr,
-        author,
-    })
-}
-
-/// Parsed from `continuous_review` at process start. The owner never sees the bool.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContinuousReview {
-    Off,
-    On,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PageRequest {
-    First,
-    After(PageCursor),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PageCursor {
-    token: String,
-}
-
-impl PageCursor {
-    pub fn new(token: impl Into<String>) -> Self {
-        Self {
-            token: token.into(),
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.token
-    }
-}
-
-/// `next` has no getter. `walk_pages` is the only reader.
-pub struct Page<T> {
-    items: Vec<T>,
-    next: Option<PageCursor>,
-}
-
-impl<T> Page<T> {
-    pub fn done(items: Vec<T>) -> Self {
-        Self { items, next: None }
-    }
-
-    pub fn more(items: Vec<T>, next: PageCursor) -> Self {
-        Self {
-            items,
-            next: Some(next),
-        }
-    }
-
-    pub fn into_items(self) -> Vec<T> {
-        self.items
-    }
-}
-
-/// Naive: `Off` and `On` both fetch `First` and drop the cursor.
-pub async fn walk_pages<T, F, Fut>(
-    mode: ContinuousReview,
-    stop: &impl Fn() -> bool,
-    mut fetch: F,
-) -> Result<Vec<T>>
+/// Naive: `continuous` and `page_size` are ignored. Only page 1 is fetched.
+///
+/// The real function fetches page 1, and when `continuous` is set keeps
+/// fetching until a page is shorter than `page_size`. `page_size` is the
+/// `per_page` the caller already sent (50 for pulls, 100 for search).
+pub async fn pages<T, F, Fut>(continuous: bool, page_size: usize, mut fetch: F) -> Result<Vec<T>>
 where
-    F: FnMut(PageRequest) -> Fut,
-    Fut: Future<Output = Result<Page<T>>>,
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<Vec<T>>>,
 {
-    let page = fetch(PageRequest::First).await?;
-    let _ = (mode, page.next.as_ref(), stop());
-    Ok(page.into_items())
+    let _ = (continuous, page_size);
+    fetch(1).await
 }
 
 /// Commit is the selected object. Named is a moving ref.
@@ -221,15 +130,11 @@ impl MentionKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FlightId(u64);
-
-/// A worker names the flight the owner started. It cannot name a SHA.
-/// The naive owner never reads these values; applying them is the implementation.
+/// The owner already knows which SHA it started. The naive owner never reads these.
 #[allow(dead_code)]
 enum WorkerReport {
-    Posted(FlightId),
-    Failed(FlightId),
+    Posted,
+    Failed,
 }
 
 /// Not `Clone`. The poll task is the only holder of `&mut Reviews`.
@@ -238,7 +143,6 @@ pub struct Reviews<C, X> {
     path: PathBuf,
     max_concurrent_requests: usize,
     in_flight: usize,
-    next_flight: u64,
     preparer: C,
     coder: X,
     reports_tx: mpsc::UnboundedSender<WorkerReport>,
@@ -268,7 +172,6 @@ where
             path: path.into(),
             max_concurrent_requests,
             in_flight: 0,
-            next_flight: 1,
             preparer,
             coder,
             reports_tx,
@@ -278,15 +181,14 @@ where
         })
     }
 
-    /// Naive: ignore the posted-head file and any report already queued,
-    /// take a slot, and check out `pull/N/head` rather than the selected SHA.
-    pub fn submit_head(&mut self, head: AuthorizedHead) -> SubmitOutcome {
+    /// Naive: ignore the posted-head file and any result already queued,
+    /// take a slot, and check out `pull/N/head` rather than `row.head`.
+    pub fn submit_head(&mut self, row: ListedPull) -> SubmitOutcome {
         let _queued = self.reports_queued.load(Ordering::SeqCst);
+        let _pin = &row.head;
         self.in_flight += 1;
-        let flight = FlightId(self.next_flight);
-        self.next_flight += 1;
-        let rev = CheckoutRev::Named(format!("pull/{}/head", head.pull_number()));
-        self.launch(rev, flight);
+        let rev = CheckoutRev::Named(format!("pull/{}/head", row.pr.number));
+        self.launch(rev);
         SubmitOutcome::Started
     }
 
@@ -346,7 +248,7 @@ where
         self.reports_queued.load(Ordering::SeqCst)
     }
 
-    fn launch(&self, rev: CheckoutRev, flight: FlightId) {
+    fn launch(&self, rev: CheckoutRev) {
         let preparer = self.preparer.clone();
         let coder = self.coder.clone();
         let tx = self.reports_tx.clone();
@@ -356,18 +258,18 @@ where
             let prepared = match preparer.checkout(&rev).await {
                 Ok(sha) => sha,
                 Err(_) => {
-                    let _ = tx.send(WorkerReport::Failed(flight));
+                    let _ = tx.send(WorkerReport::Failed);
                     queued.fetch_add(1, Ordering::SeqCst);
                     return;
                 }
             };
             if coder.run().await.is_err() {
-                let _ = tx.send(WorkerReport::Failed(flight));
+                let _ = tx.send(WorkerReport::Failed);
                 queued.fetch_add(1, Ordering::SeqCst);
                 return;
             }
             let _ = remember_checked_out(&path, &prepared);
-            let _ = tx.send(WorkerReport::Posted(flight));
+            let _ = tx.send(WorkerReport::Posted);
             queued.fetch_add(1, Ordering::SeqCst);
         });
     }
@@ -524,14 +426,8 @@ mod tests {
         std::fs::write(&path, format!(r#"{{"heads":["{}"]}}"#, sha_a.as_str())).unwrap();
         let edge = Edge::new(sha_a.clone());
         let mut reviews = open_reviews(&path, 1, &edge);
-        let head = authorize(
-            listed("dionysuzx", sha_a, 1, ListSource::Repository),
-            &policy(),
-            now(),
-        )
-        .unwrap();
 
-        let outcome = reviews.submit_head(head);
+        let outcome = reviews.submit_head(listed("dionysuzx", sha_a, 1, ListSource::Repository));
 
         assert_eq!(
             (outcome, edge.runs()),
@@ -549,14 +445,16 @@ mod tests {
         let edge = Edge::new(sha_a.clone());
         edge.set_pr_head(sha_b);
         let mut reviews = open_reviews(&path, 1, &edge);
-        let head = authorize(
-            listed("dionysuzx", sha_a.clone(), 1, ListSource::Repository),
-            &policy(),
-            now(),
-        )
-        .unwrap();
 
-        assert_eq!(reviews.submit_head(head), SubmitOutcome::Started);
+        assert_eq!(
+            reviews.submit_head(listed(
+                "dionysuzx",
+                sha_a.clone(),
+                1,
+                ListSource::Repository
+            )),
+            SubmitOutcome::Started
+        );
         wait_for_queue(&reviews).await;
         reviews.drain().await;
 
@@ -577,16 +475,11 @@ mod tests {
         let sha_a = sha('a');
         let edge = Edge::new(sha_a.clone());
         let mut reviews = open_reviews(&path, 2, &edge);
-        let head = authorize(
-            listed("dionysuzx", sha_a, 1, ListSource::Repository),
-            &policy(),
-            now(),
-        )
-        .unwrap();
+        let row = listed("dionysuzx", sha_a, 1, ListSource::Repository);
 
-        assert_eq!(reviews.submit_head(head.clone()), SubmitOutcome::Started);
+        assert_eq!(reviews.submit_head(row.clone()), SubmitOutcome::Started);
         wait_for_queue(&reviews).await;
-        let second = reviews.submit_head(head);
+        let second = reviews.submit_head(row);
 
         assert_eq!(
             (second, edge.runs()),
@@ -603,16 +496,10 @@ mod tests {
         std::fs::write(&path, format!(r#"{{"heads":["{}"]}}"#, sha_a.as_str())).unwrap();
         let edge = Edge::new(sha_a.clone());
         let mut reviews = open_reviews(&path, 1, &edge);
-        let head = authorize(
-            listed("dionysuzx", sha_a, 1, ListSource::Repository),
-            &policy(),
-            now(),
-        )
-        .unwrap();
         let observed = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&observed);
 
-        let covered = reviews.submit_head(head);
+        let covered = reviews.submit_head(listed("dionysuzx", sha_a, 1, ListSource::Repository));
         let in_flight_after_covered = reviews.in_flight();
         let mention = reviews
             .with_mention(MentionKey::new("mention-1"), || {
@@ -677,11 +564,11 @@ mod tests {
             },
         )];
 
-        let off_calls = Arc::new(AtomicUsize::new(0));
-        let off = walk(ContinuousReview::Off, &off_calls, &first, &second).await;
+        let off_pages = Arc::new(Mutex::new(Vec::new()));
+        let off = collect(false, &off_pages, &first, &second).await;
         assert_eq!(
-            off_calls.load(Ordering::SeqCst),
-            1,
+            *off_pages.lock().unwrap(),
+            vec![1],
             "I6: Off fetched a later page"
         );
         assert!(
@@ -689,16 +576,15 @@ mod tests {
             "I6: Off returned a head from a later page"
         );
 
-        let on_calls = Arc::new(AtomicUsize::new(0));
-        let on = walk(ContinuousReview::On, &on_calls, &first, &second).await;
-        assert_eq!(
-            on_calls.load(Ordering::SeqCst),
-            2,
+        let on_pages = Arc::new(Mutex::new(Vec::new()));
+        let on = collect(true, &on_pages, &first, &second).await;
+        assert!(
+            on.iter().any(|row| row.head == sha('b')),
             "I6: public-author search did not follow the page switch"
         );
         assert!(
-            on.iter().any(|row| row.head == sha('b')),
-            "I6: public-author search dropped the head from the later page"
+            on_pages.lock().unwrap().contains(&2),
+            "I6: public-author search did not request the later page"
         );
     }
 
@@ -731,14 +617,16 @@ mod tests {
         let edge = Edge::new(sha_a.clone()).block_codex();
         let release = edge.codex_gate();
         let mut reviews = open_reviews(&path, 1, &edge);
-        let head = authorize(
-            listed("dionysuzx", sha_a.clone(), 1, ListSource::Repository),
-            &policy(),
-            now(),
-        )
-        .unwrap();
 
-        assert_eq!(reviews.submit_head(head), SubmitOutcome::Started);
+        assert_eq!(
+            reviews.submit_head(listed(
+                "dionysuzx",
+                sha_a.clone(),
+                1,
+                ListSource::Repository
+            )),
+            SubmitOutcome::Started
+        );
         tokio::spawn(async move {
             tokio::task::yield_now().await;
             release.notify_one();
@@ -760,7 +648,6 @@ mod tests {
         let edge = Edge::new(sha_c.clone());
         let mut reviews = open_reviews(&path, 1, &edge);
         let row = listed("stranger", sha_c, 9, ListSource::Repository);
-        let decision = authorize(row.clone(), &policy(), now());
 
         reviews
             .poll_listed(vec![row], &policy(), now())
@@ -768,38 +655,32 @@ mod tests {
             .expect("I7 owns candidate errors; an out-of-scope row is not one");
 
         assert_eq!(
-            (
-                decision.is_none(),
-                edge.runs(),
-                posted_heads(&path).unwrap().is_empty()
-            ),
-            (true, 0, true),
-            "I9: an out-of-scope author was authorized, reviewed, or recorded"
+            (edge.runs(), posted_heads(&path).unwrap().is_empty()),
+            (0, true),
+            "I9: an out-of-scope author was reviewed or recorded"
         );
     }
 
-    async fn walk(
-        mode: ContinuousReview,
-        calls: &Arc<AtomicUsize>,
+    async fn collect(
+        continuous: bool,
+        seen: &Arc<Mutex<Vec<u32>>>,
         first: &[ListedPull],
         second: &[ListedPull],
     ) -> Vec<ListedPull> {
-        let calls = Arc::clone(calls);
+        let seen = Arc::clone(seen);
         let first = first.to_vec();
         let second = second.to_vec();
-        walk_pages(mode, &|| false, move |request| {
-            let calls = Arc::clone(&calls);
+        pages(continuous, 1, move |page| {
+            let seen = Arc::clone(&seen);
             let first = first.clone();
             let second = second.clone();
             async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                match request {
-                    PageRequest::First => Ok(Page::more(first, PageCursor::new("2"))),
-                    PageRequest::After(cursor) => {
-                        assert_eq!(cursor.as_str(), "2");
-                        Ok(Page::done(second))
-                    }
-                }
+                seen.lock().unwrap().push(page);
+                Ok(match page {
+                    1 => first,
+                    2 => second,
+                    _ => Vec::new(),
+                })
             }
         })
         .await
