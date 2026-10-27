@@ -24,6 +24,24 @@ const HANDLED_REACTION: &str = "+1";
 pub const DEFAULT_GITHUB_API_REQUESTS_PER_HOUR: u32 = 1_200;
 pub const DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS: u32 = 24;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
+
+/// How a request treats GitHub rate limiting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RateLimitPolicy {
+    /// Wait out backoffs and retry, for requests Maid needs.
+    Wait,
+    /// Fail instead of waiting, for cosmetic requests. Backoffs are still recorded.
+    Skip,
+}
+
+impl RateLimitPolicy {
+    fn max_retries(self) -> usize {
+        match self {
+            Self::Wait => MAX_RATE_LIMIT_RETRIES,
+            Self::Skip => 0,
+        }
+    }
+}
 const NOTIFICATION_PAGE_SIZE: usize = 50;
 const SEARCH_PAGE_SIZE: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 1_000;
@@ -135,17 +153,30 @@ impl GitHubRestClient {
     where
         T: for<'de> Deserialize<'de>,
     {
-        self.request(Method::GET, url, Option::<&()>::None, HeaderMap::new())
-            .await?
-            .into_json()
+        self.request(
+            Method::GET,
+            url,
+            Option::<&()>::None,
+            HeaderMap::new(),
+            RateLimitPolicy::Wait,
+        )
+        .await?
+        .into_json()
     }
 
     async fn post_json<T>(&self, url: &str, body: &T) -> Result<()>
     where
         T: Serialize + Sync,
     {
+        self.post_json_with(url, body, RateLimitPolicy::Wait).await
+    }
+
+    async fn post_json_with<T>(&self, url: &str, body: &T, policy: RateLimitPolicy) -> Result<()>
+    where
+        T: Serialize + Sync,
+    {
         let _: serde::de::IgnoredAny = self
-            .request(Method::POST, url, Some(body), HeaderMap::new())
+            .request(Method::POST, url, Some(body), HeaderMap::new(), policy)
             .await?
             .into_json()?;
         Ok(())
@@ -157,14 +188,19 @@ impl GitHubRestClient {
         url: &str,
         body: Option<&B>,
         headers: HeaderMap,
+        policy: RateLimitPolicy,
     ) -> Result<GitHubResponse<T>>
     where
         T: for<'de> Deserialize<'de>,
         B: Serialize + Sync + ?Sized,
     {
         let method_for_error = method.clone();
-        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
-            self.traffic.wait_for_turn().await;
+        let max_retries = policy.max_retries();
+        for attempt in 0..=max_retries {
+            self.traffic
+                .wait_for_turn(policy)
+                .await
+                .with_context(|| format!("{method_for_error} {url} skipped"))?;
 
             let mut request = self
                 .client
@@ -211,9 +247,10 @@ impl GitHubRestClient {
             if let Some(backoff) =
                 RateLimitBackoff::from_response(status, &response_headers, &response_body, attempt)
             {
-                if attempt == MAX_RATE_LIMIT_RETRIES {
+                self.traffic.back_off(backoff.delay).await;
+                if attempt == max_retries {
                     return Err(anyhow!(
-                        "{method_for_error} {url} still rate limited after {MAX_RATE_LIMIT_RETRIES} retries: {response_body}"
+                        "{method_for_error} {url} still rate limited after {max_retries} retries: {response_body}"
                     ));
                 }
 
@@ -225,7 +262,6 @@ impl GitHubRestClient {
                     reason = backoff.reason,
                     "GitHub rate limit reached; backing off"
                 );
-                self.traffic.back_off(backoff.delay).await;
                 continue;
             }
 
@@ -235,7 +271,7 @@ impl GitHubRestClient {
         }
 
         Err(anyhow!(
-            "{method_for_error} {url} still rate limited after {MAX_RATE_LIMIT_RETRIES} retries"
+            "{method_for_error} {url} still rate limited after {max_retries} retries"
         ))
     }
 }
@@ -254,6 +290,7 @@ impl GithubClient for GitHubRestClient {
                     &notification_page_url(&since, page),
                     Option::<&()>::None,
                     HeaderMap::new(),
+                    RateLimitPolicy::Wait,
                 )
                 .await?;
             self.notifications.record_headers(response.headers()).await;
@@ -422,6 +459,22 @@ impl GithubClient for GitHubRestClient {
         self.add_reaction(mention, HANDLED_REACTION).await
     }
 
+    async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/issues/{}/reactions",
+            pr.owner, pr.repo, pr.number
+        );
+        // The reaction is cosmetic, so it must never hold up the poll in a backoff.
+        self.post_json_with(
+            &url,
+            &PostReaction {
+                content: STARTED_REACTION,
+            },
+            RateLimitPolicy::Skip,
+        )
+        .await
+    }
+
     async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()> {
         self.add_reaction_to_api_url(api_url, HANDLED_REACTION)
             .await
@@ -433,7 +486,13 @@ impl GithubClient for GitHubRestClient {
             notification.id
         );
         let _: serde::de::IgnoredAny = self
-            .request(Method::PATCH, &url, Option::<&()>::None, HeaderMap::new())
+            .request(
+                Method::PATCH,
+                &url,
+                Option::<&()>::None,
+                HeaderMap::new(),
+                RateLimitPolicy::Wait,
+            )
             .await?
             .into_json()?;
         Ok(())
@@ -474,17 +533,20 @@ impl GitHubTraffic {
         }
     }
 
-    async fn wait_for_turn(&self) {
+    async fn wait_for_turn(&self, policy: RateLimitPolicy) -> Result<()> {
         loop {
             let wait = self.backoff_delay().await;
             if !wait.is_zero() {
+                if policy == RateLimitPolicy::Skip {
+                    bail!("GitHub rate limit backoff is active");
+                }
                 tokio::time::sleep(wait).await;
                 continue;
             }
 
             let wait = self.request_slot_delay().await;
             if wait.is_zero() {
-                return;
+                return Ok(());
             }
             tokio::time::sleep(wait).await;
         }
@@ -662,6 +724,45 @@ mod tests {
     #[test]
     fn request_rate_rejects_zero() {
         assert!(GitHubApiRequestRate::per_hour(0).is_err());
+    }
+
+    #[tokio::test]
+    async fn skip_policy_records_a_backoff_without_waiting_for_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/reactions", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = requests.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let body = "You have exceeded a secondary rate limit.";
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let client = GitHubRestClient::new("token");
+
+        let reaction = PostReaction { content: "eyes" };
+
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.post_json_with(&url, &reaction, RateLimitPolicy::Skip),
+            )
+            .await
+            .expect("a skipped request must not wait out a backoff");
+            assert!(result.is_err());
+        }
+
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!client.traffic.backoff_delay().await.is_zero());
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[async_trait]
 pub trait GithubClient: Send + Sync {
@@ -46,6 +46,8 @@ pub trait GithubClient: Send + Sync {
     -> Result<ReviewState>;
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()>;
+    /// Tells the author Maid is reviewing. Best effort; reviewed-heads.json is the record.
+    async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()>;
     async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
 }
@@ -880,6 +882,13 @@ where
         pr: PullRequest,
         task: CodexTask,
     ) -> Result<TaskStartOutcome> {
+        if let Err(err) = self.github.mark_pr_started(&pr).await {
+            warn!(
+                pr = %pr.html_url,
+                error = ?err,
+                "failed to mark auto-review pull request started"
+            );
+        }
         info!(
             pr = %pr.html_url,
             head = %pr.head,
@@ -1382,6 +1391,7 @@ mod tests {
         mentions_calls: Arc<StdMutex<usize>>,
         post_error: Arc<StdMutex<Option<String>>>,
         handled_error: Arc<StdMutex<Option<String>>>,
+        pr_started_error: Arc<StdMutex<Option<String>>>,
         started_mentions: Arc<StdMutex<Vec<String>>>,
         handled_mentions: Arc<StdMutex<HashSet<String>>>,
         stale_pending_mentions: Arc<StdMutex<HashSet<String>>>,
@@ -1465,6 +1475,14 @@ mod tests {
         async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
             self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
                 .await
+        }
+
+        async fn mark_pr_started(&self, _pr: &PullRequest) -> Result<()> {
+            self.events.lock().unwrap().push("start_pr".to_string());
+            if let Some(message) = self.pr_started_error.lock().unwrap().take() {
+                return Err(anyhow!(message));
+            }
+            Ok(())
         }
 
         async fn mention_state(
@@ -2074,7 +2092,7 @@ mod tests {
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
         assert!(github.marks.lock().unwrap().is_empty());
-        assert_eq!(*github.events.lock().unwrap(), vec!["post"]);
+        assert_eq!(*github.events.lock().unwrap(), vec!["start_pr", "post"]);
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
@@ -2721,6 +2739,21 @@ mod tests {
         assert!(github.marks.lock().unwrap().is_empty());
         assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reviews_even_when_the_started_reaction_fails() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        *github.pr_started_error.lock().unwrap() = Some("reaction failed".to_string());
+
+        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
     }
 
     #[tokio::test]
