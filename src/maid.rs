@@ -2832,36 +2832,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_opened_pr_with_durable_handled_marker_after_restart() {
-        let github = FakeGithub::default();
-        *github.pull_requests.lock().unwrap() = vec![pr()];
-        github
-            .handled_prs
-            .lock()
-            .unwrap()
-            .insert("https://github.com/o/r/pull/1".to_string());
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/unused"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), worktrees.clone(), codex.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.seen, 1);
-        assert_eq!(report.skipped, 1);
-        assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.marks.lock().unwrap().is_empty());
-        assert!(github.events.lock().unwrap().is_empty());
-        assert!(worktrees.calls.lock().unwrap().is_empty());
-        assert!(codex.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn ignores_self_authored_opened_prs() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr_with_author("maid-bot")];

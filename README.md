@@ -50,7 +50,8 @@ repositories. Repository-scoped review remains available through
 
 Set `continuous_review` to keep listing tracked open pull requests past the
 first page. Either way, Maid reviews the current head once: a head that already
-has a posted Codex review is left alone. `task_limit_per_24h`,
+has a posted Codex review is left alone. The first poll records each current
+head by reviewing it once. `task_limit_per_24h`,
 `max_concurrent_requests`, and `github_api_requests_per_hour` are the only
 limits. A review that posts and then fails to record that head can run once
 more after a restart.
