@@ -25,8 +25,8 @@ pub const DEFAULT_GITHUB_API_REQUESTS_PER_HOUR: u32 = 1_200;
 pub const DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS: u32 = 24;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const NOTIFICATION_PAGE_SIZE: usize = 50;
-const SEARCH_PAGE_SIZE: usize = 100;
-const MAX_SEARCH_RESULTS: usize = 1_000;
+pub(crate) const SEARCH_PAGE_SIZE: usize = 100;
+pub(crate) const PULL_PAGE_SIZE: usize = 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GitHubNotificationWindow {
@@ -327,62 +327,63 @@ impl GithubClient for GitHubRestClient {
         &self,
         repo: &RepoSlug,
         order: OpenPullRequestOrder,
+        page: u32,
     ) -> Result<Vec<OpenPullRequest>> {
         let pull_requests = self
-            .get::<Vec<ApiPullRequest>>(&open_pull_requests_url(repo, order))
+            .get::<Vec<ApiPullRequest>>(&open_pull_requests_url(repo, order, page))
             .await?;
-        pull_requests
-            .into_iter()
-            .map(Self::open_pull_request_from_api)
-            .collect()
+        let mut rows = Vec::new();
+        for pull_request in pull_requests {
+            match Self::open_pull_request_from_api(pull_request) {
+                Ok(row) => rows.push(row),
+                Err(err) => warn!(error = %err, "dropping pull request with no head"),
+            }
+        }
+        Ok(rows)
     }
 
-    async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>> {
+    async fn open_public_pull_requests_by_author(
+        &self,
+        author: &str,
+        page: u32,
+    ) -> Result<Vec<PullRequest>> {
         let mut pull_requests = Vec::new();
         let mut repositories = HashMap::new();
+        let search = self
+            .get::<ApiIssueSearch>(&public_pull_request_search_url(author, page)?)
+            .await?;
+        if search.incomplete_results {
+            warn!(
+                author,
+                page, "GitHub returned incomplete public pull request search results"
+            );
+        }
 
-        for page in 1..=(MAX_SEARCH_RESULTS / SEARCH_PAGE_SIZE) {
-            let search = self
-                .get::<ApiIssueSearch>(&public_pull_request_search_url(author, page)?)
-                .await?;
-            if search.incomplete_results {
-                warn!(
-                    author,
-                    page, "GitHub returned incomplete public pull request search results"
-                );
+        for item in search.items {
+            let Some(repository_url) = item.repository_url.as_deref() else {
+                continue;
+            };
+            if !repositories.contains_key(repository_url) {
+                let repository = self.get::<ApiRepo>(repository_url).await?;
+                repositories.insert(repository_url.to_string(), repository);
             }
-            if page == 1 && search.total_count > MAX_SEARCH_RESULTS {
-                warn!(
-                    author,
-                    total_count = search.total_count,
-                    max_results = MAX_SEARCH_RESULTS,
-                    "GitHub capped public pull request search results"
-                );
-            }
-            let done = search.items.len() < SEARCH_PAGE_SIZE;
-
-            for item in search.items {
-                let Some(repository_url) = item.repository_url.as_deref() else {
-                    continue;
-                };
-                if !repositories.contains_key(repository_url) {
-                    let repository = self.get::<ApiRepo>(repository_url).await?;
-                    repositories.insert(repository_url.to_string(), repository);
-                }
-                let repository = &repositories[repository_url];
-                if let Some(pull_request) =
-                    Self::public_pull_request_from_search_item(item, repository)?
-                {
-                    pull_requests.push(pull_request);
-                }
-            }
-
-            if done {
-                break;
+            let repository = &repositories[repository_url];
+            if let Some(pull_request) =
+                Self::public_pull_request_from_search_item(item, repository)?
+            {
+                pull_requests.push(pull_request);
             }
         }
 
         Ok(pull_requests)
+    }
+
+    async fn pull_request_head(&self, pr: &PullRequest) -> Result<crate::review::HeadSha> {
+        let pull_request = self.get::<ApiPullRequest>(&pr.api_url).await?;
+        let sha = pull_request
+            .head
+            .ok_or_else(|| anyhow!("pull request {} has no head", pr.html_url))?;
+        crate::review::HeadSha::parse(&sha.sha)
     }
 
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
@@ -426,37 +427,6 @@ impl GithubClient for GitHubRestClient {
     async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()> {
         self.add_reaction_to_api_url(api_url, HANDLED_REACTION)
             .await
-    }
-
-    async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState> {
-        if self
-            .pr_has_reaction(pr, bot_login, HANDLED_REACTION)
-            .await?
-        {
-            Ok(ReviewState::Handled)
-        } else {
-            Ok(ReviewState::Pending)
-        }
-    }
-
-    async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()> {
-        self.add_pr_reaction(pr, STARTED_REACTION).await
-    }
-
-    async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()> {
-        self.add_pr_reaction(pr, HANDLED_REACTION).await
-    }
-
-    async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()> {
-        let (owner, repo, number) = parse_pull_request_html_url(html_url)?;
-        let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/reactions");
-        self.post_json(
-            &url,
-            &PostReaction {
-                content: HANDLED_REACTION,
-            },
-        )
-        .await
     }
 
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
@@ -728,12 +698,12 @@ mod tests {
         };
 
         assert_eq!(
-            open_pull_requests_url(&repo, OpenPullRequestOrder::NewestCreated),
-            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=created&direction=desc&per_page=50"
+            open_pull_requests_url(&repo, OpenPullRequestOrder::NewestCreated, 1),
+            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=created&direction=desc&per_page=50&page=1"
         );
         assert_eq!(
-            open_pull_requests_url(&repo, OpenPullRequestOrder::RecentlyUpdated),
-            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=updated&direction=desc&per_page=50"
+            open_pull_requests_url(&repo, OpenPullRequestOrder::RecentlyUpdated, 1),
+            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=updated&direction=desc&per_page=50&page=1"
         );
     }
 
@@ -907,6 +877,7 @@ mod tests {
   "html_url": "https://github.com/some-org/maid/pull/7",
   "number": 7,
   "user": { "login": "octocat" },
+  "head": { "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
   "created_at": "2026-10-01T00:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
   "requested_teams": [
@@ -937,6 +908,7 @@ mod tests {
   "html_url": "https://github.com/some-org/maid/pull/7",
   "number": 7,
   "user": { "login": "octocat" },
+  "head": { "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
   "created_at": "2026-10-21T18:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
   "base": {
@@ -955,6 +927,7 @@ mod tests {
   "html_url": "https://github.com/some-org/maid/pull/7",
   "number": 7,
   "user": { "login": "octocat" },
+  "head": { "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
   "created_at": "2026-10-21T18:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
   "requested_teams": null,
@@ -974,6 +947,7 @@ mod tests {
   "html_url": "https://github.com/some-org/maid/pull/7",
   "number": 7,
   "user": { "login": "octocat" },
+  "head": { "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
   "created_at": "2026-10-01T00:00:00Z",
   "updated_at": "not-a-timestamp",
   "requested_teams": [
@@ -1135,13 +1109,18 @@ impl GitHubRestClient {
             return Err(anyhow!("pull request base repo has no owner"));
         };
 
+        let head = pr
+            .head
+            .as_ref()
+            .ok_or_else(|| anyhow!("pull request {} has no head", pr.html_url))?;
+        let head = crate::review::HeadSha::parse(&head.sha)?;
         let pull_request = PullRequest {
             owner: owner.login,
             repo: pr.base.repo.name,
             number: pr.number,
             author: pr.user.login,
             api_url: pr.url,
-            html_url: pr.html_url,
+            html_url: pr.html_url.clone(),
             clone_url: pr.base.repo.clone_url,
         };
         let created_at = timestamp_from_api(&pr.created_at);
@@ -1158,6 +1137,7 @@ impl GitHubRestClient {
             requested_teams: requested_teams_from_api(pr.requested_teams),
             created_at,
             updated_at,
+            head,
             pull_request,
         })
     }
@@ -1248,28 +1228,6 @@ impl GitHubRestClient {
         self.post_json(&url, &PostReaction { content }).await
     }
 
-    async fn pr_has_reaction(
-        &self,
-        pr: &PullRequest,
-        bot_login: &str,
-        content: &str,
-    ) -> Result<bool> {
-        self.reactions_include(&self.pr_reactions_url(pr), bot_login, content)
-            .await
-    }
-
-    async fn add_pr_reaction(&self, pr: &PullRequest, content: &str) -> Result<()> {
-        self.post_json(&self.pr_reactions_url(pr), &PostReaction { content })
-            .await
-    }
-
-    fn pr_reactions_url(&self, pr: &PullRequest) -> String {
-        format!(
-            "https://api.github.com/repos/{}/{}/issues/{}/reactions",
-            pr.owner, pr.repo, pr.number
-        )
-    }
-
     async fn reactions_include(
         &self,
         reactions_url: &str,
@@ -1299,7 +1257,7 @@ fn reaction_page_url(reactions_url: &str, page: u64) -> String {
     format!("{reactions_url}?per_page=100&page={page}")
 }
 
-fn open_pull_requests_url(repo: &RepoSlug, order: OpenPullRequestOrder) -> String {
+fn open_pull_requests_url(repo: &RepoSlug, order: OpenPullRequestOrder, page: u32) -> String {
     // GitHub defaults sort=updated to ascending, so direction=desc is required
     // for the team-review page to be the most recently updated pull requests.
     let sort = match order {
@@ -1307,7 +1265,7 @@ fn open_pull_requests_url(repo: &RepoSlug, order: OpenPullRequestOrder) -> Strin
         OpenPullRequestOrder::RecentlyUpdated => "updated",
     };
     format!(
-        "https://api.github.com/repos/{}/{}/pulls?state=open&sort={sort}&direction=desc&per_page=50",
+        "https://api.github.com/repos/{}/{}/pulls?state=open&sort={sort}&direction=desc&per_page={PULL_PAGE_SIZE}&page={page}",
         repo.owner, repo.repo
     )
 }
@@ -1352,7 +1310,7 @@ fn notification_page_url(since: &str, page: usize) -> String {
     )
 }
 
-fn public_pull_request_search_url(author: &str, page: usize) -> Result<String> {
+fn public_pull_request_search_url(author: &str, page: u32) -> Result<String> {
     let mut url = Url::parse("https://api.github.com/search/issues")?;
     url.query_pairs_mut()
         .append_pair("q", &format!("is:pr is:open author:{author}"))
@@ -1386,35 +1344,6 @@ fn comment_mention(comment: ApiComment, target: &WorkTarget) -> CommentMention {
         html_url: comment.html_url,
         target: target.clone(),
     }
-}
-
-fn parse_pull_request_html_url(html_url: &str) -> Result<(&str, &str, u64)> {
-    let Some(path) = html_url.strip_prefix("https://github.com/") else {
-        bail!("pull request URL must start with https://github.com/: {html_url}");
-    };
-    let mut parts = path.split('/');
-    let owner = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .ok_or_else(|| anyhow!("pull request URL is missing owner: {html_url}"))?;
-    let repo = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .ok_or_else(|| anyhow!("pull request URL is missing repo: {html_url}"))?;
-    match parts.next() {
-        Some("pull") => {}
-        _ => bail!("pull request URL must contain /pull/: {html_url}"),
-    }
-    let number = parts
-        .next()
-        .ok_or_else(|| anyhow!("pull request URL is missing number: {html_url}"))?
-        .parse()
-        .with_context(|| format!("pull request URL has invalid number: {html_url}"))?;
-    if parts.next().is_some() {
-        bail!("pull request URL has unexpected path after number: {html_url}");
-    }
-
-    Ok((owner, repo, number))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1473,7 +1402,6 @@ struct ApiIssuePullRequest {
 
 #[derive(Debug, Deserialize)]
 struct ApiIssueSearch {
-    total_count: usize,
     incomplete_results: bool,
     items: Vec<ApiIssue>,
 }
@@ -1488,7 +1416,13 @@ struct ApiPullRequest {
     updated_at: String,
     #[serde(default)]
     requested_teams: Option<Vec<ApiRequestedTeam>>,
+    head: Option<ApiPullHead>,
     base: ApiPullRequestBase,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiPullHead {
+    sha: String,
 }
 
 #[derive(Debug, Deserialize)]

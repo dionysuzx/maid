@@ -48,6 +48,11 @@ requests Maid should discover across GitHub. Maid ignores PRs into private base
 repositories. Repository-scoped review remains available through
 `auto_review_repos` and `auto_review_accounts`.
 
+`continuous_review` defaults to false. While it is false, each poll reads the
+first page of repository, team, and public-author pull requests. Set it to
+true to follow later pages until GitHub returns a short page. Reviewed heads
+are recorded in `~/.maid/posted-heads.json`.
+
 For `auto_review_teams`, GitHub moves `updated_at` when a draft is marked
 ready or a reviewer is requested, and also when someone later comments or
 pushes on a pull request that still requests the team. The pull request list

@@ -1,4 +1,4 @@
-use crate::domain::{CommentMention, PullRequest};
+use crate::domain::CommentMention;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,19 +11,12 @@ use std::{
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum PendingHandledMarker {
     Mention { api_url: String },
-    PullRequest { html_url: String },
 }
 
 impl PendingHandledMarker {
     pub fn for_mention(mention: &CommentMention) -> Self {
         Self::Mention {
             api_url: mention.api_url.clone(),
-        }
-    }
-
-    pub fn for_pull_request(pr: &PullRequest) -> Self {
-        Self::PullRequest {
-            html_url: pr.html_url.clone(),
         }
     }
 }
@@ -130,7 +123,6 @@ impl PendingHandledMarkerStore for FilePendingHandledMarkerStore {
 #[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct PendingHandledMarkerLedger {
     mention_api_urls: BTreeSet<String>,
-    pull_request_html_urls: BTreeSet<String>,
 }
 
 impl PendingHandledMarkerLedger {
@@ -148,34 +140,18 @@ impl PendingHandledMarkerLedger {
     }
 
     fn insert(&mut self, marker: &PendingHandledMarker) {
-        match marker {
-            PendingHandledMarker::Mention { api_url } => {
-                self.mention_api_urls.insert(api_url.clone());
-            }
-            PendingHandledMarker::PullRequest { html_url } => {
-                self.pull_request_html_urls.insert(html_url.clone());
-            }
-        }
+        let PendingHandledMarker::Mention { api_url } = marker;
+        self.mention_api_urls.insert(api_url.clone());
     }
 
     fn contains(&self, marker: &PendingHandledMarker) -> bool {
-        match marker {
-            PendingHandledMarker::Mention { api_url } => self.mention_api_urls.contains(api_url),
-            PendingHandledMarker::PullRequest { html_url } => {
-                self.pull_request_html_urls.contains(html_url)
-            }
-        }
+        let PendingHandledMarker::Mention { api_url } = marker;
+        self.mention_api_urls.contains(api_url)
     }
 
     fn remove(&mut self, marker: &PendingHandledMarker) {
-        match marker {
-            PendingHandledMarker::Mention { api_url } => {
-                self.mention_api_urls.remove(api_url);
-            }
-            PendingHandledMarker::PullRequest { html_url } => {
-                self.pull_request_html_urls.remove(html_url);
-            }
-        }
+        let PendingHandledMarker::Mention { api_url } = marker;
+        self.mention_api_urls.remove(api_url);
     }
 
     fn pending(&self) -> Vec<PendingHandledMarker> {
@@ -183,12 +159,6 @@ impl PendingHandledMarkerLedger {
             .iter()
             .cloned()
             .map(|api_url| PendingHandledMarker::Mention { api_url })
-            .chain(
-                self.pull_request_html_urls
-                    .iter()
-                    .cloned()
-                    .map(|html_url| PendingHandledMarker::PullRequest { html_url }),
-            )
             .collect()
     }
 
@@ -227,8 +197,8 @@ mod tests {
     fn file_store_persists_pending_markers() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pending-handled-markers.json");
-        let marker = PendingHandledMarker::PullRequest {
-            html_url: "https://github.com/o/r/pull/1".to_string(),
+        let marker = PendingHandledMarker::Mention {
+            api_url: "https://api.github.com/repos/o/r/issues/comments/1".to_string(),
         };
 
         let store = FilePendingHandledMarkerStore::new(&path);

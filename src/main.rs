@@ -11,7 +11,6 @@ use maid::{
     task_limit::FileTaskStartRecorder,
     worktree::GitWorktrees,
 };
-use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -49,6 +48,7 @@ async fn main() -> Result<()> {
     .with_public_auto_review_accounts(config.auto_review_public_accounts.clone())
     .with_auto_review_teams(config.auto_review_teams.clone())
     .with_team_review_window_hours(config.github_notification_window.as_hours())
+    .with_continuous_review(config.continuous_review)
     .with_task_start_recorder(FileTaskStartRecorder::new(
         config.task_limit_per_24h,
         config.task_start_ledger_path.clone(),
@@ -58,31 +58,40 @@ async fn main() -> Result<()> {
     ))
     .with_observed_notification_store(FileObservedNotificationStore::new(
         config.observed_notification_ledger_path.clone(),
-    ))
-    .into_concurrent(config.max_concurrent_requests);
+    ));
+    maid.use_posted_heads(&config.posted_heads_path)?;
+    let maid = maid.into_concurrent(config.max_concurrent_requests);
 
     let task_limit_per_24h = config
         .task_limit_per_24h
         .map_or_else(|| "none".to_string(), |limit| limit.to_string());
     let poller_metrics = polling_metrics.clone();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let poller = tokio::spawn(async move {
         loop {
-            match maid.run_once().await {
-                Ok(report) => {
-                    poller_metrics.record_success();
-                    info!(
-                        seen = report.seen,
-                        skipped = report.skipped,
-                        started = report.started,
-                        responded = report.responded,
-                        failed = report.failed,
-                        in_flight = report.in_flight,
-                        "poll complete"
-                    )
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
+                result = maid.run_once() => {
+                    match result {
+                        Ok(report) => {
+                            poller_metrics.record_success();
+                            info!(
+                                seen = report.seen,
+                                skipped = report.skipped,
+                                started = report.started,
+                                responded = report.responded,
+                                failed = report.failed,
+                                in_flight = report.in_flight,
+                                "poll complete"
+                            )
+                        }
+                        Err(err) => error!(error = ?err, "poll failed"),
+                    }
                 }
-                Err(err) => error!(error = ?err, "poll failed"),
             }
         }
+        maid.drain().await;
     });
 
     info!(
@@ -100,12 +109,14 @@ async fn main() -> Result<()> {
         auto_review_public_accounts = config.auto_review_public_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),
         auto_review_teams = config.auto_review_teams.len(),
+        continuous_review = config.continuous_review,
+        posted_heads = %config.posted_heads_path.display(),
         metrics_bind_address = %config.metrics_bind_address,
         "maid started"
     );
 
     shutdown_signal().await;
-    poller.abort();
+    let _ = shutdown_tx.send(());
     let _ = poller.await;
     metrics_server.abort();
     let _ = metrics_server.await;
@@ -135,6 +146,4 @@ async fn shutdown_signal() {
         () = ctrl_c => {}
         () = terminate => {}
     }
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }

@@ -17,6 +17,8 @@ auto_review_public_accounts = ["your-name"]
 # qualify a pull request that still requests the team.
 auto_review_teams = ["Some-Org/eng-infra"]
 
+continuous_review = false
+
 # Optional. Defaults shown below.
 git_dir = "~/.maid/git"
 codex_bin = "codex"

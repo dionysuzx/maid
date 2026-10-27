@@ -1,6 +1,20 @@
 # Continuous review
 
-Design only. `src/review.rs` is a naive stand-in so the invariant tests fail. It is compiled for tests only. The daemon does not call it.
+## Which design
+
+Five designs, judged by concept count, shared mutable state, whether each of I1–I10 is structural, local reasoning, legacy paths, magic numbers, and GraphQL.
+
+| Design | Concepts a reader holds | Why it loses |
+| --- | --- | --- |
+| PR #43 `cursor/pr-review-ledger-0c95` (+2343/−496) | Ledger row (agent, model, prompt hash, effort, outcome), per-PR reservation held until the write, write-until-success, post-checkout replan, head-lookup GET, `just stop` wait change | Coverage was bolted onto the old poll. I2 is a second plan after checkout. I3 is a reservation beside the ledger. The retry loop is `AwaitingRecord` under another name. |
+| PR #44 `cursor/continuous-review-0c95` | Everything in #43, plus `continuous_review` paging and `max_failures_per_head` | Paging is a flag on the old lister. The new failure cap is a knob. Merges #43 rather than removing it. |
+| PR #45 `7fe1a23` (+416/−207) | `reviewed-heads.json` keyed by URL and SHA, `plan_auto_review`, an in-flight key held until the record | Fewest lines, and the three blocking findings are the structure: checkout can move off the discovered SHA (I2), a coverage read can race a worker that has already posted (I3), public-author search ignores `continuous_review` (I6). |
+| `8e99f3e` | 14: the eight below, plus `AuthorizedHead`, page cursors, `walk_pages`, GraphQL, the occupancy table, `AwaitingRecord`, `FlightId`, the draining sibling, and the flush retry | I1–I10 are structural, and the reader pays for protocols no invariant test requires. GraphQL is one of them. |
+| `ba6f634` | 8 | Winner. |
+
+Nothing in #43, #44, or #45 removes a concept from `ba6f634` or closes an invariant that design still leaves open. The public-author pull GET and the unchanged 5-second `just stop` are the accepted weakenings of I4 and I8. No graft.
+
+The rest of this document is that design.
 
 ## Concepts
 
@@ -10,10 +24,10 @@ Eight. The previous draft asked a reader to hold fourteen named pieces: `HeadSha
 2. **ListedPull.** One discovered pull: the pull request, its `HeadSha`, which source found it, requested teams, `updated_at`. The SHA is part of the row, so a later source cannot keep the row and drop the commit.
 3. **Covered set.** The SHAs whose Codex comment was posted. Loaded from `~/.maid/posted-heads.json` at start. One owner holds it.
 4. **In-flight set.** The SHAs whose review has been started and has not finished. Same owner. Not written to disk.
-5. **Slot count.** `in_flight.len() + mentions`. Compared with `max_concurrent_requests`. No semaphore.
+5. **Slot count.** In-flight heads plus admitted mentions, compared with `max_concurrent_requests`. One count, on the owner. A mention hold drops when the mention task finishes, and the next admit applies that result.
 6. **`pages`.** Fetch REST page 1. If `continuous_review` is on, fetch page 2, 3, … until a page is shorter than the `per_page` that request already used (50 for pulls, 100 for search). The bool is read here and nowhere else.
 7. **Pinned checkout.** A head review fetches and detaches that `HeadSha`. `rev-parse` must equal it. Mentions still check out a named ref.
-8. **One owner.** The poll task holds the covered set, the in-flight set, and the slot count. It is not `Clone`. Workers get a checkout, Codex, and GitHub. They do not get the sets.
+8. **One owner.** The poll task holds the covered set, the in-flight set, and the slot count. Workers get a checkout, Codex, and GitHub. They do not get the sets. `Maid` is cloned into a mention task, so the owner sits behind a mutex; mention tasks do not lock it.
 
 Scope is a function, `in_scope`, not a type. Bot, unauthorized author, a public row whose author is not the searched account, and a team row outside the window return false. The poll does not submit those rows and does not record them. The rules are today's auto-review rules minus reactions. `TeamActivity` is authorized only by `authorizing_team`. `PublicAuthor` only when the searched login is a public account and matches the author. `Repository` by account or team. Dedup is the existing URL merge: the first row wins, except a later in-scope author row replaces the whole `ListedPull`, including its SHA. A team-activity row never replaces a repository row.
 
@@ -40,17 +54,17 @@ The record is `~/.maid/posted-heads.json`: `{ "heads": ["<40 lowercase hex>", ..
 
 Historical `+1`s are not imported. Open tracked heads are reviewed once on the first deploy. Closed pulls are not listed.
 
-Deleted with the shell, not on this branch:
+Removed with the shell:
 
 - PR `pr_state`, `mark_pr_started`, `mark_pr_handled`, `mark_pull_request_html_url_handled`, and the PR reaction helpers.
 - `PendingHandledMarker::PullRequest` and `pull_request_html_urls`. A leftover field is dropped on read and not imported.
-- `plan_auto_review` and its reaction actions. `authorizing_team` moves next to `in_scope`.
-- `ConcurrentMaid`, `WorkQueue`, and the inline auto-review finish in `Maid::run_once`.
+- `plan_auto_review` and its reaction actions. `authorizing_team` stays, and `in_scope` calls it.
+- `WorkQueue` and its semaphore. Mention slots and head slots are the one count on the owner.
 - The list-all client methods and `MAX_SEARCH_RESULTS`. Page limits live in `pages`.
 - Auto-review checkout of `pull/N/head` and `FETCH_HEAD`.
-- `poller.abort()` as the way a review ends.
+- `poller.abort()` and the 50ms shutdown sleep. Shutdown is a oneshot between polls, then `drain`.
 
-Already deleted on this branch, replaced by the I1 test: `auto_review_does_not_restart_finished_pr_during_reaction_lag`, `retries_pending_auto_review_marker_without_rerunning_codex`, `retries_pending_auto_review_marker_without_open_pull_request`, `pending_marker_is_marked_without_starting_task`, and `skips_opened_pr_with_durable_handled_marker_after_restart`. Mention suppression stays. The other auto-review tests in `maid.rs` still describe the old poll and change when the shell lands.
+`auto_review_does_not_restart_finished_pr_during_reaction_lag`, `retries_pending_auto_review_marker_without_rerunning_codex`, `retries_pending_auto_review_marker_without_open_pull_request`, `pending_marker_is_marked_without_starting_task`, and `skips_opened_pr_with_durable_handled_marker_after_restart` are gone. Mention suppression stays.
 
 Mention markers, mention reactions, the task-start ledger, the observed-notification ledger, the repo flock, and the daemon lock stay.
 
@@ -58,15 +72,15 @@ Mention markers, mention reactions, the task-start ledger, the observed-notifica
 
 ```text
 submit(row):
-    apply finished results          # covered.insert on post, in_flight.remove on post or failure
+    apply finished results
     if row.head is covered or in flight: return Skip
     if in_flight.len() + mentions >= max: return Skip
     task ledger: AtLimit -> Skip, error -> Fail, else continue
     in_flight.insert(row.head)
-    spawn review(row.head)          # no await
+    spawn review(row.head)
 
 review:
-    checkout Commit(sha)            # fetch that object, detach it, rev-parse must match
+    checkout Commit(sha)
     codex, post comment
     tell the owner success or failure
     the owner, not the worker, inserts sha into covered and writes the file
@@ -154,6 +168,4 @@ I8's in-process half and its "drain finishes the record" half hold. The sentence
 
 ## Diff
 
-The core is the owner, `pages`, `head.sha` on the pulls payload, `page` on those URLs, the pull GET inside the existing search loop, the commit checkout, `main` joining `drain`, and the config bool. `justfile` is not edited.
-
-The large part is still tests. `maid.rs` locks one review per URL, `+1` suppression, permit-before-`pr_state`, and a public search that always walks up to ten pages. Those move onto this owner or they are deleted with the old poll. Expect on the order of 1000–2000 lines of diff, most of it that replacement. The previous design's extra states, GraphQL, and the sibling file are not in that number.
+This branch is that shell. `justfile` is not edited. `continuous_review` defaults false. Reviewed heads live in `~/.maid/posted-heads.json`.

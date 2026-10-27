@@ -1,6 +1,7 @@
 use crate::{
     domain::{CodexTask, WorkTarget, validate_repo_name_part},
     maid::{PreparedWorktree, Worktrees},
+    review::CheckoutRev,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -53,6 +54,10 @@ impl GitWorktrees {
     }
 
     async fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<()> {
+        self.git_stdout(cwd, args).await.map(|_| ())
+    }
+
+    async fn git_stdout(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {
         let mut command = Command::new("git");
         command
             .args(args)
@@ -68,7 +73,7 @@ impl GitWorktrees {
 
         let output = command.output().await.context("failed to run git")?;
         if output.status.success() {
-            return Ok(());
+            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
         }
 
         Err(anyhow!(
@@ -105,9 +110,17 @@ impl GitWorktrees {
 
 #[async_trait]
 impl Worktrees for GitWorktrees {
-    async fn prepare(&self, target: &WorkTarget, task: &CodexTask) -> Result<PreparedWorktree> {
+    async fn prepare(
+        &self,
+        target: &WorkTarget,
+        task: &CodexTask,
+        rev: &CheckoutRev,
+    ) -> Result<PreparedWorktree> {
         let repo = self.repo_dir(target)?;
-        let worktree = self.worktree_dir(target, task)?;
+        let worktree = match rev {
+            CheckoutRev::Named(_) => self.worktree_dir(target, task)?,
+            CheckoutRev::Commit(sha) => self.worktree_dir(target, task)?.join(sha.as_str()),
+        };
         let _lock = self.acquire_repo_lock(&repo).await?;
         tokio::fs::create_dir_all(
             repo.parent()
@@ -133,7 +146,10 @@ impl Worktrees for GitWorktrees {
             &["remote", "set-url", "origin", target.clone_url()],
         )
         .await?;
-        let fetch_ref = target.fetch_ref();
+        let (fetch_ref, detach) = match rev {
+            CheckoutRev::Named(name) => (name.clone(), "FETCH_HEAD".to_string()),
+            CheckoutRev::Commit(sha) => (sha.as_str().to_string(), sha.as_str().to_string()),
+        };
         self.run_git(Some(&repo), &["fetch", "--prune", "origin", &fetch_ref])
             .await
             .with_context(|| format!("failed to fetch {}", target.html_url()))?;
@@ -156,15 +172,18 @@ impl Worktrees for GitWorktrees {
         self.run_git(Some(&repo), &["worktree", "prune"]).await?;
         self.run_git(
             Some(&repo),
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                &worktree_string,
-                "FETCH_HEAD",
-            ],
+            &["worktree", "add", "--detach", &worktree_string, &detach],
         )
         .await?;
+
+        if let CheckoutRev::Commit(sha) = rev {
+            let parsed = self
+                .git_stdout(Some(&worktree), &["rev-parse", "HEAD"])
+                .await?;
+            if parsed != sha.as_str() {
+                return Err(anyhow!("checkout of {} detached {parsed}", sha.as_str()));
+            }
+        }
 
         Ok(PreparedWorktree::git_worktree(repo, worktree))
     }
@@ -355,11 +374,19 @@ mod tests {
         });
 
         let first = worktrees
-            .prepare(&pr, &task("https://github.com/o/r/pull/46#issuecomment-2"))
+            .prepare(
+                &pr,
+                &task("https://github.com/o/r/pull/46#issuecomment-2"),
+                &CheckoutRev::Named(pr.fetch_ref()),
+            )
             .await
             .unwrap();
         let second = worktrees
-            .prepare(&pr, &task("https://github.com/o/r/pull/46#issuecomment-3"))
+            .prepare(
+                &pr,
+                &task("https://github.com/o/r/pull/46#issuecomment-3"),
+                &CheckoutRev::Named(pr.fetch_ref()),
+            )
             .await
             .unwrap();
 
@@ -406,6 +433,7 @@ mod tests {
             .prepare(
                 &issue,
                 &task("https://github.com/o/r/issues/322#issuecomment-2"),
+                &CheckoutRev::Named(issue.fetch_ref()),
             )
             .await
             .unwrap();

@@ -38,6 +38,8 @@ pub struct Config {
     pub codex_prompts: CodexPromptTemplates,
     pub github_api_ip: Option<IpAddr>,
     pub metrics_bind_address: SocketAddr,
+    pub continuous_review: bool,
+    pub posted_heads_path: PathBuf,
 }
 
 impl Config {
@@ -141,6 +143,8 @@ impl Config {
             codex_prompts,
             github_api_ip,
             metrics_bind_address,
+            continuous_review: file.continuous_review,
+            posted_heads_path: maid_home.join("posted-heads.json"),
         })
     }
 }
@@ -164,6 +168,8 @@ struct ConfigFile {
     codex_prompts: Option<CodexPromptsFile>,
     github_api_ip: Option<String>,
     metrics_bind_address: Option<String>,
+    #[serde(default)]
+    continuous_review: bool,
 }
 
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
@@ -428,6 +434,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.task_limit_per_24h, Some(5));
         assert_eq!(config.max_concurrent_requests, Some(3));
         assert_eq!(config.github_api_requests_per_hour, Some(1200));
+        assert!(!config.continuous_review);
         assert_eq!(config.github_notification_window_hours, Some(96));
         assert_eq!(
             config.metrics_bind_address.as_deref(),

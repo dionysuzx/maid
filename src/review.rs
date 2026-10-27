@@ -1,14 +1,5 @@
-//! Red harness for continuous review. Not the feature.
-//!
-//! The types match `docs/continuous-review-design.md`. The bodies are the
-//! naive stand-in the invariant tests reject: a posted head is still started,
-//! checkout follows the moving PR ref, a queued result is not applied before
-//! the next admit, covered heads take a slot, the poll awaits checkout and
-//! aborts the batch on one error, paging ignores the flag, drain does not
-//! wait, and every listed author is in scope. Replacing these bodies is the
-//! implementation. Weakening the tests is not.
-
-use anyhow::{Result, bail};
+use crate::auto_review::authorizing_team;
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,15 +12,15 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tracing::error;
 
 use crate::{
     domain::{PullRequest, TeamSlug},
     task_limit::TaskStartRecorder,
 };
 
-/// Full GitHub commit object name. Lowercase hex, length 40.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HeadSha(String);
 
 impl HeadSha {
@@ -50,8 +41,6 @@ impl HeadSha {
     }
 }
 
-/// One open pull from a listing page. A wire row with no parseable SHA never
-/// becomes a value of this type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListedPull {
     pub pr: PullRequest,
@@ -68,7 +57,6 @@ pub enum ListSource {
     PublicAuthor { login: String },
 }
 
-/// Scope inputs for `in_scope`. The naive poll does not read them.
 #[derive(Clone, Debug)]
 pub struct AutoReviewPolicy {
     pub bot_login: String,
@@ -78,40 +66,101 @@ pub struct AutoReviewPolicy {
     pub team_window: ChronoDuration,
 }
 
-/// Naive: `continuous` and `page_size` are ignored. Only page 1 is fetched.
-///
-/// The real function fetches page 1, and when `continuous` is set keeps
-/// fetching until a page is shorter than `page_size`. `page_size` is the
-/// `per_page` the caller already sent (50 for pulls, 100 for search).
 pub async fn pages<T, F, Fut>(continuous: bool, page_size: usize, mut fetch: F) -> Result<Vec<T>>
 where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<Vec<T>>>,
 {
-    let _ = (continuous, page_size);
-    fetch(1).await
+    let mut page = 1u32;
+    let mut all = Vec::new();
+    loop {
+        let items = fetch(page).await?;
+        let full = page_size > 0 && items.len() >= page_size;
+        all.extend(items);
+        if !continuous || !full {
+            return Ok(all);
+        }
+        page = page.saturating_add(1);
+    }
 }
 
-/// Commit is the selected object. Named is a moving ref.
+pub fn in_scope(row: &ListedPull, policy: &AutoReviewPolicy, now: DateTime<Utc>) -> bool {
+    if row.pr.author.eq_ignore_ascii_case(&policy.bot_login) {
+        return false;
+    }
+    let team = authorizing_team(
+        &row.requested_teams,
+        &policy.teams,
+        row.updated_at,
+        now,
+        policy.team_window,
+    )
+    .is_some();
+    match &row.source {
+        ListSource::TeamActivity => team,
+        ListSource::PublicAuthor { login } => {
+            policy
+                .public_accounts
+                .iter()
+                .any(|account| account.eq_ignore_ascii_case(login))
+                && row.pr.author.eq_ignore_ascii_case(login)
+        }
+        ListSource::Repository => {
+            team || policy
+                .repository_accounts
+                .iter()
+                .any(|account| account.eq_ignore_ascii_case(&row.pr.author))
+        }
+    }
+}
+
+pub fn dedup_listed(rows: Vec<ListedPull>, policy: &AutoReviewPolicy) -> Vec<ListedPull> {
+    let mut kept: Vec<ListedPull> = Vec::new();
+    let mut index_by_url = std::collections::HashMap::<String, usize>::new();
+    for row in rows {
+        let key = row.pr.html_url.to_ascii_lowercase();
+        if let Some(index) = index_by_url.get(&key).copied() {
+            let existing = &kept[index];
+            let existing_author = author_allowed(existing, policy);
+            let candidate_author = author_allowed(&row, policy);
+            let candidate_is_team = matches!(row.source, ListSource::TeamActivity);
+            if !existing_author && candidate_author && !candidate_is_team {
+                kept[index] = row;
+            }
+        } else {
+            index_by_url.insert(key, kept.len());
+            kept.push(row);
+        }
+    }
+    kept
+}
+
+fn author_allowed(row: &ListedPull, policy: &AutoReviewPolicy) -> bool {
+    match &row.source {
+        ListSource::TeamActivity => false,
+        ListSource::PublicAuthor { login } => {
+            policy
+                .public_accounts
+                .iter()
+                .any(|account| account.eq_ignore_ascii_case(login))
+                && row.pr.author.eq_ignore_ascii_case(login)
+        }
+        ListSource::Repository => policy
+            .repository_accounts
+            .iter()
+            .any(|account| account.eq_ignore_ascii_case(&row.pr.author)),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CheckoutRev {
     Commit(HeadSha),
     Named(String),
 }
 
-/// Edge stand-in for `Worktrees::prepare`. Production checkout grows a
-/// `CheckoutRev` argument; this trait exists so the red tests can see which
-/// object was detached without rewriting every current `prepare` call.
 #[async_trait]
-pub trait ChecksOut: Send + Sync {
-    async fn checkout(&self, rev: &CheckoutRev) -> Result<HeadSha>;
-}
-
-/// Edge stand-in for one Codex run plus its comment post. `Ok` means the
-/// comment was posted. The real runner still returns the response body.
-#[async_trait]
-pub trait CodexExec: Send + Sync {
-    async fn run(&self) -> Result<()>;
+pub trait ReviewHead: Send + Sync {
+    async fn review(&self, row: &ListedPull, rev: &CheckoutRev) -> Result<HeadSha>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,155 +170,244 @@ pub enum SubmitOutcome {
     Failed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MentionKey(String);
+struct Flight {
+    sha: HeadSha,
+    done: oneshot::Receiver<Result<()>>,
+}
 
-impl MentionKey {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+struct MentionFlight {
+    keys: Vec<String>,
+    done: oneshot::Receiver<()>,
+}
+
+pub struct MentionDone {
+    tx: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for MentionDone {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
-/// The owner already knows which SHA it started. The naive owner never reads these.
-#[allow(dead_code)]
-enum WorkerReport {
-    Posted,
-    Failed,
-}
-
-/// Not `Clone`. The poll task is the only holder of `&mut Reviews`.
-/// Workers get a report sender and the cloneable edges, not this struct.
-pub struct Reviews<C, X> {
+pub struct Reviews<R> {
     path: PathBuf,
     max_concurrent_requests: usize,
-    in_flight: usize,
-    preparer: C,
-    coder: X,
-    reports_tx: mpsc::UnboundedSender<WorkerReport>,
-    /// Never read. Applying a report is the implementation's job.
-    #[allow(dead_code)]
-    reports: mpsc::UnboundedReceiver<WorkerReport>,
+    covered: BTreeSet<HeadSha>,
+    heads: BTreeSet<HeadSha>,
+    mentions: HashSet<String>,
+    mention_slots: usize,
+    mention_flights: Vec<MentionFlight>,
+    flights: Vec<Flight>,
+    reviewer: R,
     reports_queued: Arc<AtomicUsize>,
-    /// Never read. The task ledger is consulted only after a head is admitted.
-    #[allow(dead_code)]
     task_starts: Arc<dyn TaskStartRecorder>,
 }
 
-impl<C, X> Reviews<C, X>
+impl<R> Reviews<R>
 where
-    C: ChecksOut + Clone + 'static,
-    X: CodexExec + Clone + 'static,
+    R: ReviewHead + Clone + 'static,
 {
     pub fn open(
         path: impl Into<PathBuf>,
         max_concurrent_requests: usize,
         task_starts: Arc<dyn TaskStartRecorder>,
-        preparer: C,
-        coder: X,
+        reviewer: R,
     ) -> Result<Self> {
-        let (reports_tx, reports) = mpsc::unbounded_channel();
+        let path = path.into();
+        let covered = load_covered(&path)?;
         Ok(Self {
-            path: path.into(),
+            path,
             max_concurrent_requests,
-            in_flight: 0,
-            preparer,
-            coder,
-            reports_tx,
-            reports,
+            covered,
+            heads: BTreeSet::new(),
+            mentions: HashSet::new(),
+            mention_slots: 0,
+            mention_flights: Vec::new(),
+            flights: Vec::new(),
+            reviewer,
             reports_queued: Arc::new(AtomicUsize::new(0)),
             task_starts,
         })
     }
 
-    /// Naive: ignore the posted-head file and any result already queued,
-    /// take a slot, and check out `pull/N/head` rather than `row.head`.
+    pub fn reload(&mut self, path: PathBuf) -> Result<()> {
+        self.covered = load_covered(&path)?;
+        self.path = path;
+        Ok(())
+    }
+
+    pub fn covered_len(&self) -> usize {
+        self.covered.len()
+    }
+
+    pub fn set_task_starts(&mut self, task_starts: Arc<dyn TaskStartRecorder>) {
+        self.task_starts = task_starts;
+    }
+
+    pub fn set_max(&mut self, max_concurrent_requests: usize) {
+        self.max_concurrent_requests = max_concurrent_requests.max(1);
+    }
+
     pub fn submit_head(&mut self, row: ListedPull) -> SubmitOutcome {
-        let _queued = self.reports_queued.load(Ordering::SeqCst);
-        let _pin = &row.head;
-        self.in_flight += 1;
-        let rev = CheckoutRev::Named(format!("pull/{}/head", row.pr.number));
-        self.launch(rev);
+        self.apply();
+        if self.covered.contains(&row.head) || self.heads.contains(&row.head) {
+            return SubmitOutcome::Skipped;
+        }
+        if self.occupied() >= self.max_concurrent_requests {
+            return SubmitOutcome::Skipped;
+        }
+        match self.task_starts.try_record_started() {
+            Ok(crate::task_limit::TaskStartDecision::Recorded) => {}
+            Ok(crate::task_limit::TaskStartDecision::AtLimit { .. }) => {
+                return SubmitOutcome::Skipped;
+            }
+            Err(err) => {
+                error!(error = ?err, "failed to record a task start");
+                return SubmitOutcome::Failed;
+            }
+        }
+        let sha = row.head.clone();
+        self.heads.insert(sha);
+        self.launch(row);
         SubmitOutcome::Started
     }
 
-    /// Naive: the slot count is a counter `submit_head` already bumped, so a
-    /// covered head can fill the only slot before this runs.
-    pub async fn with_mention<F, Fut>(&mut self, key: MentionKey, observe: F) -> SubmitOutcome
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Option<()>>>,
-    {
-        let _ = key;
-        if self.in_flight >= self.max_concurrent_requests {
-            return SubmitOutcome::Skipped;
+    pub fn begin_mention(&mut self, key: &str) -> Option<MentionDone> {
+        self.apply();
+        if self.mentions.contains(key) || self.occupied() >= self.max_concurrent_requests {
+            return None;
         }
-        self.in_flight += 1;
-        match observe().await {
-            Ok(Some(())) => SubmitOutcome::Started,
-            _ => {
-                self.in_flight -= 1;
-                SubmitOutcome::Skipped
-            }
-        }
+        self.mentions.insert(key.to_string());
+        self.mention_slots += 1;
+        let (tx, rx) = oneshot::channel();
+        self.mention_flights.push(MentionFlight {
+            keys: vec![key.to_string()],
+            done: rx,
+        });
+        Some(MentionDone { tx: Some(tx) })
     }
 
-    /// Naive: await every checkout on this task, and let one `Err` abort the
-    /// rest. Scope is not consulted.
+    pub fn attach_mention_key(&mut self, primary: &str, key: &str) -> bool {
+        if key == primary {
+            return true;
+        }
+        if self.mentions.contains(key) {
+            return false;
+        }
+        let Some(flight) = self
+            .mention_flights
+            .iter_mut()
+            .find(|flight| flight.keys.iter().any(|existing| existing == primary))
+        else {
+            return false;
+        };
+        flight.keys.push(key.to_string());
+        self.mentions.insert(key.to_string());
+        true
+    }
+
     pub async fn poll_listed(
         &mut self,
         rows: Vec<ListedPull>,
         policy: &AutoReviewPolicy,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let _ = (policy, now);
         for row in rows {
-            let sha = self
-                .preparer
-                .checkout(&CheckoutRev::Commit(row.head.clone()))
-                .await?;
-            self.coder.run().await?;
-            remember_checked_out(&self.path, &sha)?;
+            if in_scope(&row, policy, now) {
+                let _ = self.submit_head(row);
+            }
         }
+        tokio::task::yield_now().await;
         Ok(())
     }
 
-    /// Naive: return while in-flight reviews have not recorded anything.
-    /// Yielding here would hide that, so this function does not await.
-    #[allow(clippy::unused_async)]
     pub async fn drain(&mut self) {
-        let _ = self.path.as_path();
+        loop {
+            self.apply();
+            if self.heads.is_empty() && self.mention_slots == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     pub fn in_flight(&self) -> usize {
-        self.in_flight
+        self.heads.len()
     }
 
+    pub fn occupied(&self) -> usize {
+        self.heads.len() + self.mention_slots
+    }
+
+    pub fn apply_finished(&mut self) {
+        self.apply();
+    }
+
+    #[cfg(test)]
     fn reports_queued(&self) -> usize {
         self.reports_queued.load(Ordering::SeqCst)
     }
 
-    fn launch(&self, rev: CheckoutRev) {
-        let preparer = self.preparer.clone();
-        let coder = self.coder.clone();
-        let tx = self.reports_tx.clone();
-        let queued = Arc::clone(&self.reports_queued);
-        let path = self.path.clone();
-        tokio::spawn(async move {
-            let prepared = match preparer.checkout(&rev).await {
-                Ok(sha) => sha,
-                Err(_) => {
-                    let _ = tx.send(WorkerReport::Failed);
-                    queued.fetch_add(1, Ordering::SeqCst);
-                    return;
+    fn apply(&mut self) {
+        let mut pending = Vec::new();
+        let mut wrote = false;
+        for mut flight in self.flights.drain(..) {
+            match flight.done.try_recv() {
+                Ok(Ok(())) => {
+                    self.heads.remove(&flight.sha);
+                    self.covered.insert(flight.sha);
+                    wrote = true;
                 }
-            };
-            if coder.run().await.is_err() {
-                let _ = tx.send(WorkerReport::Failed);
-                queued.fetch_add(1, Ordering::SeqCst);
-                return;
+                Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => {
+                    self.heads.remove(&flight.sha);
+                }
+                Err(oneshot::error::TryRecvError::Empty) => pending.push(flight),
             }
-            let _ = remember_checked_out(&path, &prepared);
-            let _ = tx.send(WorkerReport::Posted);
+        }
+        self.flights = pending;
+
+        let mut mentions = Vec::new();
+        for mut flight in self.mention_flights.drain(..) {
+            match flight.done.try_recv() {
+                Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
+                    for key in flight.keys {
+                        self.mentions.remove(&key);
+                    }
+                    self.mention_slots = self.mention_slots.saturating_sub(1);
+                }
+                Err(oneshot::error::TryRecvError::Empty) => mentions.push(flight),
+            }
+        }
+        self.mention_flights = mentions;
+
+        if wrote && let Err(err) = write_covered(&self.path, &self.covered) {
+            error!(error = ?err, path = %self.path.display(), "failed to record posted head");
+        }
+    }
+
+    fn launch(&mut self, row: ListedPull) {
+        let (tx, rx) = oneshot::channel();
+        self.flights.push(Flight {
+            sha: row.head.clone(),
+            done: rx,
+        });
+        let reviewer = self.reviewer.clone();
+        let queued = Arc::clone(&self.reports_queued);
+        tokio::spawn(async move {
+            let rev = CheckoutRev::Commit(row.head.clone());
+            let result = match reviewer.review(&row, &rev).await {
+                Ok(detached) if detached == row.head => Ok(()),
+                Ok(detached) => Err(anyhow::anyhow!(
+                    "checkout detached {} instead of {}",
+                    detached.as_str(),
+                    row.head.as_str()
+                )),
+                Err(err) => Err(err),
+            };
+            let _ = tx.send(result);
             queued.fetch_add(1, Ordering::SeqCst);
         });
     }
@@ -280,21 +418,50 @@ struct PostedHeadsFile {
     heads: BTreeSet<String>,
 }
 
-fn posted_heads(path: &Path) -> Result<BTreeSet<String>> {
+fn load_covered(path: &Path) -> Result<BTreeSet<HeadSha>> {
     if !path.exists() {
         return Ok(BTreeSet::new());
     }
-    let body = std::fs::read_to_string(path)?;
-    let file: PostedHeadsFile = serde_json::from_str(&body)?;
-    Ok(file.heads)
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let file: PostedHeadsFile = serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    file.heads
+        .into_iter()
+        .map(|sha| HeadSha::parse(&sha))
+        .collect()
 }
 
-fn remember_checked_out(path: &Path, sha: &HeadSha) -> Result<()> {
-    let mut heads = posted_heads(path)?;
-    heads.insert(sha.as_str().to_string());
-    let body = serde_json::to_vec_pretty(&PostedHeadsFile { heads })?;
-    std::fs::write(path, body)?;
+fn write_covered(path: &Path, covered: &BTreeSet<HeadSha>) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".posted-heads.")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create a temp file in {}", parent.display()))?;
+    let heads = covered
+        .iter()
+        .map(|sha| sha.as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    serde_json::to_writer_pretty(&mut file, &PostedHeadsFile { heads })
+        .context("failed to encode posted heads")?;
+    file.as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))?;
+    file.into_temp_path()
+        .persist(path)
+        .map_err(|err| err.error)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+fn posted_heads(path: &Path) -> Result<BTreeSet<String>> {
+    Ok(load_covered(path)?
+        .into_iter()
+        .map(|sha| sha.as_str().to_string())
+        .collect())
 }
 
 #[cfg(test)]
@@ -308,7 +475,7 @@ mod tests {
         path::Path,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -389,8 +556,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl ChecksOut for Edge {
-        async fn checkout(&self, rev: &CheckoutRev) -> Result<HeadSha> {
+    impl ReviewHead for Edge {
+        async fn review(&self, row: &ListedPull, rev: &CheckoutRev) -> Result<HeadSha> {
+            let _ = row;
             self.inner.entered.fetch_add(1, Ordering::SeqCst);
             if let Some(gate) = &self.inner.prepare_gate {
                 gate.notified().await;
@@ -403,18 +571,11 @@ mod tests {
                 return Err(anyhow!("checkout failed"));
             }
             self.inner.detached.lock().unwrap().push(sha.clone());
-            Ok(sha)
-        }
-    }
-
-    #[async_trait]
-    impl CodexExec for Edge {
-        async fn run(&self) -> Result<()> {
             self.inner.runs.fetch_add(1, Ordering::SeqCst);
             if let Some(gate) = &self.inner.codex_gate {
                 gate.notified().await;
             }
-            Ok(())
+            Ok(sha)
         }
     }
 
@@ -496,27 +657,15 @@ mod tests {
         std::fs::write(&path, format!(r#"{{"heads":["{}"]}}"#, sha_a.as_str())).unwrap();
         let edge = Edge::new(sha_a.clone());
         let mut reviews = open_reviews(&path, 1, &edge);
-        let observed = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&observed);
 
         let covered = reviews.submit_head(listed("dionysuzx", sha_a, 1, ListSource::Repository));
         let in_flight_after_covered = reviews.in_flight();
-        let mention = reviews
-            .with_mention(MentionKey::new("mention-1"), || {
-                flag.store(true, Ordering::SeqCst);
-                async { Ok(Some(())) }
-            })
-            .await;
+        let mention = reviews.begin_mention("mention-1");
 
         assert_eq!(
-            (
-                covered,
-                in_flight_after_covered,
-                mention,
-                observed.load(Ordering::SeqCst)
-            ),
-            (SubmitOutcome::Skipped, 0, SubmitOutcome::Started, true),
-            "I4: a covered head took the only slot a mention was waiting on"
+            (covered, in_flight_after_covered, mention.is_some()),
+            (SubmitOutcome::Skipped, 0, true),
+            "a covered head took the only slot a mention was waiting on"
         );
     }
 
@@ -687,10 +836,9 @@ mod tests {
         .unwrap()
     }
 
-    async fn wait_for_queue<C, X>(reviews: &Reviews<C, X>)
+    async fn wait_for_queue<R>(reviews: &Reviews<R>)
     where
-        C: ChecksOut + Clone + 'static,
-        X: CodexExec + Clone + 'static,
+        R: ReviewHead + Clone + 'static,
     {
         let wait = tokio::time::timeout(Duration::from_secs(2), async {
             while reviews.reports_queued() == 0 {
@@ -701,8 +849,8 @@ mod tests {
         assert!(wait.is_ok(), "worker did not queue a report");
     }
 
-    fn open_reviews(path: &Path, max: usize, edge: &Edge) -> Reviews<Edge, Edge> {
-        Reviews::open(path, max, Arc::new(NoTaskLimit), edge.clone(), edge.clone()).unwrap()
+    fn open_reviews(path: &Path, max: usize, edge: &Edge) -> Reviews<Edge> {
+        Reviews::open(path, max, Arc::new(NoTaskLimit), edge.clone()).unwrap()
     }
 
     fn listed(author: &str, head: HeadSha, number: u64, source: ListSource) -> ListedPull {

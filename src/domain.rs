@@ -141,6 +141,7 @@ pub enum OpenPullRequestOrder {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenPullRequest {
     pub pull_request: PullRequest,
+    pub head: crate::review::HeadSha,
     pub requested_teams: Vec<TeamSlug>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,

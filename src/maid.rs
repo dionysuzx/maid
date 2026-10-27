@@ -1,11 +1,8 @@
-use crate::auto_review::{
-    AutoReviewAction, AutoReviewAuthor, AutoReviewObservation, authorizing_team,
-    classify_auto_review_author, plan_auto_review,
-};
 use crate::domain::{
-    CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
-    PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
+    CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, Notification, OpenPullRequest,
+    OpenPullRequestOrder, PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
 };
+use crate::github::{PULL_PAGE_SIZE, SEARCH_PAGE_SIZE};
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
 };
@@ -14,16 +11,22 @@ use crate::mention_thread::{
     MentionThreadPlan, MentionThreadRead, choose_mention_thread_read, plan_mention_thread,
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
+use crate::review::{
+    AutoReviewPolicy, CheckoutRev, ListSource, ListedPull, MentionDone, ReviewHead, Reviews,
+    SubmitOutcome, dedup_listed, in_scope, pages,
+};
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info};
 
 #[async_trait]
@@ -37,8 +40,14 @@ pub trait GithubClient: Send + Sync {
         &self,
         repo: &RepoSlug,
         order: OpenPullRequestOrder,
+        page: u32,
     ) -> Result<Vec<OpenPullRequest>>;
-    async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
+    async fn open_public_pull_requests_by_author(
+        &self,
+        author: &str,
+        page: u32,
+    ) -> Result<Vec<PullRequest>>;
+    async fn pull_request_head(&self, pr: &PullRequest) -> Result<crate::review::HeadSha>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -46,16 +55,17 @@ pub trait GithubClient: Send + Sync {
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()>;
-    async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState>;
-    async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()>;
-    async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()>;
-    async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
 }
 
 #[async_trait]
 pub trait Worktrees: Send + Sync {
-    async fn prepare(&self, target: &WorkTarget, task: &CodexTask) -> Result<PreparedWorktree>;
+    async fn prepare(
+        &self,
+        target: &WorkTarget,
+        task: &CodexTask,
+        rev: &CheckoutRev,
+    ) -> Result<PreparedWorktree>;
     async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()>;
 }
 
@@ -126,68 +136,84 @@ pub struct Maid<G, R, C> {
     task_starts: Arc<dyn TaskStartRecorder>,
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
     observed_notifications: Arc<dyn ObservedNotificationStore>,
+    continuous_review: bool,
+    reviews: Arc<tokio::sync::Mutex<Reviews<HeadReviewer<G, R, C>>>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum AutoReviewSource {
-    Repository,
-    TeamActivity,
-    PublicAuthor { login: String },
+#[derive(Clone)]
+struct HeadReviewer<G, R, C> {
+    github: G,
+    worktrees: R,
+    codex: C,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AutoReviewCandidate {
-    pr: PullRequest,
-    source: AutoReviewSource,
-    requested_teams: Vec<TeamSlug>,
-    updated_at: Option<DateTime<Utc>>,
-}
-
-impl AutoReviewCandidate {
-    fn repository(open: OpenPullRequest) -> Self {
-        Self {
-            pr: open.pull_request,
-            source: AutoReviewSource::Repository,
-            requested_teams: open.requested_teams,
-            updated_at: open.updated_at,
-        }
-    }
-
-    fn team_activity(open: OpenPullRequest) -> Self {
-        Self {
-            pr: open.pull_request,
-            source: AutoReviewSource::TeamActivity,
-            requested_teams: open.requested_teams,
-            updated_at: open.updated_at,
-        }
-    }
-
-    fn public_author(pr: PullRequest, login: &str) -> Self {
-        Self {
-            pr,
-            source: AutoReviewSource::PublicAuthor {
-                login: login.to_string(),
+#[async_trait]
+impl<G, R, C> ReviewHead for HeadReviewer<G, R, C>
+where
+    G: GithubClient + Clone + 'static,
+    R: Worktrees + Clone + 'static,
+    C: CodexRunner + Clone + 'static,
+{
+    async fn review(&self, row: &ListedPull, rev: &CheckoutRev) -> Result<crate::review::HeadSha> {
+        let target = WorkTarget::PullRequest(row.pr.clone());
+        let task = CodexTask {
+            pr_url: row.pr.html_url.clone(),
+            origin: CodexTaskOrigin::PullRequestOpened {
+                author: row.pr.author.clone(),
             },
-            requested_teams: Vec::new(),
-            updated_at: None,
+        };
+        let worktree = self.worktrees.prepare(&target, &task, rev).await?;
+        let reviewed = async {
+            let codex_run = self.codex.run(worktree.path(), &task).await?;
+            self.github
+                .post_pr_comment(&row.pr, &codex_run.response)
+                .await?;
+            if let Some((session_id, resume_command)) = codex_run.resume_command() {
+                info!(
+                    pr = %row.pr.html_url,
+                    author = %row.pr.author,
+                    codex_session_id = %session_id,
+                    codex_resume = %resume_command,
+                    "responded to pull request"
+                );
+            } else {
+                info!(
+                    pr = %row.pr.html_url,
+                    author = %row.pr.author,
+                    "responded to pull request"
+                );
+            }
+            Ok(())
+        }
+        .await;
+        let cleanup = self.worktrees.cleanup(worktree).await;
+        match (reviewed, cleanup) {
+            (Ok(()), Ok(())) => Ok(row.head.clone()),
+            (Ok(()), Err(err)) => {
+                error!(
+                    pr = %row.pr.html_url,
+                    error = ?err,
+                    "failed to clean up worktree after posting review"
+                );
+                Ok(row.head.clone())
+            }
+            (Err(err), Ok(())) => Err(err),
+            (Err(err), Err(cleanup_err)) => {
+                error!(
+                    pr = %row.pr.html_url,
+                    error = ?cleanup_err,
+                    "failed to clean up worktree after review failure"
+                );
+                Err(err)
+            }
         }
     }
+}
 
-    fn has_allowed_author(
-        &self,
-        repository_accounts: &HashSet<String>,
-        public_accounts: &HashSet<String>,
-    ) -> bool {
-        match &self.source {
-            AutoReviewSource::Repository => {
-                repository_accounts.contains(&self.pr.author.to_ascii_lowercase())
-            }
-            AutoReviewSource::TeamActivity => false,
-            AutoReviewSource::PublicAuthor { login } => {
-                public_accounts.contains(login) && self.pr.author.eq_ignore_ascii_case(login)
-            }
-        }
-    }
+fn scratch_posted_heads() -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("maid-posted-heads-{}-{n}.json", std::process::id()))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -202,9 +228,9 @@ pub struct PollReport {
 
 impl<G, R, C> Maid<G, R, C>
 where
-    G: GithubClient,
-    R: Worktrees,
-    C: CodexRunner,
+    G: GithubClient + Clone + 'static,
+    R: Worktrees + Clone + 'static,
+    C: CodexRunner + Clone + 'static,
 {
     pub fn new(
         github: G,
@@ -215,6 +241,11 @@ where
         auto_review_accounts: impl IntoIterator<Item = impl Into<String>>,
         auto_review_repos: impl IntoIterator<Item = RepoSlug>,
     ) -> Self {
+        let reviewer = HeadReviewer {
+            github: github.clone(),
+            worktrees: worktrees.clone(),
+            codex: codex.clone(),
+        };
         Self {
             github,
             worktrees,
@@ -229,7 +260,29 @@ where
             task_starts: Arc::new(NoTaskLimit),
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
+            continuous_review: false,
+            reviews: Arc::new(tokio::sync::Mutex::new(
+                Reviews::open(
+                    scratch_posted_heads(),
+                    usize::MAX,
+                    Arc::new(NoTaskLimit),
+                    reviewer,
+                )
+                .expect("scratch posted-heads file"),
+            )),
         }
+    }
+
+    pub fn with_continuous_review(mut self, enabled: bool) -> Self {
+        self.continuous_review = enabled;
+        self
+    }
+
+    pub fn use_posted_heads(&self, path: impl Into<PathBuf>) -> Result<()> {
+        self.reviews
+            .try_lock()
+            .expect("reviews")
+            .reload(path.into())
     }
 
     pub fn with_public_auto_review_accounts(
@@ -254,7 +307,12 @@ where
         mut self,
         task_starts: impl TaskStartRecorder + 'static,
     ) -> Self {
-        self.task_starts = Arc::new(task_starts);
+        let task_starts: Arc<dyn TaskStartRecorder> = Arc::new(task_starts);
+        self.reviews
+            .try_lock()
+            .expect("reviews")
+            .set_task_starts(Arc::clone(&task_starts));
+        self.task_starts = task_starts;
         self
     }
 
@@ -275,10 +333,15 @@ where
     }
 
     pub fn into_concurrent(self, max_concurrent_requests: usize) -> ConcurrentMaid<G, R, C> {
-        ConcurrentMaid {
-            maid: self,
-            work: WorkQueue::new(max_concurrent_requests),
-        }
+        self.reviews
+            .try_lock()
+            .expect("reviews")
+            .set_max(max_concurrent_requests);
+        ConcurrentMaid { maid: self }
+    }
+
+    pub async fn drain(&self) {
+        self.reviews.lock().await.drain().await;
     }
 
     pub async fn run_once(&self) -> Result<PollReport> {
@@ -326,46 +389,7 @@ where
             }
         }
 
-        for candidate in self.auto_review_candidates().await? {
-            let pr = &candidate.pr;
-            report.seen += 1;
-            match self
-                .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
-                .await
-            {
-                Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
-                    Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
-                        Ok(()) => report.responded += 1,
-                        Err(err) => {
-                            report.failed += 1;
-                            error!(
-                                pr = %pr.html_url,
-                                error = ?err,
-                                "failed to handle auto-review pull request"
-                            );
-                        }
-                    },
-                    Ok(TaskStartOutcome::Skipped) => report.skipped += 1,
-                    Err(err) => {
-                        report.failed += 1;
-                        error!(
-                            pr = %pr.html_url,
-                            error = ?err,
-                            "failed to start auto-review pull request task"
-                        );
-                    }
-                },
-                Ok(TaskAssessment::Skipped) => report.skipped += 1,
-                Err(err) => {
-                    report.failed += 1;
-                    error!(
-                        pr = %pr.html_url,
-                        error = ?err,
-                        "failed to handle auto-review pull request"
-                    );
-                }
-            }
-        }
+        self.review_open_pulls(&mut report, true).await;
 
         report.failed += self
             .retry_pending_handled_markers(pending_markers, &observed_pending_markers)
@@ -425,15 +449,6 @@ where
                 info!(
                     mention_api_url = %api_url,
                     "refreshed pending completed mention handled marker"
-                );
-            }
-            PendingHandledMarker::PullRequest { html_url } => {
-                self.github
-                    .mark_pull_request_html_url_handled(html_url)
-                    .await?;
-                info!(
-                    pr = %html_url,
-                    "refreshed pending completed auto-review pull request handled marker"
                 );
             }
         }
@@ -676,69 +691,70 @@ where
         ))
     }
 
-    async fn task_for_auto_review_candidate(
-        &self,
-        candidate: &AutoReviewCandidate,
-        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
-    ) -> Result<TaskAssessment> {
-        let observation = self.observe_auto_review_candidate(candidate).await?;
-        self.apply_auto_review_action(plan_auto_review(observation), observed_pending_markers)
-            .await
-    }
-
-    async fn observe_auto_review_candidate(
-        &self,
-        candidate: &AutoReviewCandidate,
-    ) -> Result<AutoReviewObservation> {
-        let pr = &candidate.pr;
-        let author_allowed = candidate.has_allowed_author(
-            &self.auto_review_accounts,
-            &self.auto_review_public_accounts,
-        );
-        let team_authorized = authorizing_team(
-            &candidate.requested_teams,
-            &self.auto_review_teams,
-            candidate.updated_at,
-            Utc::now(),
-            self.team_review_window,
-        )
-        .is_some();
-        let author =
-            classify_auto_review_author(pr, &self.bot_login, author_allowed || team_authorized);
-        if author != AutoReviewAuthor::Allowed {
-            return Ok(AutoReviewObservation::new(pr.clone(), author, None, false));
+    async fn review_open_pulls(&self, report: &mut PollReport, finish: bool) {
+        let rows = self.listed_pulls().await;
+        let mut reviews = self.reviews.lock().await;
+        let policy = self.review_policy();
+        let now = Utc::now();
+        let covered_before = reviews.covered_len();
+        let mut started = 0usize;
+        for row in dedup_listed(rows, &policy) {
+            report.seen += 1;
+            if !in_scope(&row, &policy, now) {
+                report.skipped += 1;
+                continue;
+            }
+            match reviews.submit_head(row) {
+                SubmitOutcome::Started => started += 1,
+                SubmitOutcome::Skipped => report.skipped += 1,
+                SubmitOutcome::Failed => report.failed += 1,
+            }
         }
-
-        let state = self.github.pr_state(pr, &self.bot_login).await?;
-        let marker = PendingHandledMarker::for_pull_request(pr);
-        let has_pending_marker = self.pending_handled_markers.contains(&marker)?;
-
-        Ok(AutoReviewObservation::new(
-            pr.clone(),
-            author,
-            Some(state),
-            has_pending_marker,
-        ))
+        report.started += started;
+        if finish {
+            reviews.drain().await;
+            let posted = reviews.covered_len().saturating_sub(covered_before);
+            report.responded += posted;
+            report.failed += started.saturating_sub(posted);
+        }
     }
 
-    async fn auto_review_candidates(&self) -> Result<Vec<AutoReviewCandidate>> {
-        let mut candidates = Vec::new();
-
+    async fn listed_pulls(&self) -> Vec<ListedPull> {
+        let mut rows = Vec::new();
         for repo in &self.auto_review_repos {
-            for open in self
-                .github
-                .open_pull_requests(repo, OpenPullRequestOrder::NewestCreated)
-                .await?
+            match pages(self.continuous_review, PULL_PAGE_SIZE, |page| {
+                self.github
+                    .open_pull_requests(repo, OpenPullRequestOrder::NewestCreated, page)
+            })
+            .await
             {
-                candidates.push(AutoReviewCandidate::repository(open));
+                Ok(listed) => rows.extend(listed.into_iter().map(|open| listed_pull(open, None))),
+                Err(err) => error!(
+                    repo = %repo,
+                    error = ?err,
+                    "failed to list open pull requests"
+                ),
             }
             if !self.auto_review_teams.is_empty() {
-                for open in self
-                    .github
-                    .open_pull_requests(repo, OpenPullRequestOrder::RecentlyUpdated)
-                    .await?
+                match pages(self.continuous_review, PULL_PAGE_SIZE, |page| {
+                    self.github.open_pull_requests(
+                        repo,
+                        OpenPullRequestOrder::RecentlyUpdated,
+                        page,
+                    )
+                })
+                .await
                 {
-                    candidates.push(AutoReviewCandidate::team_activity(open));
+                    Ok(listed) => rows.extend(
+                        listed
+                            .into_iter()
+                            .map(|open| listed_pull(open, Some(ListSource::TeamActivity))),
+                    ),
+                    Err(err) => error!(
+                        repo = %repo,
+                        error = ?err,
+                        "failed to list recently updated pull requests"
+                    ),
                 }
             }
         }
@@ -746,57 +762,51 @@ where
         let mut authors = self.auto_review_public_accounts.iter().collect::<Vec<_>>();
         authors.sort_unstable();
         for author in authors {
-            for pr in self
-                .github
-                .open_public_pull_requests_by_author(author)
-                .await?
+            let found = match pages(self.continuous_review, SEARCH_PAGE_SIZE, |page| {
+                self.github
+                    .open_public_pull_requests_by_author(author, page)
+            })
+            .await
             {
-                candidates.push(AutoReviewCandidate::public_author(pr, author));
+                Ok(found) => found,
+                Err(err) => {
+                    error!(
+                        author,
+                        error = ?err,
+                        "failed to search public pull requests"
+                    );
+                    continue;
+                }
+            };
+            for pr in found {
+                match self.github.pull_request_head(&pr).await {
+                    Ok(head) => rows.push(ListedPull {
+                        source: ListSource::PublicAuthor {
+                            login: author.clone(),
+                        },
+                        requested_teams: Vec::new(),
+                        updated_at: None,
+                        head,
+                        pr,
+                    }),
+                    Err(err) => error!(
+                        pr = %pr.html_url,
+                        error = ?err,
+                        "failed to read pull request head"
+                    ),
+                }
             }
         }
-
-        Ok(deduplicate_auto_review_candidates(
-            candidates,
-            &self.auto_review_accounts,
-            &self.auto_review_public_accounts,
-        ))
+        rows
     }
 
-    async fn apply_auto_review_action(
-        &self,
-        action: AutoReviewAction,
-        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
-    ) -> Result<TaskAssessment> {
-        match action {
-            AutoReviewAction::StartTask { pr, task } => Ok(TaskAssessment::Ready(Box::new(
-                TaskIntent::AutoReviewPullRequest { pr, task },
-            ))),
-            AutoReviewAction::MarkHandled { pr, marker } => {
-                observed_pending_markers.insert(marker);
-                self.github.mark_pr_handled(&pr).await?;
-                info!(
-                    pr = %pr.html_url,
-                    "refreshed pending completed auto-review pull request handled marker"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-            AutoReviewAction::ForgetHandledMarker { pr, marker } => {
-                self.pending_handled_markers.remove(&marker)?;
-                info!(
-                    pr = %pr.html_url,
-                    "skipping already handled auto-review pull request"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-            AutoReviewAction::SkipSelfAuthored => Ok(TaskAssessment::Skipped),
-            AutoReviewAction::SkipUnauthorized { pr } => {
-                info!(
-                    pr = %pr.html_url,
-                    author = %pr.author,
-                    "skipping pull request from account without auto review"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
+    fn review_policy(&self) -> AutoReviewPolicy {
+        AutoReviewPolicy {
+            bot_login: self.bot_login.clone(),
+            repository_accounts: self.auto_review_accounts.clone(),
+            public_accounts: self.auto_review_public_accounts.clone(),
+            teams: self.auto_review_teams.clone(),
+            team_window: self.team_review_window,
         }
     }
 
@@ -806,16 +816,12 @@ where
             return Ok(TaskStartOutcome::Skipped);
         }
 
-        match *intent {
-            TaskIntent::Mention {
-                notification,
-                mention,
-                task,
-            } => self.start_mention_task(notification, mention, task).await,
-            TaskIntent::AutoReviewPullRequest { pr, task } => {
-                self.start_auto_review_task(pr, task).await
-            }
-        }
+        let TaskIntent::Mention {
+            notification,
+            mention,
+            task,
+        } = *intent;
+        self.start_mention_task(notification, mention, task).await
     }
 
     async fn start_mention_task(
@@ -841,16 +847,12 @@ where
     }
 
     async fn finish_task(&self, task: Box<StartedTask>) -> Result<()> {
-        match *task {
-            StartedTask::Mention {
-                notification,
-                mention,
-                task,
-            } => self.finish_mention_task(notification, mention, task).await,
-            StartedTask::AutoReviewPullRequest { pr, task } => {
-                self.finish_auto_review_task(pr, task).await
-            }
-        }
+        let StartedTask::Mention {
+            notification,
+            mention,
+            task,
+        } = *task;
+        self.finish_mention_task(notification, mention, task).await
     }
 
     async fn finish_mention_task(
@@ -859,7 +861,14 @@ where
         mention: Box<CommentMention>,
         task: CodexTask,
     ) -> Result<()> {
-        let worktree = self.worktrees.prepare(&mention.target, &task).await?;
+        let worktree = self
+            .worktrees
+            .prepare(
+                &mention.target,
+                &task,
+                &CheckoutRev::Named(mention.target.fetch_ref()),
+            )
+            .await?;
         let result = async {
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
@@ -892,65 +901,6 @@ where
                     target = %mention.target.html_url(),
                     mention = %mention.html_url,
                     "responded to mention"
-                );
-            }
-            Ok(())
-        }
-        .await;
-
-        self.cleanup_worktree(worktree, result).await
-    }
-
-    async fn start_auto_review_task(
-        &self,
-        pr: PullRequest,
-        task: CodexTask,
-    ) -> Result<TaskStartOutcome> {
-        self.github.mark_pr_started(&pr).await?;
-        info!(
-            pr = %pr.html_url,
-            author = %pr.author,
-            task_kind = task.task_kind(),
-            "started handling auto-review pull request"
-        );
-
-        Ok(TaskStartOutcome::Started(Box::new(
-            StartedTask::AutoReviewPullRequest { pr, task },
-        )))
-    }
-
-    async fn finish_auto_review_task(&self, pr: PullRequest, task: CodexTask) -> Result<()> {
-        let target = WorkTarget::PullRequest(pr.clone());
-        let worktree = self.worktrees.prepare(&target, &task).await?;
-        let result = async {
-            let codex_run = self.codex.run(worktree.path(), &task).await?;
-
-            self.github
-                .post_pr_comment(&pr, &codex_run.response)
-                .await?;
-            let marker = PendingHandledMarker::for_pull_request(&pr);
-            self.pending_handled_markers.record(&marker)?;
-            if let Err(err) = self.github.mark_pr_handled(&pr).await {
-                error!(
-                    pr = %pr.html_url,
-                    error = ?err,
-                    "failed to mark auto-review pull request handled after posting response"
-                );
-            }
-
-            if let Some((session_id, resume_command)) = codex_run.resume_command() {
-                info!(
-                    pr = %pr.html_url,
-                    author = %pr.author,
-                    codex_session_id = %session_id,
-                    codex_resume = %resume_command,
-                    "responded to auto-review pull request"
-                );
-            } else {
-                info!(
-                    pr = %pr.html_url,
-                    author = %pr.author,
-                    "responded to auto-review pull request"
                 );
             }
             Ok(())
@@ -998,7 +948,6 @@ where
 #[derive(Clone)]
 pub struct ConcurrentMaid<G, R, C> {
     maid: Maid<G, R, C>,
-    work: WorkQueue,
 }
 
 impl<G, R, C> ConcurrentMaid<G, R, C>
@@ -1007,6 +956,10 @@ where
     R: Worktrees + Clone + 'static,
     C: CodexRunner + Clone + 'static,
 {
+    pub async fn drain(&self) {
+        self.maid.drain().await;
+    }
+
     pub async fn run_once(&self) -> Result<PollReport> {
         let pending_markers = self.maid.pending_handled_markers.pending()?;
 
@@ -1029,12 +982,13 @@ where
                 continue;
             }
 
-            let reservation = if notification.is_mention_candidate() {
-                let Some(reservation) = self.work.try_reserve(notification_key(&work_key)) else {
+            let reserved = if notification.is_mention_candidate() {
+                let key = notification_key(&work_key);
+                let Some(hold) = self.maid.reviews.lock().await.begin_mention(&key) else {
                     report.skipped += 1;
                     continue;
                 };
-                Some(reservation)
+                Some((key, hold))
             } else {
                 None
             };
@@ -1046,7 +1000,7 @@ where
             {
                 Ok(assessments) => {
                     let has_work = assessments.iter().any(TaskAssessment::is_ready);
-                    self.handle_assessments(assessments, reservation, &mut report)
+                    self.handle_assessments(assessments, reserved, &mut report)
                         .await;
                     if !has_work {
                         self.maid.record_observed_notification(&notification)?;
@@ -1063,54 +1017,29 @@ where
             }
         }
 
-        for candidate in self.maid.auto_review_candidates().await? {
-            let pr = &candidate.pr;
-            report.seen += 1;
-            let Some(reservation) = self.work.try_reserve(task_key_for_trigger(&pr.html_url))
-            else {
-                report.skipped += 1;
-                continue;
-            };
-
-            match self
-                .maid
-                .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
-                .await
-            {
-                Ok(TaskAssessment::Ready(intent)) => {
-                    self.start_reserved(intent, reservation, &mut report).await;
-                }
-                Ok(TaskAssessment::Skipped) => report.skipped += 1,
-                Err(err) => {
-                    report.failed += 1;
-                    error!(
-                        pr = %pr.html_url,
-                        error = ?err,
-                        "failed to handle auto-review pull request"
-                    );
-                }
-            }
-        }
+        self.maid.review_open_pulls(&mut report, false).await;
 
         report.failed += self
             .maid
             .retry_pending_handled_markers(pending_markers, &observed_pending_markers)
             .await?;
-        report.in_flight = self.work.in_flight();
+        let mut reviews = self.maid.reviews.lock().await;
+        reviews.apply_finished();
+        report.in_flight = reviews.occupied();
         Ok(report)
     }
 
     async fn handle_assessments(
         &self,
         assessments: Vec<TaskAssessment>,
-        mut reservation: Option<WorkReservation>,
+        mut reserved: Option<(String, MentionDone)>,
         report: &mut PollReport,
     ) {
         for assessment in assessments {
             match assessment {
                 TaskAssessment::Ready(intent) => {
-                    if let Some(reservation) = reservation.take() {
-                        self.start_reserved(intent, reservation, report).await;
+                    if let Some((primary, hold)) = reserved.take() {
+                        self.start_mention(intent, primary, hold, report).await;
                     } else {
                         self.start_or_defer(intent, report).await;
                     }
@@ -1122,21 +1051,29 @@ where
 
     async fn start_or_defer(&self, intent: Box<TaskIntent>, report: &mut PollReport) {
         let task_key = intent.task_key();
-        let Some(reservation) = self.work.try_reserve(task_key) else {
+        let Some(hold) = self.maid.reviews.lock().await.begin_mention(&task_key) else {
             report.skipped += 1;
             return;
         };
 
-        self.start_reserved(intent, reservation, report).await;
+        self.start_mention(intent, task_key, hold, report).await;
     }
 
-    async fn start_reserved(
+    async fn start_mention(
         &self,
         intent: Box<TaskIntent>,
-        mut reservation: WorkReservation,
+        primary: String,
+        hold: MentionDone,
         report: &mut PollReport,
     ) {
-        if !reservation.add_key(intent.task_key()) {
+        let task_key = intent.task_key();
+        if !self
+            .maid
+            .reviews
+            .lock()
+            .await
+            .attach_mention_key(&primary, &task_key)
+        {
             report.skipped += 1;
             return;
         }
@@ -1146,7 +1083,7 @@ where
                 report.started += 1;
                 let maid = self.maid.clone();
                 tokio::spawn(async move {
-                    let _reservation = reservation;
+                    let _hold = hold;
                     if let Err(err) = maid.finish_task(task.clone()).await {
                         task.log_failure(&err);
                     }
@@ -1157,76 +1094,6 @@ where
                 report.failed += 1;
                 error!(error = ?err, "failed to start task");
             }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct WorkQueue {
-    slots: Arc<Semaphore>,
-    running: Arc<std::sync::Mutex<HashSet<String>>>,
-    max_concurrent_requests: usize,
-}
-
-impl WorkQueue {
-    fn new(max_concurrent_requests: usize) -> Self {
-        let max_concurrent_requests = max_concurrent_requests.max(1);
-        Self {
-            slots: Arc::new(Semaphore::new(max_concurrent_requests)),
-            running: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            max_concurrent_requests,
-        }
-    }
-
-    fn try_reserve(&self, key: String) -> Option<WorkReservation> {
-        let mut running = self.running.lock().expect("work queue lock is poisoned");
-        if running.contains(&key) {
-            return None;
-        }
-
-        let permit = self.slots.clone().try_acquire_owned().ok()?;
-        if !running.insert(key.clone()) {
-            return None;
-        }
-
-        Some(WorkReservation {
-            keys: vec![key],
-            running: self.running.clone(),
-            _permit: permit,
-        })
-    }
-
-    fn in_flight(&self) -> usize {
-        self.max_concurrent_requests - self.slots.available_permits()
-    }
-}
-
-struct WorkReservation {
-    keys: Vec<String>,
-    running: Arc<std::sync::Mutex<HashSet<String>>>,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl WorkReservation {
-    fn add_key(&mut self, key: String) -> bool {
-        if self.keys.contains(&key) {
-            return true;
-        }
-
-        let mut running = self.running.lock().expect("work queue lock is poisoned");
-        if !running.insert(key.clone()) {
-            return false;
-        }
-        self.keys.push(key);
-        true
-    }
-}
-
-impl Drop for WorkReservation {
-    fn drop(&mut self) {
-        let mut running = self.running.lock().expect("work queue lock is poisoned");
-        for key in &self.keys {
-            running.remove(key);
         }
     }
 }
@@ -1256,39 +1123,26 @@ enum TaskIntent {
         mention: Box<CommentMention>,
         task: CodexTask,
     },
-    AutoReviewPullRequest {
-        pr: PullRequest,
-        task: CodexTask,
-    },
 }
 
 impl TaskIntent {
     fn task_key(&self) -> String {
-        match self {
-            Self::Mention { task, .. } | Self::AutoReviewPullRequest { task, .. } => {
-                task_key_for_trigger(task.trigger_url())
-            }
-        }
+        let Self::Mention { task, .. } = self;
+        task_key_for_trigger(task.trigger_url())
     }
 
     fn log_task_limit_reached(&self) {
-        match self {
-            Self::Mention {
-                notification,
-                mention,
-                ..
-            } => info!(
-                notification_id = notification.id,
-                target = %mention.target.html_url(),
-                mention = %mention.html_url,
-                "skipping mention because the 24-hour task limit is reached"
-            ),
-            Self::AutoReviewPullRequest { pr, .. } => info!(
-                pr = %pr.html_url,
-                author = %pr.author,
-                "skipping auto-review pull request because the 24-hour task limit is reached"
-            ),
-        }
+        let Self::Mention {
+            notification,
+            mention,
+            ..
+        } = self;
+        info!(
+            notification_id = notification.id,
+            target = %mention.target.html_url(),
+            mention = %mention.html_url,
+            "skipping mention because the 24-hour task limit is reached"
+        );
     }
 }
 
@@ -1299,32 +1153,22 @@ enum StartedTask {
         mention: Box<CommentMention>,
         task: CodexTask,
     },
-    AutoReviewPullRequest {
-        pr: PullRequest,
-        task: CodexTask,
-    },
 }
 
 impl StartedTask {
     fn log_failure(&self, err: &anyhow::Error) {
-        match self {
-            Self::Mention {
-                notification,
-                mention,
-                ..
-            } => error!(
-                notification_id = notification.id,
-                target = %mention.target.html_url(),
-                mention = %mention.html_url,
-                error = ?err,
-                "failed to handle notification task"
-            ),
-            Self::AutoReviewPullRequest { pr, .. } => error!(
-                pr = %pr.html_url,
-                error = ?err,
-                "failed to handle auto-review pull request task"
-            ),
-        }
+        let Self::Mention {
+            notification,
+            mention,
+            ..
+        } = self;
+        error!(
+            notification_id = notification.id,
+            target = %mention.target.html_url(),
+            mention = %mention.html_url,
+            error = ?err,
+            "failed to handle notification task"
+        );
     }
 }
 
@@ -1359,30 +1203,14 @@ fn normalized_logins(logins: impl IntoIterator<Item = impl Into<String>>) -> Has
         .collect()
 }
 
-fn deduplicate_auto_review_candidates(
-    candidates: Vec<AutoReviewCandidate>,
-    repository_accounts: &HashSet<String>,
-    public_accounts: &HashSet<String>,
-) -> Vec<AutoReviewCandidate> {
-    let mut deduplicated = Vec::<AutoReviewCandidate>::new();
-    let mut index_by_url = HashMap::<String, usize>::new();
-
-    for candidate in candidates {
-        let key = candidate.pr.html_url.to_ascii_lowercase();
-        if let Some(index) = index_by_url.get(&key).copied() {
-            let existing = &deduplicated[index];
-            if !existing.has_allowed_author(repository_accounts, public_accounts)
-                && candidate.has_allowed_author(repository_accounts, public_accounts)
-            {
-                deduplicated[index] = candidate;
-            }
-        } else {
-            index_by_url.insert(key, deduplicated.len());
-            deduplicated.push(candidate);
-        }
+fn listed_pull(open: OpenPullRequest, source: Option<ListSource>) -> ListedPull {
+    ListedPull {
+        pr: open.pull_request,
+        head: open.head,
+        source: source.unwrap_or(ListSource::Repository),
+        requested_teams: open.requested_teams,
+        updated_at: open.updated_at,
     }
-
-    deduplicated
 }
 
 #[cfg(test)]
@@ -1416,15 +1244,11 @@ mod tests {
         events: Arc<StdMutex<Vec<String>>>,
         mention_calls: Arc<StdMutex<usize>>,
         mentions_calls: Arc<StdMutex<usize>>,
-        pr_state_calls: Arc<StdMutex<Vec<String>>>,
         post_error: Arc<StdMutex<Option<String>>>,
         handled_error: Arc<StdMutex<Option<String>>>,
         started_mentions: Arc<StdMutex<Vec<String>>>,
         handled_mentions: Arc<StdMutex<HashSet<String>>>,
         stale_pending_mentions: Arc<StdMutex<HashSet<String>>>,
-        started_prs: Arc<StdMutex<Vec<String>>>,
-        handled_prs: Arc<StdMutex<HashSet<String>>>,
-        stale_pending_prs: Arc<StdMutex<HashSet<String>>>,
     }
 
     #[async_trait]
@@ -1454,7 +1278,11 @@ mod tests {
             &self,
             _repo: &RepoSlug,
             order: OpenPullRequestOrder,
+            page: u32,
         ) -> Result<Vec<OpenPullRequest>> {
+            if page != 1 {
+                return Ok(Vec::new());
+            }
             self.list_orders.lock().unwrap().push(order);
             let created = self.pull_requests.lock().unwrap().clone();
             let updated = self.recently_updated_pull_requests.lock().unwrap().clone();
@@ -1473,6 +1301,7 @@ mod tests {
                         .cloned()
                         .unwrap_or_default();
                     OpenPullRequest {
+                        head: head_for(pull_request.number),
                         requested_teams: teams,
                         created_at: created_at.get(&pull_request.html_url).copied(),
                         updated_at: updated_at.get(&pull_request.html_url).copied(),
@@ -1485,12 +1314,20 @@ mod tests {
         async fn open_public_pull_requests_by_author(
             &self,
             author: &str,
+            page: u32,
         ) -> Result<Vec<PullRequest>> {
+            if page != 1 {
+                return Ok(Vec::new());
+            }
             self.public_pull_request_authors
                 .lock()
                 .unwrap()
                 .push(author.to_string());
             Ok(self.public_pull_requests.lock().unwrap().clone())
+        }
+
+        async fn pull_request_head(&self, pr: &PullRequest) -> Result<crate::review::HeadSha> {
+            Ok(head_for(pr.number))
         }
 
         async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
@@ -1566,53 +1403,6 @@ mod tests {
             Ok(())
         }
 
-        async fn pr_state(&self, pr: &PullRequest, _bot_login: &str) -> Result<ReviewState> {
-            self.pr_state_calls
-                .lock()
-                .unwrap()
-                .push(pr.html_url.clone());
-            if self
-                .stale_pending_prs
-                .lock()
-                .unwrap()
-                .contains(&pr.html_url)
-            {
-                return Ok(ReviewState::Pending);
-            }
-            if self.handled_prs.lock().unwrap().contains(&pr.html_url) {
-                Ok(ReviewState::Handled)
-            } else {
-                Ok(ReviewState::Pending)
-            }
-        }
-
-        async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()> {
-            self.events.lock().unwrap().push("start_pr".to_string());
-            self.started_prs.lock().unwrap().push(pr.html_url.clone());
-            Ok(())
-        }
-
-        async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()> {
-            self.events.lock().unwrap().push("handled_pr".to_string());
-            if let Some(message) = self.handled_error.lock().unwrap().take() {
-                return Err(anyhow!(message));
-            }
-            self.handled_prs.lock().unwrap().insert(pr.html_url.clone());
-            Ok(())
-        }
-
-        async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()> {
-            self.events.lock().unwrap().push("handled_pr".to_string());
-            if let Some(message) = self.handled_error.lock().unwrap().take() {
-                return Err(anyhow!(message));
-            }
-            self.handled_prs
-                .lock()
-                .unwrap()
-                .insert(html_url.to_string());
-            Ok(())
-        }
-
         async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
             self.events.lock().unwrap().push("mark".to_string());
             self.marks.lock().unwrap().push(notification.id.clone());
@@ -1642,6 +1432,7 @@ mod tests {
             &self,
             target: &WorkTarget,
             _task: &CodexTask,
+            _rev: &CheckoutRev,
         ) -> Result<PreparedWorktree> {
             self.calls.lock().unwrap().push(target.repo_key());
             if let Some(message) = self.error.lock().unwrap().take() {
@@ -1790,6 +1581,10 @@ mod tests {
         }
     }
 
+    fn head_for(number: u64) -> crate::review::HeadSha {
+        crate::review::HeadSha::parse(&format!("{number:040x}")).unwrap()
+    }
+
     fn pr() -> PullRequest {
         pr_with_author("dionysuzx")
     }
@@ -1900,7 +1695,7 @@ mod tests {
         codex: C,
     ) -> Maid<FakeGithub, FakeWorktrees, C>
     where
-        C: CodexRunner,
+        C: CodexRunner + Clone + 'static,
     {
         Maid::new(
             github,
@@ -2149,21 +1944,7 @@ mod tests {
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
         assert!(github.marks.lock().unwrap().is_empty());
-        assert_eq!(
-            *github.events.lock().unwrap(),
-            vec!["start_pr", "post", "handled_pr"]
-        );
-        assert_eq!(
-            *github.started_prs.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/1"]
-        );
-        assert!(
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .contains("https://github.com/o/r/pull/1")
-        );
+        assert_eq!(*github.events.lock().unwrap(), vec!["post"]);
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
@@ -2288,7 +2069,6 @@ mod tests {
         assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
         assert!(github.public_pull_requests.lock().unwrap().is_empty());
-        assert!(github.pr_state_calls.lock().unwrap().is_empty());
         assert!(github.posts.lock().unwrap().is_empty());
     }
 
@@ -2379,23 +2159,26 @@ mod tests {
         assert_eq!(first_report.started, 1);
         assert_eq!(first_report.skipped, 1);
         assert_eq!(first_report.in_flight, 1);
-        assert_eq!(
-            *github.pr_state_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/1"]
-        );
         entered.wait().await;
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
 
         release.notify_waiters();
-        wait_until(|| github.handled_prs.lock().unwrap().len() == 1).await;
+        let second_report = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                tokio::task::yield_now().await;
+                let report = maid.run_once().await.unwrap();
+                if report.started == 1 {
+                    return report;
+                }
+            }
+        })
+        .await
+        .expect("second head was not admitted");
 
-        let second_report = maid.run_once().await.unwrap();
-
-        assert_eq!(second_report.started, 1);
         assert_eq!(second_report.skipped, 1);
         entered.wait().await;
         release.notify_waiters();
-        wait_until(|| github.handled_prs.lock().unwrap().len() == 2).await;
+        wait_until(|| github.posts.lock().unwrap().len() == 2).await;
     }
 
     #[tokio::test]
@@ -2472,10 +2255,7 @@ mod tests {
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert_eq!(
-            *github.events.lock().unwrap(),
-            vec!["start_pr", "post", "handled_pr"]
-        );
+        assert_eq!(*github.events.lock().unwrap(), vec!["post"]);
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(
@@ -2681,10 +2461,6 @@ mod tests {
             .map(|(_, task)| task.pr_url.clone())
             .collect::<Vec<_>>();
         assert_eq!(urls, vec!["https://github.com/o/r/pull/3".to_string()]);
-        assert_eq!(
-            *github.pr_state_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/3".to_string()]
-        );
     }
 
     #[tokio::test]
@@ -2701,7 +2477,6 @@ mod tests {
 
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.pr_state_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
