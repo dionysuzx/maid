@@ -55,6 +55,12 @@ has no request timestamp, and the timeline is a separate oldest-first history.
 GitHub rewrites notification reasons, and the bot only receives
 `review_requested` when it is on the team.
 
+Set `continuous_review = true` to review every new head commit of a pull
+request in scope, not just the first one. Repository discovery then reads the
+most recently updated page, because a push moves a pull request to the top.
+Maid records the last head it reviewed for each pull request in
+`~/.maid/reviewed-heads.json`, written after the review comment is posted.
+
 ## Metrics
 
 Maid serves Prometheus metrics at `http://127.0.0.1:9464/metrics` by default.

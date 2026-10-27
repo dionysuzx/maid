@@ -299,6 +299,7 @@ mod tests {
                 api_url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
                 html_url: "https://github.com/o/r/pull/1".to_string(),
                 clone_url: "https://github.com/o/r.git".to_string(),
+                head: crate::domain::CommitSha::parse(&"a".repeat(40)).unwrap(),
             }),
         }
     }

@@ -1,6 +1,6 @@
 use crate::auto_review::{
-    AutoReviewAction, AutoReviewAuthor, AutoReviewObservation, authorizing_team,
-    classify_auto_review_author, plan_auto_review,
+    AutoReviewAuthor, ReviewCadence, authorizing_team, auto_review_task,
+    classify_auto_review_author,
 };
 use crate::domain::{
     CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
@@ -14,6 +14,7 @@ use crate::mention_thread::{
     MentionThreadPlan, MentionThreadRead, choose_mention_thread_read, plan_mention_thread,
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
+use crate::reviewed_head::{MemoryReviewedHeadStore, ReviewedHeadStore};
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -46,10 +47,6 @@ pub trait GithubClient: Send + Sync {
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()>;
-    async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState>;
-    async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()>;
-    async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()>;
-    async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
 }
 
@@ -123,9 +120,11 @@ pub struct Maid<G, R, C> {
     auto_review_repos: Vec<RepoSlug>,
     auto_review_teams: Vec<TeamSlug>,
     team_review_window: ChronoDuration,
+    review_cadence: ReviewCadence,
     task_starts: Arc<dyn TaskStartRecorder>,
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
     observed_notifications: Arc<dyn ObservedNotificationStore>,
+    reviewed_heads: Arc<dyn ReviewedHeadStore>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,19 +143,10 @@ struct AutoReviewCandidate {
 }
 
 impl AutoReviewCandidate {
-    fn repository(open: OpenPullRequest) -> Self {
+    fn listed(open: OpenPullRequest, source: AutoReviewSource) -> Self {
         Self {
             pr: open.pull_request,
-            source: AutoReviewSource::Repository,
-            requested_teams: open.requested_teams,
-            updated_at: open.updated_at,
-        }
-    }
-
-    fn team_activity(open: OpenPullRequest) -> Self {
-        Self {
-            pr: open.pull_request,
-            source: AutoReviewSource::TeamActivity,
+            source,
             requested_teams: open.requested_teams,
             updated_at: open.updated_at,
         }
@@ -226,9 +216,11 @@ where
             auto_review_repos: auto_review_repos.into_iter().collect(),
             auto_review_teams: Vec::new(),
             team_review_window: ChronoDuration::hours(24),
+            review_cadence: ReviewCadence::Once,
             task_starts: Arc::new(NoTaskLimit),
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
+            reviewed_heads: Arc::new(MemoryReviewedHeadStore::default()),
         }
     }
 
@@ -247,6 +239,11 @@ where
 
     pub fn with_team_review_window_hours(mut self, hours: u32) -> Self {
         self.team_review_window = ChronoDuration::hours(i64::from(hours));
+        self
+    }
+
+    pub fn with_review_cadence(mut self, review_cadence: ReviewCadence) -> Self {
+        self.review_cadence = review_cadence;
         self
     }
 
@@ -271,6 +268,14 @@ where
         observed_notifications: impl ObservedNotificationStore + 'static,
     ) -> Self {
         self.observed_notifications = Arc::new(observed_notifications);
+        self
+    }
+
+    pub fn with_reviewed_head_store(
+        mut self,
+        reviewed_heads: impl ReviewedHeadStore + 'static,
+    ) -> Self {
+        self.reviewed_heads = Arc::new(reviewed_heads);
         self
     }
 
@@ -329,10 +334,7 @@ where
         for candidate in self.auto_review_candidates().await? {
             let pr = &candidate.pr;
             report.seen += 1;
-            match self
-                .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
-                .await
-            {
+            match self.task_for_auto_review_candidate(&candidate).await {
                 Ok(TaskAssessment::Ready(intent)) => match self.start_task(intent).await {
                     Ok(TaskStartOutcome::Started(task)) => match self.finish_task(task).await {
                         Ok(()) => report.responded += 1,
@@ -419,25 +421,13 @@ where
     }
 
     async fn retry_pending_handled_marker(&self, marker: &PendingHandledMarker) -> Result<()> {
-        match marker {
-            PendingHandledMarker::Mention { api_url } => {
-                self.github.mark_mention_api_url_handled(api_url).await?;
-                info!(
-                    mention_api_url = %api_url,
-                    "refreshed pending completed mention handled marker"
-                );
-            }
-            PendingHandledMarker::PullRequest { html_url } => {
-                self.github
-                    .mark_pull_request_html_url_handled(html_url)
-                    .await?;
-                info!(
-                    pr = %html_url,
-                    "refreshed pending completed auto-review pull request handled marker"
-                );
-            }
-        }
-
+        self.github
+            .mark_mention_api_url_handled(&marker.api_url)
+            .await?;
+        info!(
+            mention_api_url = %marker.api_url,
+            "refreshed pending completed mention handled marker"
+        );
         Ok(())
     }
 
@@ -679,18 +669,38 @@ where
     async fn task_for_auto_review_candidate(
         &self,
         candidate: &AutoReviewCandidate,
-        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<TaskAssessment> {
-        let observation = self.observe_auto_review_candidate(candidate).await?;
-        self.apply_auto_review_action(plan_auto_review(observation), observed_pending_markers)
-            .await
+        let pr = &candidate.pr;
+        match self.auto_review_author(candidate) {
+            AutoReviewAuthor::Bot => return Ok(TaskAssessment::Skipped),
+            AutoReviewAuthor::NotAllowed => {
+                info!(
+                    pr = %pr.html_url,
+                    author = %pr.author,
+                    "skipping pull request from account without auto review"
+                );
+                return Ok(TaskAssessment::Skipped);
+            }
+            AutoReviewAuthor::Allowed => {}
+        }
+
+        let last_reviewed = self.reviewed_heads.last_reviewed(pr)?;
+        if !self
+            .review_cadence
+            .needs_review(&pr.head, last_reviewed.as_ref())
+        {
+            return Ok(TaskAssessment::Skipped);
+        }
+
+        Ok(TaskAssessment::Ready(Box::new(
+            TaskIntent::AutoReviewPullRequest {
+                task: auto_review_task(pr),
+                pr: pr.clone(),
+            },
+        )))
     }
 
-    async fn observe_auto_review_candidate(
-        &self,
-        candidate: &AutoReviewCandidate,
-    ) -> Result<AutoReviewObservation> {
-        let pr = &candidate.pr;
+    fn auto_review_author(&self, candidate: &AutoReviewCandidate) -> AutoReviewAuthor {
         let author_allowed = candidate.has_allowed_author(
             &self.auto_review_accounts,
             &self.auto_review_public_accounts,
@@ -703,42 +713,20 @@ where
             self.team_review_window,
         )
         .is_some();
-        let author =
-            classify_auto_review_author(pr, &self.bot_login, author_allowed || team_authorized);
-        if author != AutoReviewAuthor::Allowed {
-            return Ok(AutoReviewObservation::new(pr.clone(), author, None, false));
-        }
-
-        let state = self.github.pr_state(pr, &self.bot_login).await?;
-        let marker = PendingHandledMarker::for_pull_request(pr);
-        let has_pending_marker = self.pending_handled_markers.contains(&marker)?;
-
-        Ok(AutoReviewObservation::new(
-            pr.clone(),
-            author,
-            Some(state),
-            has_pending_marker,
-        ))
+        classify_auto_review_author(
+            &candidate.pr,
+            &self.bot_login,
+            author_allowed || team_authorized,
+        )
     }
 
     async fn auto_review_candidates(&self) -> Result<Vec<AutoReviewCandidate>> {
         let mut candidates = Vec::new();
 
         for repo in &self.auto_review_repos {
-            for open in self
-                .github
-                .open_pull_requests(repo, OpenPullRequestOrder::NewestCreated)
-                .await?
-            {
-                candidates.push(AutoReviewCandidate::repository(open));
-            }
-            if !self.auto_review_teams.is_empty() {
-                for open in self
-                    .github
-                    .open_pull_requests(repo, OpenPullRequestOrder::RecentlyUpdated)
-                    .await?
-                {
-                    candidates.push(AutoReviewCandidate::team_activity(open));
+            for (order, source) in self.repository_listings() {
+                for open in self.github.open_pull_requests(repo, order).await? {
+                    candidates.push(AutoReviewCandidate::listed(open, source.clone()));
                 }
             }
         }
@@ -762,41 +750,27 @@ where
         ))
     }
 
-    async fn apply_auto_review_action(
-        &self,
-        action: AutoReviewAction,
-        observed_pending_markers: &mut HashSet<PendingHandledMarker>,
-    ) -> Result<TaskAssessment> {
-        match action {
-            AutoReviewAction::StartTask { pr, task } => Ok(TaskAssessment::Ready(Box::new(
-                TaskIntent::AutoReviewPullRequest { pr, task },
-            ))),
-            AutoReviewAction::MarkHandled { pr, marker } => {
-                observed_pending_markers.insert(marker);
-                self.github.mark_pr_handled(&pr).await?;
-                info!(
-                    pr = %pr.html_url,
-                    "refreshed pending completed auto-review pull request handled marker"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-            AutoReviewAction::ForgetHandledMarker { pr, marker } => {
-                self.pending_handled_markers.remove(&marker)?;
-                info!(
-                    pr = %pr.html_url,
-                    "skipping already handled auto-review pull request"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
-            AutoReviewAction::SkipSelfAuthored => Ok(TaskAssessment::Skipped),
-            AutoReviewAction::SkipUnauthorized { pr } => {
-                info!(
-                    pr = %pr.html_url,
-                    author = %pr.author,
-                    "skipping pull request from account without auto review"
-                );
-                Ok(TaskAssessment::Skipped)
-            }
+    fn repository_listings(&self) -> Vec<(OpenPullRequestOrder, AutoReviewSource)> {
+        match self.review_cadence {
+            // A push moves updated_at, so this page shows every pull request with a new head.
+            ReviewCadence::EveryHead => vec![(
+                OpenPullRequestOrder::RecentlyUpdated,
+                AutoReviewSource::Repository,
+            )],
+            ReviewCadence::Once if self.auto_review_teams.is_empty() => vec![(
+                OpenPullRequestOrder::NewestCreated,
+                AutoReviewSource::Repository,
+            )],
+            ReviewCadence::Once => vec![
+                (
+                    OpenPullRequestOrder::NewestCreated,
+                    AutoReviewSource::Repository,
+                ),
+                (
+                    OpenPullRequestOrder::RecentlyUpdated,
+                    AutoReviewSource::TeamActivity,
+                ),
+            ],
         }
     }
 
@@ -906,9 +880,9 @@ where
         pr: PullRequest,
         task: CodexTask,
     ) -> Result<TaskStartOutcome> {
-        self.github.mark_pr_started(&pr).await?;
         info!(
             pr = %pr.html_url,
+            head = %pr.head,
             author = %pr.author,
             task_kind = task.task_kind(),
             "started handling auto-review pull request"
@@ -928,19 +902,12 @@ where
             self.github
                 .post_pr_comment(&pr, &codex_run.response)
                 .await?;
-            let marker = PendingHandledMarker::for_pull_request(&pr);
-            self.pending_handled_markers.record(&marker)?;
-            if let Err(err) = self.github.mark_pr_handled(&pr).await {
-                error!(
-                    pr = %pr.html_url,
-                    error = ?err,
-                    "failed to mark auto-review pull request handled after posting response"
-                );
-            }
+            self.reviewed_heads.record(&pr)?;
 
             if let Some((session_id, resume_command)) = codex_run.resume_command() {
                 info!(
                     pr = %pr.html_url,
+                    head = %pr.head,
                     author = %pr.author,
                     codex_session_id = %session_id,
                     codex_resume = %resume_command,
@@ -949,6 +916,7 @@ where
             } else {
                 info!(
                     pr = %pr.html_url,
+                    head = %pr.head,
                     author = %pr.author,
                     "responded to auto-review pull request"
                 );
@@ -1072,11 +1040,7 @@ where
                 continue;
             };
 
-            match self
-                .maid
-                .task_for_auto_review_candidate(&candidate, &mut observed_pending_markers)
-                .await
-            {
+            match self.maid.task_for_auto_review_candidate(&candidate).await {
                 Ok(TaskAssessment::Ready(intent)) => {
                     self.start_reserved(intent, reservation, &mut report).await;
                 }
@@ -1388,7 +1352,7 @@ fn deduplicate_auto_review_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CodexTaskOrigin, Issue, TeamSlug};
+    use crate::domain::{CodexTaskOrigin, CommitSha, Issue, TeamSlug};
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use std::collections::HashMap;
@@ -1416,15 +1380,11 @@ mod tests {
         events: Arc<StdMutex<Vec<String>>>,
         mention_calls: Arc<StdMutex<usize>>,
         mentions_calls: Arc<StdMutex<usize>>,
-        pr_state_calls: Arc<StdMutex<Vec<String>>>,
         post_error: Arc<StdMutex<Option<String>>>,
         handled_error: Arc<StdMutex<Option<String>>>,
         started_mentions: Arc<StdMutex<Vec<String>>>,
         handled_mentions: Arc<StdMutex<HashSet<String>>>,
         stale_pending_mentions: Arc<StdMutex<HashSet<String>>>,
-        started_prs: Arc<StdMutex<Vec<String>>>,
-        handled_prs: Arc<StdMutex<HashSet<String>>>,
-        stale_pending_prs: Arc<StdMutex<HashSet<String>>>,
     }
 
     #[async_trait]
@@ -1563,53 +1523,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(api_url.to_string());
-            Ok(())
-        }
-
-        async fn pr_state(&self, pr: &PullRequest, _bot_login: &str) -> Result<ReviewState> {
-            self.pr_state_calls
-                .lock()
-                .unwrap()
-                .push(pr.html_url.clone());
-            if self
-                .stale_pending_prs
-                .lock()
-                .unwrap()
-                .contains(&pr.html_url)
-            {
-                return Ok(ReviewState::Pending);
-            }
-            if self.handled_prs.lock().unwrap().contains(&pr.html_url) {
-                Ok(ReviewState::Handled)
-            } else {
-                Ok(ReviewState::Pending)
-            }
-        }
-
-        async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()> {
-            self.events.lock().unwrap().push("start_pr".to_string());
-            self.started_prs.lock().unwrap().push(pr.html_url.clone());
-            Ok(())
-        }
-
-        async fn mark_pr_handled(&self, pr: &PullRequest) -> Result<()> {
-            self.events.lock().unwrap().push("handled_pr".to_string());
-            if let Some(message) = self.handled_error.lock().unwrap().take() {
-                return Err(anyhow!(message));
-            }
-            self.handled_prs.lock().unwrap().insert(pr.html_url.clone());
-            Ok(())
-        }
-
-        async fn mark_pull_request_html_url_handled(&self, html_url: &str) -> Result<()> {
-            self.events.lock().unwrap().push("handled_pr".to_string());
-            if let Some(message) = self.handled_error.lock().unwrap().take() {
-                return Err(anyhow!(message));
-            }
-            self.handled_prs
-                .lock()
-                .unwrap()
-                .insert(html_url.to_string());
             Ok(())
         }
 
@@ -1811,7 +1724,19 @@ mod tests {
             api_url: format!("https://api.github.com/repos/o/r/pulls/{number}"),
             html_url: format!("https://github.com/o/r/pull/{number}"),
             clone_url: "https://github.com/o/r.git".to_string(),
+            head: sha(&format!("{number:x}")),
         }
+    }
+
+    fn pushed(pr: &PullRequest, head: &str) -> PullRequest {
+        PullRequest {
+            head: sha(head),
+            ..pr.clone()
+        }
+    }
+
+    fn sha(prefix: &str) -> CommitSha {
+        CommitSha::parse(&format!("{prefix:0<40}")).unwrap()
     }
 
     fn team_slug(value: &str) -> TeamSlug {
@@ -2149,21 +2074,7 @@ mod tests {
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
         assert!(github.marks.lock().unwrap().is_empty());
-        assert_eq!(
-            *github.events.lock().unwrap(),
-            vec!["start_pr", "post", "handled_pr"]
-        );
-        assert_eq!(
-            *github.started_prs.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/1"]
-        );
-        assert!(
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .contains("https://github.com/o/r/pull/1")
-        );
+        assert_eq!(*github.events.lock().unwrap(), vec!["post"]);
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
@@ -2288,7 +2199,6 @@ mod tests {
         assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
         assert!(github.public_pull_requests.lock().unwrap().is_empty());
-        assert!(github.pr_state_calls.lock().unwrap().is_empty());
         assert!(github.posts.lock().unwrap().is_empty());
     }
 
@@ -2379,15 +2289,11 @@ mod tests {
         assert_eq!(first_report.started, 1);
         assert_eq!(first_report.skipped, 1);
         assert_eq!(first_report.in_flight, 1);
-        assert_eq!(
-            *github.pr_state_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/1"]
-        );
         entered.wait().await;
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
 
         release.notify_waiters();
-        wait_until(|| github.handled_prs.lock().unwrap().len() == 1).await;
+        wait_until(|| github.posts.lock().unwrap().len() == 1).await;
 
         let second_report = maid.run_once().await.unwrap();
 
@@ -2395,7 +2301,7 @@ mod tests {
         assert_eq!(second_report.skipped, 1);
         entered.wait().await;
         release.notify_waiters();
-        wait_until(|| github.handled_prs.lock().unwrap().len() == 2).await;
+        wait_until(|| github.posts.lock().unwrap().len() == 2).await;
     }
 
     #[tokio::test]
@@ -2472,10 +2378,6 @@ mod tests {
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert_eq!(
-            *github.events.lock().unwrap(),
-            vec!["start_pr", "post", "handled_pr"]
-        );
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(
@@ -2681,10 +2583,6 @@ mod tests {
             .map(|(_, task)| task.pr_url.clone())
             .collect::<Vec<_>>();
         assert_eq!(urls, vec!["https://github.com/o/r/pull/3".to_string()]);
-        assert_eq!(
-            *github.pr_state_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/3".to_string()]
-        );
     }
 
     #[tokio::test]
@@ -2701,7 +2599,6 @@ mod tests {
 
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.pr_state_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2827,33 +2724,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_opened_pr_with_durable_handled_marker_after_restart() {
+    async fn review_once_ignores_new_heads() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
-        github
-            .handled_prs
-            .lock()
-            .unwrap()
-            .insert("https://github.com/o/r/pull/1".to_string());
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/unused"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
         let codex = FakeCodex::default();
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone());
 
-        let report = maid(github.clone(), worktrees.clone(), codex.clone())
-            .run_once()
-            .await
-            .unwrap();
+        let first = maid.run_once().await.unwrap();
+        *github.pull_requests.lock().unwrap() = vec![pushed(&pr(), "b")];
+        let after_push = maid.run_once().await.unwrap();
 
-        assert_eq!(report.seen, 1);
-        assert_eq!(report.skipped, 1);
-        assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.marks.lock().unwrap().is_empty());
-        assert!(github.events.lock().unwrap().is_empty());
-        assert!(worktrees.calls.lock().unwrap().is_empty());
-        assert!(codex.calls.lock().unwrap().is_empty());
+        assert_eq!(first.responded, 1);
+        assert_eq!(after_push.skipped, 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn continuous_review_reviews_each_new_head_once() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let worktrees = idle_worktrees();
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), worktrees, codex.clone())
+            .with_review_cadence(ReviewCadence::EveryHead);
+
+        let first = maid.run_once().await.unwrap();
+        let unchanged = maid.run_once().await.unwrap();
+        *github.pull_requests.lock().unwrap() = vec![pushed(&pr(), "b")];
+        let after_push = maid.run_once().await.unwrap();
+
+        assert_eq!(first.responded, 1);
+        assert_eq!(unchanged.skipped, 1);
+        assert_eq!(after_push.responded, 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 2);
+        assert!(
+            github
+                .list_orders
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|order| *order == OpenPullRequestOrder::RecentlyUpdated)
+        );
     }
 
     #[tokio::test]
@@ -3484,44 +3395,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_review_does_not_restart_finished_pr_during_reaction_lag() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker_path = temp.path().join("pending-handled-markers.json");
-        let pull_request = pr();
-        let github = FakeGithub::default();
-        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/worktree"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeCodex::default();
-        let maid = maid(github.clone(), worktrees, codex.clone())
-            .with_pending_handled_marker_store(
-                crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path),
-            );
-
-        let first_report = maid.run_once().await.unwrap();
-        github
-            .stale_pending_prs
-            .lock()
-            .unwrap()
-            .insert(pull_request.html_url);
-        let second_report = maid.run_once().await.unwrap();
-        let third_report = maid.run_once().await.unwrap();
-
-        assert_eq!(first_report.responded, 1);
-        assert_eq!(second_report.skipped, 1);
-        assert_eq!(third_report.skipped, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert_eq!(
-            *github.started_prs.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/1"]
-        );
-    }
-
-    #[tokio::test]
     async fn handled_latest_trusted_request_does_not_resurrect_older_mentions() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
@@ -3727,7 +3600,7 @@ mod tests {
     async fn retries_pending_mention_marker_without_notification() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("pending-handled-markers.json");
-        let marker = PendingHandledMarker::Mention {
+        let marker = PendingHandledMarker {
             api_url: "https://api.github.com/repos/o/r/issues/comments/2".to_string(),
         };
         let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
@@ -3766,7 +3639,7 @@ mod tests {
     async fn retryable_pending_mention_marker_failure_does_not_stop_polling() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("pending-handled-markers.json");
-        let marker = PendingHandledMarker::Mention {
+        let marker = PendingHandledMarker {
             api_url: "https://api.github.com/repos/o/r/issues/comments/99".to_string(),
         };
         let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
@@ -3802,7 +3675,7 @@ mod tests {
     async fn permanent_pending_mention_marker_failure_is_dropped() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("pending-handled-markers.json");
-        let marker = PendingHandledMarker::Mention {
+        let marker = PendingHandledMarker {
             api_url: "https://api.github.com/repos/o/r/issues/comments/99".to_string(),
         };
         let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
@@ -3836,7 +3709,7 @@ mod tests {
     async fn concurrent_run_retries_pending_mention_marker_without_notification() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("pending-handled-markers.json");
-        let marker = PendingHandledMarker::Mention {
+        let marker = PendingHandledMarker {
             api_url: "https://api.github.com/repos/o/r/issues/comments/2".to_string(),
         };
         let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
@@ -3864,79 +3737,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .contains("https://api.github.com/repos/o/r/issues/comments/2")
-        );
-        assert!(
-            !crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)
-                .contains(&marker)
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn retries_pending_auto_review_marker_without_rerunning_codex() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker_path = temp.path().join("pending-handled-markers.json");
-        let github = FakeGithub::default();
-        *github.pull_requests.lock().unwrap() = vec![pr()];
-        *github.handled_error.lock().unwrap() = Some("reaction failed".to_string());
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/worktree"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeCodex::default();
-        let maid = maid(github.clone(), worktrees, codex.clone())
-            .with_pending_handled_marker_store(
-                crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path),
-            );
-
-        let first_report = maid.run_once().await.unwrap();
-        let second_report = maid.run_once().await.unwrap();
-
-        assert_eq!(first_report.responded, 1);
-        assert_eq!(second_report.skipped, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert!(
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .contains("https://github.com/o/r/pull/1")
-        );
-    }
-
-    #[tokio::test]
-    async fn retries_pending_auto_review_marker_without_open_pull_request() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker_path = temp.path().join("pending-handled-markers.json");
-        let marker = PendingHandledMarker::PullRequest {
-            html_url: "https://github.com/o/r/pull/1".to_string(),
-        };
-        let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
-        store.record(&marker).unwrap();
-
-        let github = FakeGithub::default();
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/worktree"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeCodex::default();
-        let maid =
-            maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
-
-        let report = maid.run_once().await.unwrap();
-
-        assert_eq!(report.started, 0);
-        assert_eq!(*github.posts.lock().unwrap(), Vec::<String>::new());
-        assert_eq!(codex.calls.lock().unwrap().len(), 0);
-        assert!(
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .contains("https://github.com/o/r/pull/1")
         );
         assert!(
             !crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)

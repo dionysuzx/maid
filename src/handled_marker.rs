@@ -1,29 +1,23 @@
-use crate::domain::{CommentMention, PullRequest};
-use anyhow::{Context, Result, anyhow};
+use crate::domain::CommentMention;
+use crate::json_file;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
+/// A mention whose response was posted but whose handled reaction may be missing.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum PendingHandledMarker {
-    Mention { api_url: String },
-    PullRequest { html_url: String },
+pub struct PendingHandledMarker {
+    pub api_url: String,
 }
 
 impl PendingHandledMarker {
     pub fn for_mention(mention: &CommentMention) -> Self {
-        Self::Mention {
+        Self {
             api_url: mention.api_url.clone(),
-        }
-    }
-
-    pub fn for_pull_request(pr: &PullRequest) -> Self {
-        Self::PullRequest {
-            html_url: pr.html_url.clone(),
         }
     }
 }
@@ -95,9 +89,9 @@ impl PendingHandledMarkerStore for FilePendingHandledMarkerStore {
             .lock
             .lock()
             .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
-        let mut ledger = PendingHandledMarkerLedger::read(&self.path)?;
+        let mut ledger = json_file::read::<PendingHandledMarkerLedger>(&self.path)?;
         ledger.insert(marker);
-        ledger.write(&self.path)
+        json_file::write(&self.path, &ledger)
     }
 
     fn contains(&self, marker: &PendingHandledMarker) -> Result<bool> {
@@ -105,7 +99,7 @@ impl PendingHandledMarkerStore for FilePendingHandledMarkerStore {
             .lock
             .lock()
             .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
-        Ok(PendingHandledMarkerLedger::read(&self.path)?.contains(marker))
+        Ok(json_file::read::<PendingHandledMarkerLedger>(&self.path)?.contains(marker))
     }
 
     fn remove(&self, marker: &PendingHandledMarker) -> Result<()> {
@@ -113,9 +107,9 @@ impl PendingHandledMarkerStore for FilePendingHandledMarkerStore {
             .lock
             .lock()
             .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
-        let mut ledger = PendingHandledMarkerLedger::read(&self.path)?;
+        let mut ledger = json_file::read::<PendingHandledMarkerLedger>(&self.path)?;
         ledger.remove(marker);
-        ledger.write(&self.path)
+        json_file::write(&self.path, &ledger)
     }
 
     fn pending(&self) -> Result<Vec<PendingHandledMarker>> {
@@ -123,99 +117,34 @@ impl PendingHandledMarkerStore for FilePendingHandledMarkerStore {
             .lock
             .lock()
             .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
-        Ok(PendingHandledMarkerLedger::read(&self.path)?.pending())
+        Ok(json_file::read::<PendingHandledMarkerLedger>(&self.path)?.pending())
     }
 }
 
 #[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct PendingHandledMarkerLedger {
     mention_api_urls: BTreeSet<String>,
-    pull_request_html_urls: BTreeSet<String>,
 }
 
 impl PendingHandledMarkerLedger {
-    fn read(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str(&contents).with_context(|| {
-                format!(
-                    "failed to parse pending handled marker ledger {}",
-                    path.display()
-                )
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
-        }
-    }
-
     fn insert(&mut self, marker: &PendingHandledMarker) {
-        match marker {
-            PendingHandledMarker::Mention { api_url } => {
-                self.mention_api_urls.insert(api_url.clone());
-            }
-            PendingHandledMarker::PullRequest { html_url } => {
-                self.pull_request_html_urls.insert(html_url.clone());
-            }
-        }
+        self.mention_api_urls.insert(marker.api_url.clone());
     }
 
     fn contains(&self, marker: &PendingHandledMarker) -> bool {
-        match marker {
-            PendingHandledMarker::Mention { api_url } => self.mention_api_urls.contains(api_url),
-            PendingHandledMarker::PullRequest { html_url } => {
-                self.pull_request_html_urls.contains(html_url)
-            }
-        }
+        self.mention_api_urls.contains(&marker.api_url)
     }
 
     fn remove(&mut self, marker: &PendingHandledMarker) {
-        match marker {
-            PendingHandledMarker::Mention { api_url } => {
-                self.mention_api_urls.remove(api_url);
-            }
-            PendingHandledMarker::PullRequest { html_url } => {
-                self.pull_request_html_urls.remove(html_url);
-            }
-        }
+        self.mention_api_urls.remove(&marker.api_url);
     }
 
     fn pending(&self) -> Vec<PendingHandledMarker> {
         self.mention_api_urls
             .iter()
             .cloned()
-            .map(|api_url| PendingHandledMarker::Mention { api_url })
-            .chain(
-                self.pull_request_html_urls
-                    .iter()
-                    .cloned()
-                    .map(|html_url| PendingHandledMarker::PullRequest { html_url }),
-            )
+            .map(|api_url| PendingHandledMarker { api_url })
             .collect()
-    }
-
-    fn write(&self, path: &Path) -> Result<()> {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-
-        let mut file = tempfile::Builder::new()
-            .prefix(".maid-pending-handled-markers.")
-            .tempfile_in(parent)
-            .with_context(|| {
-                format!(
-                    "failed to create temp marker ledger in {}",
-                    parent.display()
-                )
-            })?;
-
-        serde_json::to_writer_pretty(&mut file, self).context("failed to encode marker ledger")?;
-        file.as_file()
-            .sync_all()
-            .with_context(|| format!("failed to sync {}", path.display()))?;
-        file.into_temp_path()
-            .persist(path)
-            .map_err(|err| err.error)
-            .with_context(|| format!("failed to replace {}", path.display()))?;
-        Ok(())
     }
 }
 
@@ -227,8 +156,8 @@ mod tests {
     fn file_store_persists_pending_markers() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pending-handled-markers.json");
-        let marker = PendingHandledMarker::PullRequest {
-            html_url: "https://github.com/o/r/pull/1".to_string(),
+        let marker = PendingHandledMarker {
+            api_url: "https://api.github.com/repos/o/r/issues/comments/2".to_string(),
         };
 
         let store = FilePendingHandledMarkerStore::new(&path);

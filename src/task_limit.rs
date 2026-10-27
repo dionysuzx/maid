@@ -1,8 +1,8 @@
+use crate::json_file;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -71,11 +71,11 @@ impl TaskStartRecorder for FileTaskStartRecorder {
             .lock()
             .map_err(|_| anyhow!("task start ledger lock is poisoned"))?;
         let now = unix_seconds(SystemTime::now())?;
-        let mut ledger = TaskStartLedgerFile::read(&self.path)?;
+        let mut ledger = json_file::read::<TaskStartLedgerFile>(&self.path)?;
         ledger.retain_window(now, limit.window);
 
         if ledger.started_at_unix_seconds.len() >= limit.max_started_tasks {
-            ledger.write(&self.path)?;
+            json_file::write(&self.path, &ledger)?;
             return Ok(TaskStartDecision::AtLimit {
                 limit: limit.max_started_tasks,
                 window: limit.window,
@@ -83,7 +83,7 @@ impl TaskStartRecorder for FileTaskStartRecorder {
         }
 
         ledger.started_at_unix_seconds.push(now);
-        ledger.write(&self.path)?;
+        json_file::write(&self.path, &ledger)?;
         Ok(TaskStartDecision::Recorded)
     }
 }
@@ -94,42 +94,10 @@ struct TaskStartLedgerFile {
 }
 
 impl TaskStartLedgerFile {
-    fn read(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str(&contents)
-                .with_context(|| format!("failed to parse task start ledger {}", path.display())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
-        }
-    }
-
     fn retain_window(&mut self, now: u64, window: Duration) {
         let window_seconds = window.as_secs();
         self.started_at_unix_seconds
             .retain(|started_at| now.saturating_sub(*started_at) < window_seconds);
-    }
-
-    fn write(&self, path: &Path) -> Result<()> {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-
-        let mut file = tempfile::Builder::new()
-            .prefix(".maid-task-starts.")
-            .tempfile_in(parent)
-            .with_context(|| {
-                format!("failed to create temp task ledger in {}", parent.display())
-            })?;
-
-        serde_json::to_writer_pretty(&mut file, self).context("failed to encode task ledger")?;
-        file.as_file()
-            .sync_all()
-            .with_context(|| format!("failed to sync {}", path.display()))?;
-        file.into_temp_path()
-            .persist(path)
-            .map_err(|err| err.error)
-            .with_context(|| format!("failed to replace {}", path.display()))?;
-        Ok(())
     }
 }
 

@@ -17,6 +17,10 @@ auto_review_public_accounts = ["your-name"]
 # qualify a pull request that still requests the team.
 auto_review_teams = ["Some-Org/eng-infra"]
 
+# Optional. When true, Maid reviews every new head commit of a pull request in
+# its auto-review scope instead of reviewing each pull request once.
+continuous_review = false
+
 # Optional. Defaults shown below.
 git_dir = "~/.maid/git"
 codex_bin = "codex"

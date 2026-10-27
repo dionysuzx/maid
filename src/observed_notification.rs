@@ -1,10 +1,10 @@
 use crate::domain::Notification;
-use anyhow::{Context, Result, anyhow};
+use crate::json_file;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -57,7 +57,8 @@ impl ObservedNotificationStore for FileObservedNotificationStore {
             .lock
             .lock()
             .map_err(|_| anyhow!("observed notification lock is poisoned"))?;
-        Ok(ObservedNotificationLedger::read(&self.path)?.contains_current(notification))
+        Ok(json_file::read::<ObservedNotificationLedger>(&self.path)?
+            .contains_current(notification))
     }
 
     fn record_current(&self, notification: &Notification) -> Result<()> {
@@ -65,9 +66,9 @@ impl ObservedNotificationStore for FileObservedNotificationStore {
             .lock
             .lock()
             .map_err(|_| anyhow!("observed notification lock is poisoned"))?;
-        let mut ledger = ObservedNotificationLedger::read(&self.path)?;
+        let mut ledger = json_file::read::<ObservedNotificationLedger>(&self.path)?;
         ledger.record_current(notification);
-        ledger.write(&self.path)
+        json_file::write(&self.path, &ledger)
     }
 }
 
@@ -77,19 +78,6 @@ struct ObservedNotificationLedger {
 }
 
 impl ObservedNotificationLedger {
-    fn read(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str(&contents).with_context(|| {
-                format!(
-                    "failed to parse observed notification ledger {}",
-                    path.display()
-                )
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
-        }
-    }
-
     fn contains_current(&self, notification: &Notification) -> bool {
         self.notifications
             .get(&notification.id)
@@ -104,33 +92,6 @@ impl ObservedNotificationLedger {
                 latest_comment_url: notification.latest_comment_url.clone(),
             },
         );
-    }
-
-    fn write(&self, path: &Path) -> Result<()> {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-
-        let mut file = tempfile::Builder::new()
-            .prefix(".maid-observed-notifications.")
-            .tempfile_in(parent)
-            .with_context(|| {
-                format!(
-                    "failed to create temp observed notification ledger in {}",
-                    parent.display()
-                )
-            })?;
-
-        serde_json::to_writer_pretty(&mut file, self)
-            .context("failed to encode observed notification ledger")?;
-        file.as_file()
-            .sync_all()
-            .with_context(|| format!("failed to sync {}", path.display()))?;
-        file.into_temp_path()
-            .persist(path)
-            .map_err(|err| err.error)
-            .with_context(|| format!("failed to replace {}", path.display()))?;
-        Ok(())
     }
 }
 
