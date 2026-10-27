@@ -58,7 +58,8 @@ GitHub rewrites notification reasons, and the bot only receives
 Set `continuous_review = true` to review every new head commit of a pull
 request in scope, not just the first one. Repository discovery then reads the
 most recently updated page, because a push moves a pull request to the top.
-Maid records the last head it reviewed for each pull request in
+A pull request Maid has reviewed stays in scope, even after GitHub clears the
+team request that brought it in once a team member reviews. Maid records the last head it reviewed for each pull request in
 `~/.maid/reviewed-heads.json`, written after the review comment is posted.
 When an automatic review starts, Maid adds 👀 to the pull request so its author
 can see Maid is working. The reaction is best effort and is not a record.
