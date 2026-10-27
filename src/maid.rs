@@ -726,11 +726,15 @@ where
         if let Some(head) = self.reviewed_heads.last_reviewed(pr)? {
             return Ok(Some(head));
         }
-        if !self.github.has_legacy_review(pr, &self.bot_login).await? {
+        let legacy_review = self
+            .pending_handled_markers
+            .has_legacy_pull_request(&pr.html_url)?
+            || self.github.has_legacy_review(pr, &self.bot_login).await?;
+        if !legacy_review {
             return Ok(None);
         }
 
-        // The +1 does not say which head was reviewed, so it covers the current one.
+        // Legacy records do not say which head was reviewed, so they cover the current one.
         self.reviewed_heads.record(pr)?;
         info!(
             pr = %pr.html_url,
@@ -2789,6 +2793,32 @@ mod tests {
         assert_eq!(after_push.responded, 1);
         assert_eq!(github.legacy_review_calls.lock().unwrap().len(), 1);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn adopts_legacy_pending_pull_request_marker_as_the_reviewed_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("pending-handled-markers.json");
+        std::fs::write(
+            &marker_path,
+            r#"{"mention_api_urls":[],"pull_request_html_urls":["https://github.com/o/r/pull/1"]}"#,
+        )
+        .unwrap();
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let codex = FakeCodex::default();
+
+        let report = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_pending_handled_marker_store(
+                crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path),
+            )
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert!(codex.calls.lock().unwrap().is_empty());
+        assert!(github.posts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

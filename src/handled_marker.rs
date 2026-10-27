@@ -27,6 +27,8 @@ pub trait PendingHandledMarkerStore: Send + Sync {
     fn contains(&self, marker: &PendingHandledMarker) -> Result<bool>;
     fn remove(&self, marker: &PendingHandledMarker) -> Result<()>;
     fn pending(&self) -> Result<Vec<PendingHandledMarker>>;
+    /// Whether this ledger recorded a posted auto-review before the reviewed-head ledger existed.
+    fn has_legacy_pull_request(&self, html_url: &str) -> Result<bool>;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,6 +67,15 @@ impl PendingHandledMarkerStore for MemoryPendingHandledMarkerStore {
             .lock()
             .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?
             .pending())
+    }
+
+    fn has_legacy_pull_request(&self, html_url: &str) -> Result<bool> {
+        Ok(self
+            .ledger
+            .lock()
+            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?
+            .pull_request_html_urls
+            .contains(html_url))
     }
 }
 
@@ -119,11 +130,24 @@ impl PendingHandledMarkerStore for FilePendingHandledMarkerStore {
             .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
         Ok(json_file::read::<PendingHandledMarkerLedger>(&self.path)?.pending())
     }
+
+    fn has_legacy_pull_request(&self, html_url: &str) -> Result<bool> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| anyhow!("pending handled marker lock is poisoned"))?;
+        Ok(json_file::read::<PendingHandledMarkerLedger>(&self.path)?
+            .pull_request_html_urls
+            .contains(html_url))
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct PendingHandledMarkerLedger {
     mention_api_urls: BTreeSet<String>,
+    /// Kept so writes do not drop the posted auto-reviews it recorded; nothing adds to it.
+    #[serde(default)]
+    pull_request_html_urls: BTreeSet<String>,
 }
 
 impl PendingHandledMarkerLedger {
@@ -173,22 +197,26 @@ mod tests {
     }
 
     #[test]
-    fn ledger_from_before_pull_request_markers_were_removed_still_reads() {
+    fn keeps_legacy_pull_request_markers_across_writes() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pending-handled-markers.json");
         std::fs::write(
             &path,
-            r#"{"mention_api_urls":["https://api.github.com/c/2"],"pull_request_html_urls":["https://github.com/o/r/pull/1"]}"#,
+            r#"{"mention_api_urls":[],"pull_request_html_urls":["https://github.com/o/r/pull/1"]}"#,
         )
         .unwrap();
+        let store = FilePendingHandledMarkerStore::new(&path);
 
-        let pending = FilePendingHandledMarkerStore::new(&path).pending().unwrap();
-
-        assert_eq!(
-            pending,
-            vec![PendingHandledMarker {
+        store
+            .record(&PendingHandledMarker {
                 api_url: "https://api.github.com/c/2".to_string(),
-            }]
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .has_legacy_pull_request("https://github.com/o/r/pull/1")
+                .unwrap()
         );
     }
 }
