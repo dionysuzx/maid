@@ -107,30 +107,39 @@ migrate-reviewed-heads:
     fi
 
     # Every auto-reviewed pull request has a bot comment, and the bot +1 on the
-    # pull request itself marked that review done.
+    # pull request itself marked that review done. Each read is assigned on its
+    # own line so set -e aborts before the ledger is replaced.
+    commented="$(gh search prs --commenter "$bot_login" --state open --limit 1000 \
+        --json repository,number --jq '.[] | "\(.repository.nameWithOwner) \(.number)"')"
     urls=()
     while read -r repo number; do
+        [[ -n "$repo" ]] || continue
         reviewed="$(gh api --paginate "repos/$repo/issues/$number/reactions" \
             --jq ".[] | select(.content == \"+1\" and (.user.login | ascii_downcase) == (\"$bot_login\" | ascii_downcase)) | .id")"
         if [[ -n "$reviewed" ]]; then
             urls+=("https://github.com/$repo/pull/$number")
         fi
-    done < <(gh search prs --commenter "$bot_login" --state open --limit 1000 \
-        --json repository,number --jq '.[] | "\(.repository.nameWithOwner) \(.number)"')
+    done <<<"$commented"
 
     # Reviews that were posted even though the +1 failed.
     if [[ -f "$markers" ]]; then
+        marked="$(jq -r '.pull_request_html_urls // [] | .[]' "$markers")"
         while read -r url; do
-            urls+=("$url")
-        done < <(jq -r '.pull_request_html_urls // [] | .[]' "$markers")
+            if [[ -n "$url" ]]; then
+                urls+=("$url")
+            fi
+        done <<<"$marked"
     fi
 
     # A reaction does not say which head was reviewed, so it covers the current one.
-    migrated="$(printf '%s\n' "${urls[@]}" | sort -u | while read -r url; do
-        [[ -n "$url" ]] || continue
-        gh pr view "$url" --json url,state,headRefOid \
-            --jq 'select(.state == "OPEN") | {(.url): .headRefOid}'
-    done | jq -s 'add // {}')"
+    migrated='{}'
+    for url in $(printf '%s\n' "${urls[@]}" | sort -u); do
+        entry="$(gh pr view "$url" --json url,state,headRefOid \
+            --jq 'select(.state == "OPEN") | {(.url): .headRefOid}')"
+        if [[ -n "$entry" ]]; then
+            migrated="$(jq -n --argjson all "$migrated" --argjson one "$entry" '$all + $one')"
+        fi
+    done
     existing='{}'
     if [[ -f "$ledger" ]]; then
         existing="$(jq '.heads_by_pull_request' "$ledger")"
