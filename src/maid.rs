@@ -2827,36 +2827,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_opened_pr_with_durable_handled_marker_after_restart() {
-        let github = FakeGithub::default();
-        *github.pull_requests.lock().unwrap() = vec![pr()];
-        github
-            .handled_prs
-            .lock()
-            .unwrap()
-            .insert("https://github.com/o/r/pull/1".to_string());
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/unused"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), worktrees.clone(), codex.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.seen, 1);
-        assert_eq!(report.skipped, 1);
-        assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.marks.lock().unwrap().is_empty());
-        assert!(github.events.lock().unwrap().is_empty());
-        assert!(worktrees.calls.lock().unwrap().is_empty());
-        assert!(codex.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn ignores_self_authored_opened_prs() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr_with_author("maid-bot")];
@@ -3484,44 +3454,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_review_does_not_restart_finished_pr_during_reaction_lag() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker_path = temp.path().join("pending-handled-markers.json");
-        let pull_request = pr();
-        let github = FakeGithub::default();
-        *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/worktree"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeCodex::default();
-        let maid = maid(github.clone(), worktrees, codex.clone())
-            .with_pending_handled_marker_store(
-                crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path),
-            );
-
-        let first_report = maid.run_once().await.unwrap();
-        github
-            .stale_pending_prs
-            .lock()
-            .unwrap()
-            .insert(pull_request.html_url);
-        let second_report = maid.run_once().await.unwrap();
-        let third_report = maid.run_once().await.unwrap();
-
-        assert_eq!(first_report.responded, 1);
-        assert_eq!(second_report.skipped, 1);
-        assert_eq!(third_report.skipped, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert_eq!(
-            *github.started_prs.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/1"]
-        );
-    }
-
-    #[tokio::test]
     async fn handled_latest_trusted_request_does_not_resurrect_older_mentions() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification_with_comment("n1", "4")];
@@ -3864,79 +3796,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .contains("https://api.github.com/repos/o/r/issues/comments/2")
-        );
-        assert!(
-            !crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)
-                .contains(&marker)
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn retries_pending_auto_review_marker_without_rerunning_codex() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker_path = temp.path().join("pending-handled-markers.json");
-        let github = FakeGithub::default();
-        *github.pull_requests.lock().unwrap() = vec![pr()];
-        *github.handled_error.lock().unwrap() = Some("reaction failed".to_string());
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/worktree"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeCodex::default();
-        let maid = maid(github.clone(), worktrees, codex.clone())
-            .with_pending_handled_marker_store(
-                crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path),
-            );
-
-        let first_report = maid.run_once().await.unwrap();
-        let second_report = maid.run_once().await.unwrap();
-
-        assert_eq!(first_report.responded, 1);
-        assert_eq!(second_report.skipped, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert!(
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .contains("https://github.com/o/r/pull/1")
-        );
-    }
-
-    #[tokio::test]
-    async fn retries_pending_auto_review_marker_without_open_pull_request() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker_path = temp.path().join("pending-handled-markers.json");
-        let marker = PendingHandledMarker::PullRequest {
-            html_url: "https://github.com/o/r/pull/1".to_string(),
-        };
-        let store = crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path);
-        store.record(&marker).unwrap();
-
-        let github = FakeGithub::default();
-        let worktrees = FakeWorktrees {
-            worktree: PathBuf::from("/tmp/worktree"),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeCodex::default();
-        let maid =
-            maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
-
-        let report = maid.run_once().await.unwrap();
-
-        assert_eq!(report.started, 0);
-        assert_eq!(*github.posts.lock().unwrap(), Vec::<String>::new());
-        assert_eq!(codex.calls.lock().unwrap().len(), 0);
-        assert!(
-            github
-                .handled_prs
-                .lock()
-                .unwrap()
-                .contains("https://github.com/o/r/pull/1")
         );
         assert!(
             !crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path)

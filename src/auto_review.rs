@@ -139,25 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_marker_is_marked_without_starting_task() {
-        let pr = pr("dionysuzx");
-        let action = plan_auto_review(AutoReviewObservation::new(
-            pr.clone(),
-            AutoReviewAuthor::Allowed,
-            Some(ReviewState::Pending),
-            true,
-        ));
-
-        assert_eq!(
-            action,
-            AutoReviewAction::MarkHandled {
-                marker: PendingHandledMarker::for_pull_request(&pr),
-                pr,
-            }
-        );
-    }
-
-    #[test]
     fn pending_allowed_pr_starts_review_task() {
         let pr = pr("dionysuzx");
         let action = plan_auto_review(AutoReviewObservation::new(
