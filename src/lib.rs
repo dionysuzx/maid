@@ -1,5 +1,6 @@
 pub mod auto_review;
 pub mod codex;
+pub mod comment_body;
 pub mod config;
 pub mod daemon_lock;
 pub mod domain;

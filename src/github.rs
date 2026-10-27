@@ -1,4 +1,5 @@
 use crate::{
+    comment_body::CommentBody,
     domain::{
         CommentMention, CommitSha, Issue, Notification, OpenPullRequest, OpenPullRequestOrder,
         PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
@@ -421,17 +422,23 @@ impl GithubClient for GitHubRestClient {
         Ok(pull_requests)
     }
 
-    async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
+    async fn post_comment(&self, target: &WorkTarget, body: &CommentBody) -> Result<()> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/issues/{}/comments",
             target.owner(),
             target.repo(),
             target.number()
         );
-        self.post_json(&url, &PostComment { body }).await
+        self.post_json(
+            &url,
+            &PostComment {
+                body: body.as_str(),
+            },
+        )
+        .await
     }
 
-    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
+    async fn post_pr_comment(&self, pr: &PullRequest, body: &CommentBody) -> Result<()> {
         self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
             .await
     }

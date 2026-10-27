@@ -2,6 +2,7 @@ use crate::auto_review::{
     AutoReviewAuthor, ReviewCadence, authorizing_team, auto_review_task,
     classify_auto_review_author,
 };
+use crate::comment_body::CommentBody;
 use crate::domain::{
     CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
     PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
@@ -40,8 +41,8 @@ pub trait GithubClient: Send + Sync {
         order: OpenPullRequestOrder,
     ) -> Result<Vec<OpenPullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
-    async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
-    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
+    async fn post_comment(&self, target: &WorkTarget, body: &CommentBody) -> Result<()>;
+    async fn post_pr_comment(&self, pr: &PullRequest, body: &CommentBody) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
     -> Result<ReviewState>;
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
@@ -839,9 +840,15 @@ where
         let result = async {
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
-            self.github
-                .post_comment(&mention.target, &codex_run.response)
-                .await?;
+            let body = CommentBody::from_response(&codex_run.response);
+            if body.withheld() {
+                warn!(
+                    notification_id = notification.id,
+                    mention = %mention.html_url,
+                    "withheld a mention response that contained a credential"
+                );
+            }
+            self.github.post_comment(&mention.target, &body).await?;
             let marker = PendingHandledMarker::for_mention(&mention);
             self.pending_handled_markers.record(&marker)?;
             if let Err(err) = self.github.mark_mention_handled(&mention).await {
@@ -908,9 +915,15 @@ where
         let result = async {
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
-            self.github
-                .post_pr_comment(&pr, &codex_run.response)
-                .await?;
+            let body = CommentBody::from_response(&codex_run.response);
+            if body.withheld() {
+                warn!(
+                    pr = %pr.html_url,
+                    head = %pr.head,
+                    "withheld an auto-review response that contained a credential"
+                );
+            }
+            self.github.post_pr_comment(&pr, &body).await?;
             self.reviewed_heads.record(&pr)?;
 
             if let Some((session_id, resume_command)) = codex_run.resume_command() {
@@ -1463,16 +1476,16 @@ mod tests {
             Ok(self.public_pull_requests.lock().unwrap().clone())
         }
 
-        async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
+        async fn post_comment(&self, _target: &WorkTarget, body: &CommentBody) -> Result<()> {
             self.events.lock().unwrap().push("post".to_string());
             if let Some(message) = self.post_error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
-            self.posts.lock().unwrap().push(body.to_string());
+            self.posts.lock().unwrap().push(body.as_str().to_string());
             Ok(())
         }
 
-        async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
+        async fn post_pr_comment(&self, pr: &PullRequest, body: &CommentBody) -> Result<()> {
             self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
                 .await
         }
@@ -1590,6 +1603,7 @@ mod tests {
     struct FakeCodex {
         calls: Arc<StdMutex<Vec<(PathBuf, CodexTask)>>>,
         error: Arc<StdMutex<Option<String>>>,
+        response: Arc<StdMutex<Option<String>>>,
     }
 
     #[async_trait]
@@ -1603,7 +1617,12 @@ mod tests {
                 return Err(anyhow!(message));
             }
             Ok(CodexRun {
-                response: "codex response".to_string(),
+                response: self
+                    .response
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "codex response".to_string()),
                 session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
             })
         }
@@ -2754,6 +2773,25 @@ mod tests {
 
         assert_eq!(report.responded, 1);
         assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+    }
+
+    #[tokio::test]
+    async fn withholds_a_leaked_credential_and_still_records_the_review() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let codex = FakeCodex::default();
+        *codex.response.lock().unwrap() = Some(format!("token: ghp_{}", "a".repeat(36)));
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone());
+
+        let first = maid.run_once().await.unwrap();
+        let second = maid.run_once().await.unwrap();
+
+        assert_eq!(first.responded, 1);
+        assert_eq!(second.skipped, 1);
+        let posts = github.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert!(!posts[0].contains("ghp_"));
+        assert_eq!(codex.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
