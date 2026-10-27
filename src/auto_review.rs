@@ -1,5 +1,4 @@
-use crate::domain::{CodexTask, CodexTaskOrigin, PullRequest, ReviewState, TeamSlug};
-use crate::handled_marker::PendingHandledMarker;
+use crate::domain::{CodexTask, CodexTaskOrigin, PullRequest, TeamSlug};
 use chrono::{DateTime, Duration, Utc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,22 +46,17 @@ pub fn authorizing_team<'a>(
 pub struct AutoReviewObservation {
     pr: PullRequest,
     author: AutoReviewAuthor,
-    state: Option<ReviewState>,
-    has_pending_marker: bool,
+    head: String,
+    posted: bool,
 }
 
 impl AutoReviewObservation {
-    pub fn new(
-        pr: PullRequest,
-        author: AutoReviewAuthor,
-        state: Option<ReviewState>,
-        has_pending_marker: bool,
-    ) -> Self {
+    pub fn new(pr: PullRequest, author: AutoReviewAuthor, head: String, posted: bool) -> Self {
         Self {
             pr,
             author,
-            state,
-            has_pending_marker,
+            head,
+            posted,
         }
     }
 }
@@ -72,14 +66,10 @@ pub enum AutoReviewAction {
     StartTask {
         pr: PullRequest,
         task: CodexTask,
+        head: String,
     },
-    MarkHandled {
+    SkipReviewed {
         pr: PullRequest,
-        marker: PendingHandledMarker,
-    },
-    ForgetHandledMarker {
-        pr: PullRequest,
-        marker: PendingHandledMarker,
     },
     SkipSelfAuthored,
     SkipUnauthorized {
@@ -96,28 +86,19 @@ pub fn plan_auto_review(observation: AutoReviewObservation) -> AutoReviewAction 
 }
 
 fn plan_allowed_auto_review(observation: AutoReviewObservation) -> AutoReviewAction {
-    let marker = PendingHandledMarker::for_pull_request(&observation.pr);
-    match observation.state {
-        Some(ReviewState::Handled) => AutoReviewAction::ForgetHandledMarker {
-            pr: observation.pr,
-            marker,
-        },
-        Some(ReviewState::Pending) if observation.has_pending_marker => {
-            AutoReviewAction::MarkHandled {
-                pr: observation.pr,
-                marker,
-            }
-        }
-        Some(ReviewState::Pending) => AutoReviewAction::StartTask {
-            task: CodexTask {
-                pr_url: observation.pr.html_url.clone(),
-                origin: CodexTaskOrigin::PullRequestOpened {
-                    author: observation.pr.author.clone(),
-                },
+    if observation.posted {
+        return AutoReviewAction::SkipReviewed { pr: observation.pr };
+    }
+
+    AutoReviewAction::StartTask {
+        task: CodexTask {
+            pr_url: observation.pr.html_url.clone(),
+            origin: CodexTaskOrigin::PullRequestOpened {
+                author: observation.pr.author.clone(),
             },
-            pr: observation.pr,
         },
-        None => AutoReviewAction::SkipUnauthorized { pr: observation.pr },
+        head: observation.head,
+        pr: observation.pr,
     }
 }
 
@@ -131,7 +112,7 @@ mod tests {
         let action = plan_auto_review(AutoReviewObservation::new(
             pr.clone(),
             AutoReviewAuthor::NotAllowed,
-            None,
+            String::new(),
             false,
         ));
 
@@ -139,22 +120,16 @@ mod tests {
     }
 
     #[test]
-    fn pending_marker_is_marked_without_starting_task() {
+    fn posted_head_is_not_reviewed_again() {
         let pr = pr("dionysuzx");
         let action = plan_auto_review(AutoReviewObservation::new(
             pr.clone(),
             AutoReviewAuthor::Allowed,
-            Some(ReviewState::Pending),
+            "abc".to_string(),
             true,
         ));
 
-        assert_eq!(
-            action,
-            AutoReviewAction::MarkHandled {
-                marker: PendingHandledMarker::for_pull_request(&pr),
-                pr,
-            }
-        );
+        assert_eq!(action, AutoReviewAction::SkipReviewed { pr });
     }
 
     #[test]
@@ -163,14 +138,15 @@ mod tests {
         let action = plan_auto_review(AutoReviewObservation::new(
             pr.clone(),
             AutoReviewAuthor::Allowed,
-            Some(ReviewState::Pending),
+            "abc".to_string(),
             false,
         ));
 
         assert!(matches!(
             action,
-            AutoReviewAction::StartTask { pr: started, task }
+            AutoReviewAction::StartTask { pr: started, task, head }
                 if started == pr
+                    && head == "abc"
                     && task.pr_url == "https://github.com/o/r/pull/1"
                     && matches!(task.origin, CodexTaskOrigin::PullRequestOpened { .. })
         ));

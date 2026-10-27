@@ -48,6 +48,13 @@ requests Maid should discover across GitHub. Maid ignores PRs into private base
 repositories. Repository-scoped review remains available through
 `auto_review_repos` and `auto_review_accounts`.
 
+Set `continuous_review` to keep listing tracked open pull requests past the
+first page. Either way, Maid reviews the current head once: a head that already
+has a posted Codex review is left alone. `task_limit_per_24h`,
+`max_concurrent_requests`, and `github_api_requests_per_hour` are the only
+limits. A review that posts and then fails to record that head can run once
+more after a restart.
+
 For `auto_review_teams`, GitHub moves `updated_at` when a draft is marked
 ready or a reviewer is requested, and also when someone later comments or
 pushes on a pull request that still requests the team. The pull request list

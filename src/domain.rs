@@ -144,6 +144,7 @@ pub struct OpenPullRequest {
     pub requested_teams: Vec<TeamSlug>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+    pub head: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

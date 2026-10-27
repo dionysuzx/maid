@@ -25,6 +25,7 @@ pub const DEFAULT_GITHUB_API_REQUESTS_PER_HOUR: u32 = 1_200;
 pub const DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS: u32 = 24;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const NOTIFICATION_PAGE_SIZE: usize = 50;
+const OPEN_PULL_REQUEST_PAGE_SIZE: usize = 50;
 const SEARCH_PAGE_SIZE: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 1_000;
 
@@ -327,14 +328,29 @@ impl GithubClient for GitHubRestClient {
         &self,
         repo: &RepoSlug,
         order: OpenPullRequestOrder,
+        all_pages: bool,
     ) -> Result<Vec<OpenPullRequest>> {
-        let pull_requests = self
-            .get::<Vec<ApiPullRequest>>(&open_pull_requests_url(repo, order))
-            .await?;
-        pull_requests
-            .into_iter()
-            .map(Self::open_pull_request_from_api)
-            .collect()
+        let mut page = 1u32;
+        let mut pull_requests = Vec::new();
+        loop {
+            let batch = self
+                .get::<Vec<ApiPullRequest>>(&open_pull_requests_url(repo, order, page))
+                .await?;
+            let done = !all_pages || batch.len() < OPEN_PULL_REQUEST_PAGE_SIZE;
+            for pr in batch {
+                pull_requests.push(Self::open_pull_request_from_api(pr)?);
+            }
+            if done {
+                break;
+            }
+            page += 1;
+        }
+        Ok(pull_requests)
+    }
+
+    async fn pull_request_head(&self, pr: &PullRequest) -> Result<String> {
+        let pr = self.get::<ApiPullRequest>(&pr.api_url).await?;
+        require_head(&pr.head.sha)
     }
 
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>> {
@@ -426,17 +442,6 @@ impl GithubClient for GitHubRestClient {
     async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()> {
         self.add_reaction_to_api_url(api_url, HANDLED_REACTION)
             .await
-    }
-
-    async fn pr_state(&self, pr: &PullRequest, bot_login: &str) -> Result<ReviewState> {
-        if self
-            .pr_has_reaction(pr, bot_login, HANDLED_REACTION)
-            .await?
-        {
-            Ok(ReviewState::Handled)
-        } else {
-            Ok(ReviewState::Pending)
-        }
     }
 
     async fn mark_pr_started(&self, pr: &PullRequest) -> Result<()> {
@@ -728,12 +733,12 @@ mod tests {
         };
 
         assert_eq!(
-            open_pull_requests_url(&repo, OpenPullRequestOrder::NewestCreated),
-            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=created&direction=desc&per_page=50"
+            open_pull_requests_url(&repo, OpenPullRequestOrder::NewestCreated, 1),
+            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=created&direction=desc&per_page=50&page=1"
         );
         assert_eq!(
-            open_pull_requests_url(&repo, OpenPullRequestOrder::RecentlyUpdated),
-            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=updated&direction=desc&per_page=50"
+            open_pull_requests_url(&repo, OpenPullRequestOrder::RecentlyUpdated, 2),
+            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=updated&direction=desc&per_page=50&page=2"
         );
     }
 
@@ -906,6 +911,7 @@ mod tests {
   "url": "https://api.github.com/repos/some-org/maid/pulls/7",
   "html_url": "https://github.com/some-org/maid/pull/7",
   "number": 7,
+  "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "user": { "login": "octocat" },
   "created_at": "2026-10-01T00:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
@@ -936,6 +942,7 @@ mod tests {
   "url": "https://api.github.com/repos/some-org/maid/pulls/7",
   "html_url": "https://github.com/some-org/maid/pull/7",
   "number": 7,
+  "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "user": { "login": "octocat" },
   "created_at": "2026-10-21T18:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
@@ -954,6 +961,7 @@ mod tests {
   "url": "https://api.github.com/repos/some-org/maid/pulls/7",
   "html_url": "https://github.com/some-org/maid/pull/7",
   "number": 7,
+  "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "user": { "login": "octocat" },
   "created_at": "2026-10-21T18:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
@@ -973,6 +981,7 @@ mod tests {
   "url": "https://api.github.com/repos/some-org/maid/pulls/7",
   "html_url": "https://github.com/some-org/maid/pull/7",
   "number": 7,
+  "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "user": { "login": "octocat" },
   "created_at": "2026-10-01T00:00:00Z",
   "updated_at": "not-a-timestamp",
@@ -1158,6 +1167,7 @@ impl GitHubRestClient {
             requested_teams: requested_teams_from_api(pr.requested_teams),
             created_at,
             updated_at,
+            head: require_head(&pr.head.sha)?,
             pull_request,
         })
     }
@@ -1248,16 +1258,6 @@ impl GitHubRestClient {
         self.post_json(&url, &PostReaction { content }).await
     }
 
-    async fn pr_has_reaction(
-        &self,
-        pr: &PullRequest,
-        bot_login: &str,
-        content: &str,
-    ) -> Result<bool> {
-        self.reactions_include(&self.pr_reactions_url(pr), bot_login, content)
-            .await
-    }
-
     async fn add_pr_reaction(&self, pr: &PullRequest, content: &str) -> Result<()> {
         self.post_json(&self.pr_reactions_url(pr), &PostReaction { content })
             .await
@@ -1299,7 +1299,7 @@ fn reaction_page_url(reactions_url: &str, page: u64) -> String {
     format!("{reactions_url}?per_page=100&page={page}")
 }
 
-fn open_pull_requests_url(repo: &RepoSlug, order: OpenPullRequestOrder) -> String {
+fn open_pull_requests_url(repo: &RepoSlug, order: OpenPullRequestOrder, page: u32) -> String {
     // GitHub defaults sort=updated to ascending, so direction=desc is required
     // for the team-review page to be the most recently updated pull requests.
     let sort = match order {
@@ -1307,9 +1307,16 @@ fn open_pull_requests_url(repo: &RepoSlug, order: OpenPullRequestOrder) -> Strin
         OpenPullRequestOrder::RecentlyUpdated => "updated",
     };
     format!(
-        "https://api.github.com/repos/{}/{}/pulls?state=open&sort={sort}&direction=desc&per_page=50",
+        "https://api.github.com/repos/{}/{}/pulls?state=open&sort={sort}&direction=desc&per_page={OPEN_PULL_REQUEST_PAGE_SIZE}&page={page}",
         repo.owner, repo.repo
     )
+}
+
+fn require_head(sha: &str) -> Result<String> {
+    if sha.is_empty() {
+        bail!("pull request head sha is empty");
+    }
+    Ok(sha.to_string())
 }
 
 fn timestamp_from_api(value: &str) -> Option<DateTime<Utc>> {
@@ -1484,11 +1491,17 @@ struct ApiPullRequest {
     html_url: String,
     number: u64,
     user: ApiUser,
+    head: ApiGitRef,
     created_at: String,
     updated_at: String,
     #[serde(default)]
     requested_teams: Option<Vec<ApiRequestedTeam>>,
     base: ApiPullRequestBase,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiGitRef {
+    sha: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -28,6 +28,8 @@ pub struct Config {
     pub task_start_ledger_path: PathBuf,
     pub pending_handled_marker_ledger_path: PathBuf,
     pub observed_notification_ledger_path: PathBuf,
+    pub reviewed_heads_path: PathBuf,
+    pub continuous_review: bool,
     pub task_limit_per_24h: Option<usize>,
     pub max_concurrent_requests: usize,
     pub github_api_requests_per_hour: GitHubApiRequestRate,
@@ -131,6 +133,8 @@ impl Config {
             task_start_ledger_path: maid_home.join("task-starts.json"),
             pending_handled_marker_ledger_path: maid_home.join("pending-handled-markers.json"),
             observed_notification_ledger_path: maid_home.join("observed-notifications.json"),
+            reviewed_heads_path: maid_home.join("reviewed-heads.json"),
+            continuous_review: file.continuous_review.unwrap_or(false),
             task_limit_per_24h,
             max_concurrent_requests,
             github_api_requests_per_hour,
@@ -164,6 +168,7 @@ struct ConfigFile {
     codex_prompts: Option<CodexPromptsFile>,
     github_api_ip: Option<String>,
     metrics_bind_address: Option<String>,
+    continuous_review: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
