@@ -328,30 +328,24 @@ impl GithubClient for GitHubRestClient {
         repo: &RepoSlug,
         order: OpenPullRequestOrder,
         page: u32,
-    ) -> Result<Vec<OpenPullRequest>> {
+    ) -> Result<crate::review::Fetched<OpenPullRequest>> {
         let pull_requests = self
             .get::<Vec<ApiPullRequest>>(&open_pull_requests_url(repo, order, page))
             .await?;
-        let mut rows = Vec::new();
-        for pull_request in pull_requests {
-            match Self::open_pull_request_from_api(pull_request) {
-                Ok(row) => rows.push(row),
-                Err(err) => warn!(error = %err, "dropping pull request with no head"),
-            }
-        }
-        Ok(rows)
+        Ok(fetched_pulls(pull_requests))
     }
 
     async fn open_public_pull_requests_by_author(
         &self,
         author: &str,
         page: u32,
-    ) -> Result<Vec<PullRequest>> {
+    ) -> Result<crate::review::Fetched<PullRequest>> {
         let mut pull_requests = Vec::new();
         let mut repositories = HashMap::new();
         let search = self
             .get::<ApiIssueSearch>(&public_pull_request_search_url(author, page)?)
             .await?;
+        let received = search.items.len();
         if search.incomplete_results {
             warn!(
                 author,
@@ -375,7 +369,10 @@ impl GithubClient for GitHubRestClient {
             }
         }
 
-        Ok(pull_requests)
+        Ok(crate::review::Fetched {
+            items: pull_requests,
+            received,
+        })
     }
 
     async fn pull_request_head(&self, pr: &PullRequest) -> Result<crate::review::HeadSha> {
@@ -759,6 +756,17 @@ mod tests {
         );
         assert!(dropped.created_at.is_some());
         assert!(dropped.updated_at.is_none());
+    }
+
+    #[test]
+    fn a_missing_head_does_not_shrink_the_page_github_returned() {
+        let with_head: ApiPullRequest =
+            serde_json::from_str(PULL_REQUEST_WITH_TEAM_FIXTURE).unwrap();
+        let mut without_head: ApiPullRequest =
+            serde_json::from_str(PULL_REQUEST_WITHOUT_TEAMS_FIXTURE).unwrap();
+        without_head.head = None;
+        let fetched = fetched_pulls(vec![with_head, without_head]);
+        assert_eq!((fetched.received, fetched.items.len()), (2, 1));
     }
 
     #[test]
@@ -1268,6 +1276,20 @@ fn open_pull_requests_url(repo: &RepoSlug, order: OpenPullRequestOrder, page: u3
         "https://api.github.com/repos/{}/{}/pulls?state=open&sort={sort}&direction=desc&per_page={PULL_PAGE_SIZE}&page={page}",
         repo.owner, repo.repo
     )
+}
+
+fn fetched_pulls(
+    pull_requests: Vec<ApiPullRequest>,
+) -> crate::review::Fetched<crate::domain::OpenPullRequest> {
+    let received = pull_requests.len();
+    let mut items = Vec::new();
+    for pull_request in pull_requests {
+        match GitHubRestClient::open_pull_request_from_api(pull_request) {
+            Ok(row) => items.push(row),
+            Err(err) => warn!(error = %err, "dropping pull request with no head"),
+        }
+    }
+    crate::review::Fetched { items, received }
 }
 
 fn timestamp_from_api(value: &str) -> Option<DateTime<Utc>> {

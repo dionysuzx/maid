@@ -25,7 +25,7 @@ Eight. The previous draft asked a reader to hold fourteen named pieces: `HeadSha
 3. **Covered set.** The SHAs whose Codex comment was posted. Loaded from `~/.maid/posted-heads.json` at start. One owner holds it.
 4. **In-flight set.** The SHAs whose review has been started and has not finished. Same owner. Not written to disk.
 5. **Slot count.** In-flight heads plus admitted mentions, compared with `max_concurrent_requests`. One count, on the owner. A mention hold drops when the mention task finishes, and the next admit applies that result.
-6. **`pages`.** Fetch REST page 1. If `continuous_review` is on, fetch page 2, 3, … until a page is shorter than the `per_page` that request already used (50 for pulls, 100 for search). The bool is read here and nowhere else.
+6. **`pages`.** Fetch REST page 1. If `continuous_review` is on, fetch page 2, 3, … until the response GitHub returned is shorter than the `per_page` that request already used (50 for pulls, 100 for search). Dropped rows do not shorten that count. A later page that cannot be fetched ends the walk and keeps the pages already read. The bool is read here and nowhere else.
 7. **Pinned checkout.** A head review fetches and detaches that `HeadSha`. `rev-parse` must equal it. Mentions still check out a named ref.
 8. **One owner.** The poll task holds the covered set, the in-flight set, and the slot count. Workers get a checkout, Codex, and GitHub. They do not get the sets. `Maid` is cloned into a mention task, so the owner sits behind a mutex; mention tasks do not lock it.
 
@@ -104,7 +104,7 @@ Repo and team pages are the pulls request they already are: `per_page=50`, `dire
 
 Public-author pages are the existing issue search (`per_page=100`) and the existing per-repo visibility GET. Issue search has no commit, so each kept hit is completed with GET of the pull URL on that hit, reading `head.sha`. A failed GET drops that hit. This GET is how the row comes to exist. It happens before coverage is known, so a covered public head pays it on every poll. It does not take a slot, a checkout, or a task allowance. Repo and team heads do not pay it: their SHA is on the pulls page.
 
-`continuous_review` defaults false and is serde-defaulted. Off means `pages` returns page 1 even when that page is full. On means it follows until a short page. `MAX_SEARCH_RESULTS` (the cap of 1000) goes away with the old search loop. GitHub returning an empty or short page is the stop. No new knob.
+`continuous_review` defaults false and is serde-defaulted. Off means `pages` returns page 1 even when that page is full. On means it follows until the response is short. `MAX_SEARCH_RESULTS` is not reintroduced. Search stops when GitHub returns a short page or refuses the next one; the pages already read stay. No new knob.
 
 ## Shutdown
 
@@ -134,7 +134,8 @@ I8's in-process half and its "drain finishes the record" half hold. The sentence
 - Posted-heads file missing: empty covered set, process starts.
 - Posted-heads file unreadable or unparseable: `open` fails, process does not start, file untouched.
 - `notifications()` error: poll returns before listing.
-- One repo page, one search page, or one repo-visibility GET fails: that source adds no rows; other sources and the mention-marker retry still run. Next poll retries the source.
+- The first page of a repo list or an author search fails: that source adds no rows. A later page fails: the walk stops and the pages already read stay. Other sources and the mention-marker retry still run. Next poll retries the source.
+- One repo-visibility GET fails: that search page fails. The rule above decides whether earlier pages of that author stay.
 - One search hit's pull GET fails, or a SHA does not parse: that row is dropped, the rest are kept, nothing is recorded.
 - `in_scope` is false: no submit, no record, no slot.
 - SHA covered or in flight, or the slot count is at the max: `Skip`. No task-ledger start, no checkout, no further GitHub call.
@@ -162,6 +163,9 @@ I8's in-process half and its "drain finishes the record" half hold. The sentence
 | `covered_head_does_not_take_the_only_slot_from_a_mention` | I4 | `(Started, 1, Skipped, false)` |
 | `stalled_checkout_does_not_block_the_poll_and_is_bounded` | I5 | the poll does not return (`returned=false`, `entered=1`) |
 | `public_author_pages_follow_the_flag` | I6 | the flag on still returns only page 1 |
+| `dropped_row_does_not_end_a_full_page` | I6 | a dropped row makes a full response look short |
+| `later_page_failure_keeps_pages_already_read` | I6 | the failed next page throws away the pages already read |
+| `a_missing_head_does_not_shrink_the_page_github_returned` | I6 | the pulls adapter counts rows it kept |
 | `one_candidate_checkout_failure_does_not_stop_the_other` | I7 | `(false, 0, 1)` |
 | `clean_shutdown_drains_the_posted_record` | I8 | `drain` returns before the SHA is in the file |
 | `out_of_scope_author_is_not_reviewed_or_recorded` | I9 | the outsider is reviewed and the file receives the SHA |

@@ -13,7 +13,7 @@ use std::{
     },
 };
 use tokio::sync::oneshot;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     domain::{PullRequest, TeamSlug},
@@ -66,17 +66,33 @@ pub struct AutoReviewPolicy {
     pub team_window: ChronoDuration,
 }
 
+pub struct Fetched<T> {
+    pub items: Vec<T>,
+    pub received: usize,
+}
+
 pub async fn pages<T, F, Fut>(continuous: bool, page_size: usize, mut fetch: F) -> Result<Vec<T>>
 where
     F: FnMut(u32) -> Fut,
-    Fut: Future<Output = Result<Vec<T>>>,
+    Fut: Future<Output = Result<Fetched<T>>>,
 {
     let mut page = 1u32;
     let mut all = Vec::new();
     loop {
-        let items = fetch(page).await?;
-        let full = page_size > 0 && items.len() >= page_size;
-        all.extend(items);
+        let fetched = match fetch(page).await {
+            Ok(fetched) => fetched,
+            Err(err) if all.is_empty() => return Err(err),
+            Err(err) => {
+                warn!(
+                    page,
+                    error = ?err,
+                    "listing stopped; keeping pages already read"
+                );
+                return Ok(all);
+            }
+        };
+        let full = page_size > 0 && fetched.received >= page_size;
+        all.extend(fetched.items);
         if !continuous || !full {
             return Ok(all);
         }
@@ -738,6 +754,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_row_does_not_end_a_full_page() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_page = Arc::clone(&seen);
+        let rows = pages(true, 2, move |page| {
+            let seen_page = Arc::clone(&seen_page);
+            async move {
+                seen_page.lock().unwrap().push(page);
+                let items = match page {
+                    1 => vec![listed(
+                        "ada",
+                        sha('a'),
+                        1,
+                        ListSource::PublicAuthor {
+                            login: "ada".to_string(),
+                        },
+                    )],
+                    2 => vec![listed(
+                        "ada",
+                        sha('b'),
+                        2,
+                        ListSource::PublicAuthor {
+                            login: "ada".to_string(),
+                        },
+                    )],
+                    _ => Vec::new(),
+                };
+                let received = if page == 1 { 2 } else { items.len() };
+                Ok(Fetched { items, received })
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+        assert!(rows.iter().any(|row| row.head == sha('b')));
+    }
+
+    #[tokio::test]
+    async fn later_page_failure_keeps_pages_already_read() {
+        let rows = pages(true, 1, |page| async move {
+            if page == 1 {
+                let items = vec![listed(
+                    "ada",
+                    sha('a'),
+                    1,
+                    ListSource::PublicAuthor {
+                        login: "ada".to_string(),
+                    },
+                )];
+                let received = items.len();
+                Ok(Fetched { items, received })
+            } else {
+                Err(anyhow!("search page is not available"))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].head, sha('a'));
+    }
+
+    #[tokio::test]
     async fn one_candidate_checkout_failure_does_not_stop_the_other() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("posted-heads.json");
@@ -825,11 +904,13 @@ mod tests {
             let second = second.clone();
             async move {
                 seen.lock().unwrap().push(page);
-                Ok(match page {
+                let items = match page {
                     1 => first,
                     2 => second,
                     _ => Vec::new(),
-                })
+                };
+                let received = items.len();
+                Ok(Fetched { items, received })
             }
         })
         .await

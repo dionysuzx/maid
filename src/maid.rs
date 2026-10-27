@@ -12,8 +12,8 @@ use crate::mention_thread::{
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::review::{
-    AutoReviewPolicy, CheckoutRev, ListSource, ListedPull, MentionDone, ReviewHead, Reviews,
-    SubmitOutcome, dedup_listed, in_scope, pages,
+    AutoReviewPolicy, CheckoutRev, Fetched, ListSource, ListedPull, MentionDone, ReviewHead,
+    Reviews, SubmitOutcome, dedup_listed, in_scope, pages,
 };
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::Result;
@@ -41,12 +41,12 @@ pub trait GithubClient: Send + Sync {
         repo: &RepoSlug,
         order: OpenPullRequestOrder,
         page: u32,
-    ) -> Result<Vec<OpenPullRequest>>;
+    ) -> Result<Fetched<OpenPullRequest>>;
     async fn open_public_pull_requests_by_author(
         &self,
         author: &str,
         page: u32,
-    ) -> Result<Vec<PullRequest>>;
+    ) -> Result<Fetched<PullRequest>>;
     async fn pull_request_head(&self, pr: &PullRequest) -> Result<crate::review::HeadSha>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
@@ -1279,9 +1279,12 @@ mod tests {
             _repo: &RepoSlug,
             order: OpenPullRequestOrder,
             page: u32,
-        ) -> Result<Vec<OpenPullRequest>> {
+        ) -> Result<Fetched<OpenPullRequest>> {
             if page != 1 {
-                return Ok(Vec::new());
+                return Ok(Fetched {
+                    items: Vec::new(),
+                    received: 0,
+                });
             }
             self.list_orders.lock().unwrap().push(order);
             let created = self.pull_requests.lock().unwrap().clone();
@@ -1293,7 +1296,7 @@ mod tests {
             let requested_teams = self.requested_teams.lock().unwrap().clone();
             let created_at = self.pull_created_at.lock().unwrap().clone();
             let updated_at = self.pull_updated_at.lock().unwrap().clone();
-            Ok(pull_requests
+            let items = pull_requests
                 .into_iter()
                 .map(|pull_request| {
                     let teams = requested_teams
@@ -1308,22 +1311,29 @@ mod tests {
                         pull_request,
                     }
                 })
-                .collect())
+                .collect::<Vec<_>>();
+            let received = items.len();
+            Ok(Fetched { items, received })
         }
 
         async fn open_public_pull_requests_by_author(
             &self,
             author: &str,
             page: u32,
-        ) -> Result<Vec<PullRequest>> {
+        ) -> Result<Fetched<PullRequest>> {
             if page != 1 {
-                return Ok(Vec::new());
+                return Ok(Fetched {
+                    items: Vec::new(),
+                    received: 0,
+                });
             }
             self.public_pull_request_authors
                 .lock()
                 .unwrap()
                 .push(author.to_string());
-            Ok(self.public_pull_requests.lock().unwrap().clone())
+            let items = self.public_pull_requests.lock().unwrap().clone();
+            let received = items.len();
+            Ok(Fetched { items, received })
         }
 
         async fn pull_request_head(&self, pr: &PullRequest) -> Result<crate::review::HeadSha> {
