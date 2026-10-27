@@ -3,8 +3,8 @@ use crate::auto_review::{
     classify_auto_review_author,
 };
 use crate::domain::{
-    CodexTask, CommentMention, CommitSha, MentionRequest, Notification, OpenPullRequest,
-    OpenPullRequestOrder, PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
+    CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
+    PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -47,8 +47,6 @@ pub trait GithubClient: Send + Sync {
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_handled(&self, mention: &CommentMention) -> Result<()>;
     async fn mark_mention_api_url_handled(&self, api_url: &str) -> Result<()>;
-    /// Before the reviewed-head ledger, Maid marked a reviewed pull request with a bot +1.
-    async fn has_legacy_review(&self, pr: &PullRequest, bot_login: &str) -> Result<bool>;
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()>;
 }
 
@@ -686,7 +684,7 @@ where
             AutoReviewAuthor::Allowed => {}
         }
 
-        let last_reviewed = self.last_reviewed_head(pr).await?;
+        let last_reviewed = self.reviewed_heads.last_reviewed(pr)?;
         if !self
             .review_cadence
             .needs_review(&pr.head, last_reviewed.as_ref())
@@ -720,28 +718,6 @@ where
             &self.bot_login,
             author_allowed || team_authorized,
         )
-    }
-
-    async fn last_reviewed_head(&self, pr: &PullRequest) -> Result<Option<CommitSha>> {
-        if let Some(head) = self.reviewed_heads.last_reviewed(pr)? {
-            return Ok(Some(head));
-        }
-        let legacy_review = self
-            .pending_handled_markers
-            .has_legacy_pull_request(&pr.html_url)?
-            || self.github.has_legacy_review(pr, &self.bot_login).await?;
-        if !legacy_review {
-            return Ok(None);
-        }
-
-        // Legacy records do not say which head was reviewed, so they cover the current one.
-        self.reviewed_heads.record(pr)?;
-        info!(
-            pr = %pr.html_url,
-            head = %pr.head,
-            "adopted legacy auto-review reaction as the reviewed head"
-        );
-        Ok(Some(pr.head.clone()))
     }
 
     async fn auto_review_candidates(&self) -> Result<Vec<AutoReviewCandidate>> {
@@ -1376,7 +1352,7 @@ fn deduplicate_auto_review_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CodexTaskOrigin, Issue, TeamSlug};
+    use crate::domain::{CodexTaskOrigin, CommitSha, Issue, TeamSlug};
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use std::collections::HashMap;
@@ -1404,13 +1380,11 @@ mod tests {
         events: Arc<StdMutex<Vec<String>>>,
         mention_calls: Arc<StdMutex<usize>>,
         mentions_calls: Arc<StdMutex<usize>>,
-        legacy_review_calls: Arc<StdMutex<Vec<String>>>,
         post_error: Arc<StdMutex<Option<String>>>,
         handled_error: Arc<StdMutex<Option<String>>>,
         started_mentions: Arc<StdMutex<Vec<String>>>,
         handled_mentions: Arc<StdMutex<HashSet<String>>>,
         stale_pending_mentions: Arc<StdMutex<HashSet<String>>>,
-        legacy_reviewed_prs: Arc<StdMutex<HashSet<String>>>,
     }
 
     #[async_trait]
@@ -1550,18 +1524,6 @@ mod tests {
                 .unwrap()
                 .insert(api_url.to_string());
             Ok(())
-        }
-
-        async fn has_legacy_review(&self, pr: &PullRequest, _bot_login: &str) -> Result<bool> {
-            self.legacy_review_calls
-                .lock()
-                .unwrap()
-                .push(pr.html_url.clone());
-            Ok(self
-                .legacy_reviewed_prs
-                .lock()
-                .unwrap()
-                .contains(&pr.html_url))
         }
 
         async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
@@ -2237,7 +2199,6 @@ mod tests {
         assert_eq!(report.seen, 1);
         assert_eq!(report.skipped, 1);
         assert!(github.public_pull_requests.lock().unwrap().is_empty());
-        assert!(github.legacy_review_calls.lock().unwrap().is_empty());
         assert!(github.posts.lock().unwrap().is_empty());
     }
 
@@ -2328,10 +2289,6 @@ mod tests {
         assert_eq!(first_report.started, 1);
         assert_eq!(first_report.skipped, 1);
         assert_eq!(first_report.in_flight, 1);
-        assert_eq!(
-            *github.legacy_review_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/1"]
-        );
         entered.wait().await;
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
 
@@ -2626,10 +2583,6 @@ mod tests {
             .map(|(_, task)| task.pr_url.clone())
             .collect::<Vec<_>>();
         assert_eq!(urls, vec!["https://github.com/o/r/pull/3".to_string()]);
-        assert_eq!(
-            *github.legacy_review_calls.lock().unwrap(),
-            vec!["https://github.com/o/r/pull/3".to_string()]
-        );
     }
 
     #[tokio::test]
@@ -2646,7 +2599,6 @@ mod tests {
 
         assert_eq!(report.skipped, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-        assert!(github.legacy_review_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2769,56 +2721,6 @@ mod tests {
         assert!(github.marks.lock().unwrap().is_empty());
         assert!(worktrees.calls.lock().unwrap().is_empty());
         assert!(codex.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn adopts_legacy_handled_reaction_as_the_reviewed_head() {
-        let github = FakeGithub::default();
-        *github.pull_requests.lock().unwrap() = vec![pr()];
-        github
-            .legacy_reviewed_prs
-            .lock()
-            .unwrap()
-            .insert("https://github.com/o/r/pull/1".to_string());
-        let codex = FakeCodex::default();
-        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_review_cadence(ReviewCadence::EveryHead);
-
-        let first = maid.run_once().await.unwrap();
-        let second = maid.run_once().await.unwrap();
-        *github.pull_requests.lock().unwrap() = vec![pushed(&pr(), "b")];
-        let after_push = maid.run_once().await.unwrap();
-
-        assert_eq!((first.skipped, second.skipped), (1, 1));
-        assert_eq!(after_push.responded, 1);
-        assert_eq!(github.legacy_review_calls.lock().unwrap().len(), 1);
-        assert_eq!(codex.calls.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn adopts_legacy_pending_pull_request_marker_as_the_reviewed_head() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker_path = temp.path().join("pending-handled-markers.json");
-        std::fs::write(
-            &marker_path,
-            r#"{"mention_api_urls":[],"pull_request_html_urls":["https://github.com/o/r/pull/1"]}"#,
-        )
-        .unwrap();
-        let github = FakeGithub::default();
-        *github.pull_requests.lock().unwrap() = vec![pr()];
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_pending_handled_marker_store(
-                crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path),
-            )
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.skipped, 1);
-        assert!(codex.calls.lock().unwrap().is_empty());
-        assert!(github.posts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

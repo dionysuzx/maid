@@ -427,15 +427,6 @@ impl GithubClient for GitHubRestClient {
             .await
     }
 
-    async fn has_legacy_review(&self, pr: &PullRequest, bot_login: &str) -> Result<bool> {
-        let reactions_url = format!(
-            "https://api.github.com/repos/{}/{}/issues/{}/reactions",
-            pr.owner, pr.repo, pr.number
-        );
-        self.reactions_include(&reactions_url, bot_login, HANDLED_REACTION)
-            .await
-    }
-
     async fn mark_notification_handled(&self, notification: &Notification) -> Result<()> {
         let url = format!(
             "https://api.github.com/notifications/threads/{}",

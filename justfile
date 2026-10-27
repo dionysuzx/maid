@@ -88,6 +88,59 @@ update:
 
 restart: stop start
 
+# One-off: seed reviewed-heads.json from the reactions Maid used before it. Run while stopped.
+migrate-reviewed-heads:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if just status >/dev/null 2>&1; then
+        echo "maid is running; run: just stop"
+        exit 1
+    fi
+
+    ledger="{{maid_home}}/reviewed-heads.json"
+    markers="{{maid_home}}/pending-handled-markers.json"
+    bot_login="$(sed -n 's/^bot_login *= *"\(.*\)".*/\1/p' "{{config_file}}")"
+    if [[ -z "$bot_login" ]]; then
+        echo "bot_login is missing from {{config_file}}"
+        exit 1
+    fi
+
+    # Every auto-reviewed pull request has a bot comment, and the bot +1 on the
+    # pull request itself marked that review done.
+    urls=()
+    while read -r repo number; do
+        reviewed="$(gh api --paginate "repos/$repo/issues/$number/reactions" \
+            --jq ".[] | select(.content == \"+1\" and (.user.login | ascii_downcase) == (\"$bot_login\" | ascii_downcase)) | .id")"
+        if [[ -n "$reviewed" ]]; then
+            urls+=("https://github.com/$repo/pull/$number")
+        fi
+    done < <(gh search prs --commenter "$bot_login" --state open --limit 1000 \
+        --json repository,number --jq '.[] | "\(.repository.nameWithOwner) \(.number)"')
+
+    # Reviews that were posted even though the +1 failed.
+    if [[ -f "$markers" ]]; then
+        while read -r url; do
+            urls+=("$url")
+        done < <(jq -r '.pull_request_html_urls // [] | .[]' "$markers")
+    fi
+
+    # A reaction does not say which head was reviewed, so it covers the current one.
+    migrated="$(printf '%s\n' "${urls[@]}" | sort -u | while read -r url; do
+        [[ -n "$url" ]] || continue
+        gh pr view "$url" --json url,state,headRefOid \
+            --jq 'select(.state == "OPEN") | {(.url): .headRefOid}'
+    done | jq -s 'add // {}')"
+    existing='{}'
+    if [[ -f "$ledger" ]]; then
+        existing="$(jq '.heads_by_pull_request' "$ledger")"
+    fi
+
+    jq -n --argjson migrated "$migrated" --argjson existing "$existing" \
+        '{heads_by_pull_request: ($migrated + $existing)}' >"$ledger.tmp"
+    mv "$ledger.tmp" "$ledger"
+    echo "recorded $(jq length <<<"$migrated") reviewed pull requests in $ledger"
+
 logs:
     #!/usr/bin/env bash
     set -euo pipefail

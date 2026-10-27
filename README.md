@@ -60,9 +60,6 @@ request in scope, not just the first one. Repository discovery then reads the
 most recently updated page, because a push moves a pull request to the top.
 Maid records the last head it reviewed for each pull request in
 `~/.maid/reviewed-heads.json`, written after the review comment is posted.
-A pull request Maid reviewed before this ledger existed, shown by a bot `+1` or
-an entry in the old pending-marker ledger, counts as reviewed at its current
-head.
 
 ## Metrics
 
