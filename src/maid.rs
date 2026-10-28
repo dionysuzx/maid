@@ -1,10 +1,10 @@
 use crate::auto_review::{
-    AutoReviewAuthor, ReviewCadence, authorizing_team, auto_review_task,
+    AutoReviewAuthor, ReviewCadence, authorizing_team, auto_review_comment, auto_review_task,
     classify_auto_review_author,
 };
 use crate::domain::{
     CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
-    PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
+    PullRequest, RepoSlug, ReviewState, TeamSlug, TreeSha, WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -40,6 +40,8 @@ pub trait GithubClient: Send + Sync {
         order: OpenPullRequestOrder,
     ) -> Result<Vec<OpenPullRequest>>;
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
+    /// The tree at the pull request's head commit.
+    async fn head_tree(&self, pr: &PullRequest) -> Result<TreeSha>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -689,8 +691,19 @@ where
 
         if !self
             .review_cadence
-            .needs_review(&pr.head, last_reviewed.as_ref())
+            .needs_review(&pr.head, last_reviewed.as_ref().map(|last| &last.commit))
         {
+            return Ok(TaskAssessment::Skipped);
+        }
+
+        let tree = self.github.head_tree(pr).await?;
+        if last_reviewed.is_some_and(|last| last.tree == tree) {
+            self.reviewed_heads.record(pr, &tree)?;
+            info!(
+                pr = %pr.html_url,
+                head = %pr.head,
+                "skipping new head whose code was already reviewed"
+            );
             return Ok(TaskAssessment::Skipped);
         }
 
@@ -698,6 +711,7 @@ where
             TaskIntent::AutoReviewPullRequest {
                 task: auto_review_task(pr),
                 pr: pr.clone(),
+                tree,
             },
         )))
     }
@@ -794,8 +808,8 @@ where
                 mention,
                 task,
             } => self.start_mention_task(notification, mention, task).await,
-            TaskIntent::AutoReviewPullRequest { pr, task } => {
-                self.start_auto_review_task(pr, task).await
+            TaskIntent::AutoReviewPullRequest { pr, task, tree } => {
+                self.start_auto_review_task(pr, task, tree).await
             }
         }
     }
@@ -829,8 +843,8 @@ where
                 mention,
                 task,
             } => self.finish_mention_task(notification, mention, task).await,
-            StartedTask::AutoReviewPullRequest { pr, task } => {
-                self.finish_auto_review_task(pr, task).await
+            StartedTask::AutoReviewPullRequest { pr, task, tree } => {
+                self.finish_auto_review_task(pr, task, tree).await
             }
         }
     }
@@ -887,6 +901,7 @@ where
         &self,
         pr: PullRequest,
         task: CodexTask,
+        tree: TreeSha,
     ) -> Result<TaskStartOutcome> {
         if let Err(err) = self.github.mark_pr_started(&pr).await {
             warn!(
@@ -904,20 +919,25 @@ where
         );
 
         Ok(TaskStartOutcome::Started(Box::new(
-            StartedTask::AutoReviewPullRequest { pr, task },
+            StartedTask::AutoReviewPullRequest { pr, task, tree },
         )))
     }
 
-    async fn finish_auto_review_task(&self, pr: PullRequest, task: CodexTask) -> Result<()> {
+    async fn finish_auto_review_task(
+        &self,
+        pr: PullRequest,
+        task: CodexTask,
+        tree: TreeSha,
+    ) -> Result<()> {
         let target = WorkTarget::PullRequest(pr.clone());
         let worktree = self.worktrees.prepare(&target, &task).await?;
         let result = async {
             let codex_run = self.codex.run(worktree.path(), &task).await?;
 
             self.github
-                .post_pr_comment(&pr, &codex_run.response)
+                .post_pr_comment(&pr, &auto_review_comment(&pr, &codex_run.response))
                 .await?;
-            self.reviewed_heads.record(&pr)?;
+            self.reviewed_heads.record(&pr, &tree)?;
 
             if let Some((session_id, resume_command)) = codex_run.resume_command() {
                 info!(
@@ -1238,6 +1258,7 @@ enum TaskIntent {
     AutoReviewPullRequest {
         pr: PullRequest,
         task: CodexTask,
+        tree: TreeSha,
     },
 }
 
@@ -1281,6 +1302,7 @@ enum StartedTask {
     AutoReviewPullRequest {
         pr: PullRequest,
         task: CodexTask,
+        tree: TreeSha,
     },
 }
 
@@ -1367,7 +1389,7 @@ fn deduplicate_auto_review_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CodexTaskOrigin, CommitSha, Issue, TeamSlug};
+    use crate::domain::{CodexTaskOrigin, CommitSha, Issue, TeamSlug, TreeSha};
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use std::collections::HashMap;
@@ -1390,6 +1412,7 @@ mod tests {
         pull_updated_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
+        head_trees: Arc<StdMutex<HashMap<CommitSha, TreeSha>>>,
         posts: Arc<StdMutex<Vec<String>>>,
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
@@ -1467,6 +1490,17 @@ mod tests {
                 .unwrap()
                 .push(author.to_string());
             Ok(self.public_pull_requests.lock().unwrap().clone())
+        }
+
+        async fn head_tree(&self, pr: &PullRequest) -> Result<TreeSha> {
+            // Each commit has its own code unless a test says otherwise.
+            Ok(self
+                .head_trees
+                .lock()
+                .unwrap()
+                .get(&pr.head)
+                .cloned()
+                .unwrap_or_else(|| TreeSha::parse(&pr.head.to_string()).unwrap()))
         }
 
         async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
@@ -1757,6 +1791,10 @@ mod tests {
             head: sha(head),
             ..pr.clone()
         }
+    }
+
+    fn review_of(pr: &PullRequest) -> String {
+        auto_review_comment(pr, "codex response")
     }
 
     fn sha(prefix: &str) -> CommitSha {
@@ -2096,7 +2134,7 @@ mod tests {
 
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![review_of(&pr())]);
         assert!(github.marks.lock().unwrap().is_empty());
         assert_eq!(*github.events.lock().unwrap(), vec!["start_pr", "post"]);
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
@@ -2146,7 +2184,7 @@ mod tests {
             *github.public_pull_request_authors.lock().unwrap(),
             vec!["dionysuzx"]
         );
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![review_of(&pr())]);
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
@@ -2189,7 +2227,7 @@ mod tests {
 
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![review_of(&pr())]);
     }
 
     #[tokio::test]
@@ -2257,7 +2295,7 @@ mod tests {
 
         release.notify_waiters();
         wait_until(|| github.posts.lock().unwrap().len() == 1).await;
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![review_of(&pr())]);
     }
 
     #[tokio::test]
@@ -2401,7 +2439,10 @@ mod tests {
 
         assert_eq!(report.seen, 1);
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(
+            *github.posts.lock().unwrap(),
+            vec![review_of(&pull_request)]
+        );
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(
@@ -2759,7 +2800,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![review_of(&pr())]);
     }
 
     #[tokio::test]
@@ -2804,6 +2845,31 @@ mod tests {
                 .iter()
                 .all(|order| *order == OpenPullRequestOrder::RecentlyUpdated)
         );
+    }
+
+    #[tokio::test]
+    async fn continuous_review_skips_a_new_head_with_the_reviewed_code() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let codex = FakeCodex::default();
+        let maid = maid(github.clone(), idle_worktrees(), codex.clone())
+            .with_review_cadence(ReviewCadence::EveryHead);
+
+        let first = maid.run_once().await.unwrap();
+        let rewritten = pushed(&pr(), "b");
+        github.head_trees.lock().unwrap().insert(
+            rewritten.head.clone(),
+            TreeSha::parse(&pr().head.to_string()).unwrap(),
+        );
+        *github.pull_requests.lock().unwrap() = vec![rewritten];
+        let after_force_push = maid.run_once().await.unwrap();
+        *github.pull_requests.lock().unwrap() = vec![pushed(&pr(), "c")];
+        let after_new_code = maid.run_once().await.unwrap();
+
+        assert_eq!(first.responded, 1);
+        assert_eq!(after_force_push.skipped, 1);
+        assert_eq!(after_new_code.responded, 1);
+        assert_eq!(codex.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

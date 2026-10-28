@@ -88,6 +88,38 @@ update:
 
 restart: stop start
 
+migrate-reviewed-head-trees:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if just status >/dev/null 2>&1; then
+        echo "maid is running; run: just stop"
+        exit 1
+    fi
+
+    ledger="{{maid_home}}/reviewed-heads.json"
+    if [[ ! -f "$ledger" ]]; then
+        echo "no ledger at $ledger"
+        exit 0
+    fi
+
+    # Each read is assigned on its own line so set -e aborts before the ledger
+    # is replaced.
+    entries="$(jq -r '.heads_by_pull_request | to_entries[]
+        | select(.value | type == "string") | "\(.key) \(.value)"' "$ledger")"
+    migrated="$(jq '.heads_by_pull_request | with_entries(select(.value | type == "object"))' "$ledger")"
+    while read -r url commit; do
+        [[ -n "$url" ]] || continue
+        repo="$(sed -E 's#^https://github.com/([^/]+/[^/]+)/pull/[0-9]+$#\1#' <<<"$url")"
+        tree="$(gh api "repos/$repo/git/commits/$commit" --jq '.tree.sha')"
+        migrated="$(jq -n --argjson all "$migrated" --arg url "$url" --arg commit "$commit" \
+            --arg tree "$tree" '$all + {($url): {commit: $commit, tree: $tree}}')"
+    done <<<"$entries"
+
+    jq -n --argjson migrated "$migrated" '{heads_by_pull_request: $migrated}' >"$ledger.tmp"
+    mv "$ledger.tmp" "$ledger"
+    echo "recorded trees for $(jq length <<<"$migrated") reviewed pull requests in $ledger"
+
 logs:
     #!/usr/bin/env bash
     set -euo pipefail
