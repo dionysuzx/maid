@@ -319,7 +319,7 @@ impl GithubClient for GitHubRestClient {
     }
 
     async fn mention_for(&self, notification: &Notification) -> Result<Option<CommentMention>> {
-        let Some(comment_url) = notification.latest_comment_url.as_deref() else {
+        let Some(comment_url) = comment_url(notification) else {
             return Ok(None);
         };
 
@@ -903,6 +903,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mention_for_does_not_fetch_a_pull_request_as_a_comment() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::clone(&requests);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buffer = [0; 1024];
+                let _ = stream.read(&mut buffer).await;
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let pr_url = format!("http://{address}/repos/dionysuzx/maid/pulls/52");
+        let notification = Notification {
+            id: "1".to_string(),
+            reason: "comment".to_string(),
+            subject_kind: "PullRequest".to_string(),
+            subject_url: Some(pr_url.clone()),
+            latest_comment_url: Some(pr_url),
+            unread: true,
+            updated_at: "2026-06-08T04:00:00Z".to_string(),
+        };
+
+        let mention = GitHubRestClient::new("token")
+            .mention_for(&notification)
+            .await
+            .unwrap();
+
+        assert!(mention.is_none());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn keeps_recent_comments_across_issue_and_review_comment_streams() {
         let mut comments = (0..21)
@@ -1084,7 +1125,7 @@ impl GitHubRestClient {
             return self.target_for_subject_url(subject_url).await;
         }
 
-        let Some(comment_url) = notification.latest_comment_url.as_deref() else {
+        let Some(comment_url) = comment_url(notification) else {
             return Ok(None);
         };
         let comment = self.get::<ApiComment>(comment_url).await?;
@@ -1401,6 +1442,13 @@ fn recent_comments(mut comments: Vec<ApiComment>, limit: usize) -> Vec<ApiCommen
     });
     let start = comments.len().saturating_sub(limit);
     comments.into_iter().skip(start).collect()
+}
+
+// GitHub sets latest_comment_url to the subject URL when the notification has no comment.
+fn comment_url(notification: &Notification) -> Option<&str> {
+    let url = notification.latest_comment_url.as_deref()?;
+    let (parent, id) = url.rsplit_once('/')?;
+    (parent.ends_with("/comments") && !id.is_empty()).then_some(url)
 }
 
 fn comment_mention(comment: ApiComment, target: &WorkTarget) -> CommentMention {
