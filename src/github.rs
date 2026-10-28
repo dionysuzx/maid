@@ -1,7 +1,7 @@
 use crate::{
     domain::{
         CommentMention, CommitSha, Issue, Notification, OpenPullRequest, OpenPullRequestOrder,
-        PullRequest, RepoSlug, ReviewState, TeamSlug, WorkTarget,
+        PullRequest, RepoSlug, ReviewState, TeamSlug, TreeSha, WorkTarget,
     },
     maid::GithubClient,
 };
@@ -419,6 +419,15 @@ impl GithubClient for GitHubRestClient {
         }
 
         Ok(pull_requests)
+    }
+
+    async fn head_tree(&self, pr: &PullRequest) -> Result<TreeSha> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/git/commits/{}",
+            pr.owner, pr.repo, pr.head
+        );
+        let commit = self.get::<ApiGitCommit>(&url).await?;
+        TreeSha::parse(&commit.tree.sha)
     }
 
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
@@ -1490,6 +1499,16 @@ struct ApiPullRequest {
 
 #[derive(Debug, Deserialize)]
 struct ApiCommitRef {
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiGitCommit {
+    tree: ApiGitObject,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiGitObject {
     sha: String,
 }
 

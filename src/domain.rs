@@ -154,11 +154,7 @@ pub struct CommitSha(String);
 
 impl CommitSha {
     pub fn parse(value: &str) -> Result<Self> {
-        let valid = value.len() == 40
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-        if valid {
+        if is_full_sha(value) {
             Ok(Self(value.to_string()))
         } else {
             Err(anyhow!("invalid commit SHA: {value:?}"))
@@ -184,6 +180,48 @@ impl fmt::Display for CommitSha {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+/// A full, lowercase git tree SHA: the code at a commit, whatever its history.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TreeSha(String);
+
+impl TreeSha {
+    pub fn parse(value: &str) -> Result<Self> {
+        if is_full_sha(value) {
+            Ok(Self(value.to_string()))
+        } else {
+            Err(anyhow!("invalid tree SHA: {value:?}"))
+        }
+    }
+}
+
+impl TryFrom<String> for TreeSha {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        Self::parse(&value)
+    }
+}
+
+impl From<TreeSha> for String {
+    fn from(sha: TreeSha) -> Self {
+        sha.0
+    }
+}
+
+impl fmt::Display for TreeSha {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+fn is_full_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// An open pull request as GitHub reported it, including the commit at its head.
