@@ -1,4 +1,4 @@
-use crate::domain::{CodexTask, CodexTaskOrigin, CommitSha, PullRequest, TeamSlug};
+use crate::domain::{CodexTask, CodexTaskOrigin, CommitSha, PullRequest, RequestedReviewer};
 use chrono::{DateTime, Duration, Utc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,13 +22,13 @@ pub fn classify_auto_review_author(
     }
 }
 
-pub fn authorizing_team<'a>(
-    requested_teams: &[TeamSlug],
-    configured_teams: &'a [TeamSlug],
+pub fn authorizing_reviewer<'a>(
+    requested_reviewers: &[RequestedReviewer],
+    configured_reviewers: &'a [RequestedReviewer],
     updated_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
     window: Duration,
-) -> Option<&'a TeamSlug> {
+) -> Option<&'a RequestedReviewer> {
     if window <= Duration::zero() {
         return None;
     }
@@ -37,9 +37,9 @@ pub fn authorizing_team<'a>(
         return None;
     }
 
-    configured_teams
+    configured_reviewers
         .iter()
-        .find(|team| requested_teams.contains(*team))
+        .find(|reviewer| requested_reviewers.contains(*reviewer))
 }
 
 /// How often Maid reviews a pull request that is in its auto-review scope.
@@ -122,28 +122,38 @@ mod tests {
     }
 
     #[test]
-    fn team_review_authorizes_only_a_configured_team_inside_the_window() {
+    fn review_request_authorizes_only_a_configured_reviewer_inside_the_window() {
         let now = DateTime::parse_from_rfc3339("2026-10-21T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let window = Duration::hours(24);
         let configured = [
-            TeamSlug::parse("some-org/docs").unwrap(),
-            TeamSlug::parse("Some-Org/eng-infra").unwrap(),
+            reviewer("some-org/docs"),
+            reviewer("Some-Org/eng-infra"),
+            reviewer("Maid-Bot"),
         ];
-        let requested = [
-            TeamSlug::parse("some-org/eng-infra").unwrap(),
-            TeamSlug::parse("some-org/docs").unwrap(),
-        ];
+        let requested = [reviewer("some-org/eng-infra"), reviewer("some-org/docs")];
 
         assert_eq!(
-            authorizing_team(&requested, &configured, Some(now - window), now, window)
+            authorizing_reviewer(&requested, &configured, Some(now - window), now, window)
                 .map(ToString::to_string)
                 .as_deref(),
             Some("some-org/docs")
         );
+        assert_eq!(
+            authorizing_reviewer(
+                &[reviewer("octocat"), reviewer("maid-bot")],
+                &configured,
+                Some(now),
+                now,
+                window,
+            )
+            .map(ToString::to_string)
+            .as_deref(),
+            Some("maid-bot")
+        );
         assert!(
-            authorizing_team(
+            authorizing_reviewer(
                 &requested,
                 &configured,
                 Some(now - window - Duration::seconds(1)),
@@ -152,12 +162,12 @@ mod tests {
             )
             .is_none()
         );
-        assert!(authorizing_team(&requested, &configured, None, now, window).is_none());
-        assert!(authorizing_team(&[], &configured, Some(now), now, window).is_none());
-        assert!(authorizing_team(&requested, &[], Some(now), now, window).is_none());
+        assert!(authorizing_reviewer(&requested, &configured, None, now, window).is_none());
+        assert!(authorizing_reviewer(&[], &configured, Some(now), now, window).is_none());
+        assert!(authorizing_reviewer(&requested, &[], Some(now), now, window).is_none());
         assert!(
-            authorizing_team(
-                &[TeamSlug::parse("other-org/eng-infra").unwrap()],
+            authorizing_reviewer(
+                &[reviewer("other-org/eng-infra"), reviewer("octocat")],
                 &configured,
                 Some(now),
                 now,
@@ -166,7 +176,7 @@ mod tests {
             .is_none()
         );
         assert!(
-            authorizing_team(
+            authorizing_reviewer(
                 &requested,
                 &configured,
                 Some(now + Duration::minutes(5)),
@@ -176,8 +186,13 @@ mod tests {
             .is_some()
         );
         assert!(
-            authorizing_team(&requested, &configured, Some(now), now, Duration::zero()).is_none()
+            authorizing_reviewer(&requested, &configured, Some(now), now, Duration::zero())
+                .is_none()
         );
+    }
+
+    fn reviewer(value: &str) -> RequestedReviewer {
+        RequestedReviewer::parse(value).unwrap()
     }
 
     fn sha(digit: char) -> CommitSha {

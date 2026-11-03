@@ -1,7 +1,7 @@
 use crate::{
     domain::{
         CommentMention, CommitSha, Issue, Notification, OpenPullRequest, OpenPullRequestOrder,
-        PullRequest, RepoSlug, ReviewState, TeamSlug, TreeSha, WorkTarget,
+        PullRequest, RepoSlug, RequestedReviewer, ReviewState, TeamSlug, TreeSha, WorkTarget,
     },
     maid::GithubClient,
 };
@@ -816,17 +816,20 @@ mod tests {
     }
 
     #[test]
-    fn reads_requested_teams_from_a_pull_request_list_payload() {
+    fn reads_requested_reviewers_from_a_pull_request_list_payload() {
         let open = GitHubRestClient::open_pull_request_from_api(
-            serde_json::from_str(PULL_REQUEST_WITH_TEAM_FIXTURE).unwrap(),
+            serde_json::from_str(PULL_REQUEST_WITH_REVIEWERS_FIXTURE).unwrap(),
         )
         .unwrap();
 
         assert_eq!(open.pull_request.author, "octocat");
         assert_eq!(open.pull_request.number, 7);
         assert_eq!(
-            open.requested_teams,
-            vec![TeamSlug::parse("some-org/eng-infra").unwrap()]
+            open.requested_reviewers,
+            vec![
+                RequestedReviewer::parse("maid-bot").unwrap(),
+                RequestedReviewer::parse("some-org/eng-infra").unwrap()
+            ]
         );
         assert_eq!(
             open.created_at,
@@ -845,25 +848,25 @@ mod tests {
             )
         );
 
-        let missing_teams = GitHubRestClient::open_pull_request_from_api(
-            serde_json::from_str(PULL_REQUEST_WITHOUT_TEAMS_FIXTURE).unwrap(),
+        let missing_reviewers = GitHubRestClient::open_pull_request_from_api(
+            serde_json::from_str(PULL_REQUEST_WITHOUT_REVIEWERS_FIXTURE).unwrap(),
         )
         .unwrap();
-        assert!(missing_teams.requested_teams.is_empty());
+        assert!(missing_reviewers.requested_reviewers.is_empty());
 
-        let null_teams = GitHubRestClient::open_pull_request_from_api(
-            serde_json::from_str(PULL_REQUEST_WITH_NULL_TEAMS_FIXTURE).unwrap(),
+        let null_reviewers = GitHubRestClient::open_pull_request_from_api(
+            serde_json::from_str(PULL_REQUEST_WITH_NULL_REVIEWERS_FIXTURE).unwrap(),
         )
         .unwrap();
-        assert!(null_teams.requested_teams.is_empty());
+        assert!(null_reviewers.requested_reviewers.is_empty());
 
         let dropped = GitHubRestClient::open_pull_request_from_api(
             serde_json::from_str(PULL_REQUEST_WITH_UNUSABLE_TEAM_FIXTURE).unwrap(),
         )
         .unwrap();
         assert_eq!(
-            dropped.requested_teams,
-            vec![TeamSlug::parse("some-org/docs").unwrap()]
+            dropped.requested_reviewers,
+            vec![RequestedReviewer::parse("some-org/docs").unwrap()]
         );
         assert!(dropped.created_at.is_some());
         assert!(dropped.updated_at.is_none());
@@ -1013,7 +1016,7 @@ mod tests {
         }
     }
 
-    const PULL_REQUEST_WITH_TEAM_FIXTURE: &str = r#"
+    const PULL_REQUEST_WITH_REVIEWERS_FIXTURE: &str = r#"
 {
   "url": "https://api.github.com/repos/some-org/maid/pulls/7",
   "html_url": "https://github.com/some-org/maid/pull/7",
@@ -1021,6 +1024,10 @@ mod tests {
   "user": { "login": "octocat" },
   "created_at": "2026-10-01T00:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
+  "requested_reviewers": [
+    { "login": "Maid-Bot" },
+    { "login": "maid-bot" }
+  ],
   "requested_teams": [
     {
       "name": "Engineering Infra",
@@ -1044,7 +1051,7 @@ mod tests {
 }
 "#;
 
-    const PULL_REQUEST_WITHOUT_TEAMS_FIXTURE: &str = r#"
+    const PULL_REQUEST_WITHOUT_REVIEWERS_FIXTURE: &str = r#"
 {
   "url": "https://api.github.com/repos/some-org/maid/pulls/7",
   "html_url": "https://github.com/some-org/maid/pull/7",
@@ -1063,7 +1070,7 @@ mod tests {
 }
 "#;
 
-    const PULL_REQUEST_WITH_NULL_TEAMS_FIXTURE: &str = r#"
+    const PULL_REQUEST_WITH_NULL_REVIEWERS_FIXTURE: &str = r#"
 {
   "url": "https://api.github.com/repos/some-org/maid/pulls/7",
   "html_url": "https://github.com/some-org/maid/pull/7",
@@ -1071,6 +1078,7 @@ mod tests {
   "user": { "login": "octocat" },
   "created_at": "2026-10-21T18:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
+  "requested_reviewers": null,
   "requested_teams": null,
   "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "base": {
@@ -1267,12 +1275,15 @@ impl GitHubRestClient {
             warn!(
                 pr = %pull_request.html_url,
                 updated_at = %pr.updated_at,
-                "pull request updated_at could not be parsed; team review will skip it"
+                "pull request updated_at could not be parsed; review request will skip it"
             );
         }
 
         Ok(OpenPullRequest {
-            requested_teams: requested_teams_from_api(pr.requested_teams),
+            requested_reviewers: requested_reviewers_from_api(
+                pr.requested_reviewers,
+                pr.requested_teams,
+            ),
             created_at,
             updated_at,
             pull_request,
@@ -1376,7 +1387,7 @@ fn reaction_page_url(reactions_url: &str, page: u64) -> String {
 
 fn open_pull_requests_url(repo: &RepoSlug, order: OpenPullRequestOrder) -> String {
     // GitHub defaults sort=updated to ascending, so direction=desc is required
-    // for the team-review page to be the most recently updated pull requests.
+    // for the review-request page to be the most recently updated pull requests.
     let sort = match order {
         OpenPullRequestOrder::NewestCreated => "created",
         OpenPullRequestOrder::RecentlyUpdated => "updated",
@@ -1393,8 +1404,20 @@ fn timestamp_from_api(value: &str) -> Option<DateTime<Utc>> {
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
-fn requested_teams_from_api(teams: Option<Vec<ApiRequestedTeam>>) -> Vec<TeamSlug> {
+fn requested_reviewers_from_api(
+    accounts: Option<Vec<ApiUser>>,
+    teams: Option<Vec<ApiRequestedTeam>>,
+) -> Vec<RequestedReviewer> {
     let mut parsed = Vec::new();
+    for account in accounts.unwrap_or_default() {
+        match RequestedReviewer::account(&account.login) {
+            Ok(reviewer) if !parsed.contains(&reviewer) => parsed.push(reviewer),
+            Ok(_) => {}
+            Err(err) => {
+                warn!(login = account.login, error = %err, "ignoring requested reviewer");
+            }
+        }
+    }
     for team in teams.unwrap_or_default() {
         let Some(html_url) = team
             .html_url
@@ -1405,8 +1428,8 @@ fn requested_teams_from_api(teams: Option<Vec<ApiRequestedTeam>>) -> Vec<TeamSlu
             continue;
         };
 
-        match TeamSlug::from_github_team(&team.slug, html_url) {
-            Ok(slug) if !parsed.contains(&slug) => parsed.push(slug),
+        match TeamSlug::from_github_team(&team.slug, html_url).map(RequestedReviewer::Team) {
+            Ok(reviewer) if !parsed.contains(&reviewer) => parsed.push(reviewer),
             Ok(_) => {}
             Err(err) => {
                 warn!(
@@ -1539,6 +1562,8 @@ struct ApiPullRequest {
     user: ApiUser,
     created_at: String,
     updated_at: String,
+    #[serde(default)]
+    requested_reviewers: Option<Vec<ApiUser>>,
     #[serde(default)]
     requested_teams: Option<Vec<ApiRequestedTeam>>,
     head: ApiCommitRef,

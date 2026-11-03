@@ -7,8 +7,8 @@ It watches for opened PRs and issue or PR mentions to your configured GitHub bot
 an isolated worktree, runs `codex`, and posts Codex's final answer back as a
 comment. It can also run automatic reviews for configured repositories, for
 configured accounts across all public repositories, or when a configured team
-is requested on an open pull request, and trusted users can request adhoc
-operator tasks with `/operate`.
+or account is requested as a reviewer on an open pull request, and trusted
+users can request adhoc operator tasks with `/operate`.
 
 Each task runs in its own git worktree while sharing a cached bare repository
 for the source GitHub repo.
@@ -48,18 +48,20 @@ requests Maid should discover across GitHub. Maid ignores PRs into private base
 repositories. Repository-scoped review remains available through
 `auto_review_repos` and `auto_review_accounts`.
 
-For `auto_review_teams`, GitHub moves `updated_at` when a draft is marked
-ready or a reviewer is requested, and also when someone later comments or
-pushes on a pull request that still requests the team. The pull request list
-has no request timestamp, and the timeline is a separate oldest-first history.
-GitHub rewrites notification reasons, and the bot only receives
-`review_requested` when it is on the team.
+Set `auto_review_requested_reviewers` to teams (`org/team-slug`) and accounts
+(`login`) whose review request on a pull request in `auto_review_repos` asks
+Maid to review it. List the bot's own login to review whenever someone requests
+it. GitHub moves `updated_at` when a draft is marked ready or a reviewer is
+requested, and also when someone later comments or pushes on a pull request
+that still requests the reviewer. The pull request list has no request timestamp, and the timeline is a separate oldest-first history.
+GitHub rewrites notification reasons, so Maid reads review requests from the
+pull request, not from `review_requested` notifications.
 
 Set `continuous_review = true` to review every new head commit of a pull
 request in scope, not just the first one. Repository discovery then reads the
 most recently updated page, because a push moves a pull request to the top.
 A pull request Maid has reviewed stays in scope, even after GitHub clears the
-team request that brought it in once a team member reviews. Maid records the last head it reviewed for each pull request in
+review request that brought it in once the reviewer reviews. Maid records the last head it reviewed for each pull request in
 `~/.maid/reviewed-heads.json`, written after the review comment is posted.
 Each entry keeps the head's tree too, so a force-push that only rewrites
 history, leaving the code unchanged, is not reviewed again. Each review

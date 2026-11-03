@@ -13,9 +13,11 @@ auto_review_repos = ["your-name/maid"]
 # master_accounts. Empty or omitted disables cross-repository discovery.
 auto_review_public_accounts = ["your-name"]
 
-# Optional. A comment or push inside github_notification_window_hours can still
-# qualify a pull request that still requests the team.
-auto_review_teams = ["Some-Org/eng-infra"]
+# Optional. Reviews a pull request in auto_review_repos that requests one of
+# these teams (org/team-slug) or accounts (login) as a reviewer. A comment or
+# push inside github_notification_window_hours can still qualify a pull request
+# that still requests the reviewer.
+auto_review_requested_reviewers = ["Some-Org/eng-infra", "maid-bot"]
 
 # Optional. When true, Maid reviews every new head commit of a pull request in
 # its auto-review scope instead of reviewing each pull request once.

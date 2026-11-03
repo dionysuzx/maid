@@ -48,8 +48,8 @@ async fn main() -> Result<()> {
         config.auto_review_repos.clone(),
     )
     .with_public_auto_review_accounts(config.auto_review_public_accounts.clone())
-    .with_auto_review_teams(config.auto_review_teams.clone())
-    .with_team_review_window_hours(config.github_notification_window.as_hours())
+    .with_auto_review_requested_reviewers(config.auto_review_requested_reviewers.clone())
+    .with_review_request_window_hours(config.github_notification_window.as_hours())
     .with_review_cadence(config.review_cadence)
     .with_task_start_recorder(FileTaskStartRecorder::new(
         config.task_limit_per_24h,
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
         auto_review_accounts = config.auto_review_accounts.len(),
         auto_review_public_accounts = config.auto_review_public_accounts.len(),
         auto_review_repos = config.auto_review_repos.len(),
-        auto_review_teams = config.auto_review_teams.len(),
+        auto_review_requested_reviewers = config.auto_review_requested_reviewers.len(),
         review_cadence = ?config.review_cadence,
         metrics_bind_address = %config.metrics_bind_address,
         "maid started"

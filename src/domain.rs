@@ -133,6 +133,40 @@ impl fmt::Display for TeamSlug {
     }
 }
 
+/// A team or account whose review a pull request requests.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum RequestedReviewer {
+    Team(TeamSlug),
+    Account(String),
+}
+
+impl RequestedReviewer {
+    /// Parses `org/team-slug` as a team and anything else as an account login.
+    pub fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if value.contains('/') {
+            return TeamSlug::parse(value).map(Self::Team);
+        }
+
+        Self::account(value)
+    }
+
+    pub fn account(login: &str) -> Result<Self> {
+        let login = login.trim();
+        validate_repo_name_part(login, "reviewer login")?;
+        Ok(Self::Account(login.to_ascii_lowercase()))
+    }
+}
+
+impl fmt::Display for RequestedReviewer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Team(team) => team.fmt(formatter),
+            Self::Account(login) => formatter.write_str(login),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenPullRequestOrder {
     NewestCreated,
@@ -142,7 +176,7 @@ pub enum OpenPullRequestOrder {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenPullRequest {
     pub pull_request: PullRequest,
-    pub requested_teams: Vec<TeamSlug>,
+    pub requested_reviewers: Vec<RequestedReviewer>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -839,6 +873,26 @@ mod tests {
         assert!(TeamSlug::parse("some-org/").is_err());
         assert!(TeamSlug::parse("/eng-infra").is_err());
         assert!(TeamSlug::parse("../eng-infra").is_err());
+    }
+
+    #[test]
+    fn parses_requested_reviewers_as_teams_or_accounts() {
+        assert_eq!(
+            RequestedReviewer::parse(" Some-Org/Eng-Infra ").unwrap(),
+            RequestedReviewer::Team(TeamSlug::parse("some-org/eng-infra").unwrap())
+        );
+        assert_eq!(
+            RequestedReviewer::parse(" Maid-Bot ").unwrap(),
+            RequestedReviewer::Account("maid-bot".to_string())
+        );
+        assert_eq!(
+            RequestedReviewer::parse("Maid-Bot").unwrap().to_string(),
+            "maid-bot"
+        );
+
+        assert!(RequestedReviewer::parse("").is_err());
+        assert!(RequestedReviewer::parse("some-org/").is_err());
+        assert!(RequestedReviewer::parse("maid bot").is_err());
     }
 
     #[test]
