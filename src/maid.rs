@@ -1,10 +1,10 @@
 use crate::auto_review::{
-    AutoReviewAuthor, ReviewCadence, authorizing_team, auto_review_comment, auto_review_task,
+    AutoReviewAuthor, ReviewCadence, authorizing_reviewer, auto_review_comment, auto_review_task,
     classify_auto_review_author,
 };
 use crate::domain::{
     CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
-    PullRequest, RepoSlug, ReviewState, TeamSlug, TreeSha, WorkTarget,
+    PullRequest, RepoSlug, RequestedReviewer, ReviewState, TreeSha, WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -122,8 +122,8 @@ pub struct Maid<G, R, C> {
     auto_review_accounts: HashSet<String>,
     auto_review_public_accounts: HashSet<String>,
     auto_review_repos: Vec<RepoSlug>,
-    auto_review_teams: Vec<TeamSlug>,
-    team_review_window: ChronoDuration,
+    auto_review_requested_reviewers: Vec<RequestedReviewer>,
+    review_request_window: ChronoDuration,
     review_cadence: ReviewCadence,
     task_starts: Arc<dyn TaskStartRecorder>,
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
@@ -134,7 +134,7 @@ pub struct Maid<G, R, C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AutoReviewSource {
     Repository,
-    TeamActivity,
+    ReviewRequestActivity,
     PublicAuthor { login: String },
 }
 
@@ -142,7 +142,7 @@ enum AutoReviewSource {
 struct AutoReviewCandidate {
     pr: PullRequest,
     source: AutoReviewSource,
-    requested_teams: Vec<TeamSlug>,
+    requested_reviewers: Vec<RequestedReviewer>,
     updated_at: Option<DateTime<Utc>>,
 }
 
@@ -151,7 +151,7 @@ impl AutoReviewCandidate {
         Self {
             pr: open.pull_request,
             source,
-            requested_teams: open.requested_teams,
+            requested_reviewers: open.requested_reviewers,
             updated_at: open.updated_at,
         }
     }
@@ -162,7 +162,7 @@ impl AutoReviewCandidate {
             source: AutoReviewSource::PublicAuthor {
                 login: login.to_string(),
             },
-            requested_teams: Vec::new(),
+            requested_reviewers: Vec::new(),
             updated_at: None,
         }
     }
@@ -176,7 +176,7 @@ impl AutoReviewCandidate {
             AutoReviewSource::Repository => {
                 repository_accounts.contains(&self.pr.author.to_ascii_lowercase())
             }
-            AutoReviewSource::TeamActivity => false,
+            AutoReviewSource::ReviewRequestActivity => false,
             AutoReviewSource::PublicAuthor { login } => {
                 public_accounts.contains(login) && self.pr.author.eq_ignore_ascii_case(login)
             }
@@ -218,8 +218,8 @@ where
             auto_review_accounts: normalized_logins(auto_review_accounts),
             auto_review_public_accounts: HashSet::new(),
             auto_review_repos: auto_review_repos.into_iter().collect(),
-            auto_review_teams: Vec::new(),
-            team_review_window: ChronoDuration::hours(24),
+            auto_review_requested_reviewers: Vec::new(),
+            review_request_window: ChronoDuration::hours(24),
             review_cadence: ReviewCadence::Once,
             task_starts: Arc::new(NoTaskLimit),
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
@@ -236,13 +236,16 @@ where
         self
     }
 
-    pub fn with_auto_review_teams(mut self, teams: impl IntoIterator<Item = TeamSlug>) -> Self {
-        self.auto_review_teams = teams.into_iter().collect();
+    pub fn with_auto_review_requested_reviewers(
+        mut self,
+        reviewers: impl IntoIterator<Item = RequestedReviewer>,
+    ) -> Self {
+        self.auto_review_requested_reviewers = reviewers.into_iter().collect();
         self
     }
 
-    pub fn with_team_review_window_hours(mut self, hours: u32) -> Self {
-        self.team_review_window = ChronoDuration::hours(i64::from(hours));
+    pub fn with_review_request_window_hours(mut self, hours: u32) -> Self {
+        self.review_request_window = ChronoDuration::hours(i64::from(hours));
         self
     }
 
@@ -725,20 +728,20 @@ where
             &self.auto_review_accounts,
             &self.auto_review_public_accounts,
         );
-        let team_authorized = authorizing_team(
-            &candidate.requested_teams,
-            &self.auto_review_teams,
+        let review_requested = authorizing_reviewer(
+            &candidate.requested_reviewers,
+            &self.auto_review_requested_reviewers,
             candidate.updated_at,
             Utc::now(),
-            self.team_review_window,
+            self.review_request_window,
         )
         .is_some();
-        // A reviewed pull request stays in scope: GitHub clears a team's review
-        // request once a member reviews, before the author pushes again.
+        // A reviewed pull request stays in scope: GitHub clears a review request
+        // once the reviewer, or a member of the team, reviews.
         classify_auto_review_author(
             &candidate.pr,
             &self.bot_login,
-            previously_reviewed || author_allowed || team_authorized,
+            previously_reviewed || author_allowed || review_requested,
         )
     }
 
@@ -779,7 +782,7 @@ where
                 OpenPullRequestOrder::RecentlyUpdated,
                 AutoReviewSource::Repository,
             )],
-            ReviewCadence::Once if self.auto_review_teams.is_empty() => vec![(
+            ReviewCadence::Once if self.auto_review_requested_reviewers.is_empty() => vec![(
                 OpenPullRequestOrder::NewestCreated,
                 AutoReviewSource::Repository,
             )],
@@ -790,7 +793,7 @@ where
                 ),
                 (
                     OpenPullRequestOrder::RecentlyUpdated,
-                    AutoReviewSource::TeamActivity,
+                    AutoReviewSource::ReviewRequestActivity,
                 ),
             ],
         }
@@ -1389,7 +1392,7 @@ fn deduplicate_auto_review_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CodexTaskOrigin, CommitSha, Issue, TeamSlug, TreeSha};
+    use crate::domain::{CodexTaskOrigin, CommitSha, Issue, TreeSha};
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use std::collections::HashMap;
@@ -1407,7 +1410,7 @@ mod tests {
         pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         list_orders: Arc<StdMutex<Vec<OpenPullRequestOrder>>>,
         recently_updated_pull_requests: Arc<StdMutex<Option<Vec<PullRequest>>>>,
-        requested_teams: Arc<StdMutex<HashMap<String, Vec<TeamSlug>>>>,
+        requested_reviewers: Arc<StdMutex<HashMap<String, Vec<RequestedReviewer>>>>,
         pull_created_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         pull_updated_at: Arc<StdMutex<HashMap<String, DateTime<Utc>>>>,
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
@@ -1461,18 +1464,18 @@ mod tests {
                 OpenPullRequestOrder::NewestCreated => created,
                 OpenPullRequestOrder::RecentlyUpdated => updated.unwrap_or(created),
             };
-            let requested_teams = self.requested_teams.lock().unwrap().clone();
+            let requested_reviewers = self.requested_reviewers.lock().unwrap().clone();
             let created_at = self.pull_created_at.lock().unwrap().clone();
             let updated_at = self.pull_updated_at.lock().unwrap().clone();
             Ok(pull_requests
                 .into_iter()
                 .map(|pull_request| {
-                    let teams = requested_teams
+                    let reviewers = requested_reviewers
                         .get(&pull_request.html_url)
                         .cloned()
                         .unwrap_or_default();
                     OpenPullRequest {
-                        requested_teams: teams,
+                        requested_reviewers: reviewers,
                         created_at: created_at.get(&pull_request.html_url).copied(),
                         updated_at: updated_at.get(&pull_request.html_url).copied(),
                         pull_request,
@@ -1801,16 +1804,25 @@ mod tests {
         CommitSha::parse(&format!("{prefix:0<40}")).unwrap()
     }
 
-    fn team_slug(value: &str) -> TeamSlug {
-        TeamSlug::parse(value).unwrap()
+    fn reviewer(value: &str) -> RequestedReviewer {
+        RequestedReviewer::parse(value).unwrap()
     }
 
     fn request_team(github: &FakeGithub, pr: &PullRequest, updated_at: DateTime<Utc>) {
+        request_review(github, pr, reviewer("some-org/eng-infra"), updated_at);
+    }
+
+    fn request_review(
+        github: &FakeGithub,
+        pr: &PullRequest,
+        reviewer: RequestedReviewer,
+        updated_at: DateTime<Utc>,
+    ) {
         github
-            .requested_teams
+            .requested_reviewers
             .lock()
             .unwrap()
-            .insert(pr.html_url.clone(), vec![team_slug("some-org/eng-infra")]);
+            .insert(pr.html_url.clone(), vec![reviewer]);
         github
             .pull_updated_at
             .lock()
@@ -2432,7 +2444,7 @@ mod tests {
         let codex = FakeCodex::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
-            .with_auto_review_teams([team_slug("Some-Org/Eng-Infra")])
+            .with_auto_review_requested_reviewers([reviewer("Some-Org/Eng-Infra")])
             .run_once()
             .await
             .unwrap();
@@ -2454,13 +2466,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reviews_recent_pr_when_configured_account_is_requested() {
+        let github = FakeGithub::default();
+        let requests_bot = pr_with_author_and_number("contributor", 1);
+        let requests_other = pr_with_author_and_number("contributor", 2);
+        *github.pull_requests.lock().unwrap() = vec![requests_bot.clone(), requests_other.clone()];
+        request_review(
+            &github,
+            &requests_bot,
+            reviewer("maid-bot"),
+            recent_pr_time(),
+        );
+        request_review(
+            &github,
+            &requests_other,
+            reviewer("octocat"),
+            recent_pr_time(),
+        );
+
+        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+            .with_auto_review_requested_reviewers([
+                reviewer("some-org/eng-infra"),
+                reviewer("Maid-Bot"),
+            ])
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.posts.lock().unwrap(),
+            vec![review_of(&requests_bot)]
+        );
+    }
+
+    #[tokio::test]
     async fn does_not_review_a_team_request_twice() {
         let github = FakeGithub::default();
         let pull_request = pr_with_author("contributor");
         *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
         request_team(&github, &pull_request, recent_pr_time());
         let maid = maid(github.clone(), idle_worktrees(), FakeCodex::default())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")]);
+            .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")]);
 
         let first = maid.run_once().await.unwrap();
         let second = maid.run_once().await.unwrap();
@@ -2482,7 +2529,7 @@ mod tests {
 
         let report = maid(github.clone(), idle_worktrees(), codex.clone())
             .with_public_auto_review_accounts(["dionysuzx"])
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .run_once()
             .await
             .unwrap();
@@ -2514,7 +2561,7 @@ mod tests {
         let codex = FakeCodex::default();
 
         let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .run_once()
             .await
             .unwrap();
@@ -2564,7 +2611,7 @@ mod tests {
         let codex = FakeCodex::default();
 
         let report = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .run_once()
             .await
             .unwrap();
@@ -2599,9 +2646,9 @@ mod tests {
             .lock()
             .unwrap()
             .insert(removed.html_url.clone(), recent_pr_time());
-        github.requested_teams.lock().unwrap().insert(
+        github.requested_reviewers.lock().unwrap().insert(
             other_team.html_url.clone(),
-            vec![team_slug("other-org/docs")],
+            vec![reviewer("other-org/docs")],
         );
         github
             .pull_updated_at
@@ -2610,7 +2657,7 @@ mod tests {
             .insert(other_team.html_url.clone(), recent_pr_time());
 
         let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .run_once()
             .await
             .unwrap();
@@ -2676,7 +2723,7 @@ mod tests {
         let codex = FakeCodex::default();
 
         let own_report = maid(github.clone(), worktrees.clone(), codex.clone())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .run_once()
             .await
             .unwrap();
@@ -2693,7 +2740,7 @@ mod tests {
             ["dionysuzx"],
             Vec::<RepoSlug>::new(),
         )
-        .with_auto_review_teams([team_slug("some-org/eng-infra")]);
+        .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")]);
         let contributor = pr_with_author("contributor");
         *github.pull_requests.lock().unwrap() = vec![contributor.clone()];
         request_team(&github, &contributor, recent_pr_time());
@@ -2713,7 +2760,7 @@ mod tests {
         let task_starts = at_limit_recorder();
 
         let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .with_task_start_recorder(task_starts.clone())
             .run_once()
             .await
@@ -2736,7 +2783,7 @@ mod tests {
         request_team(&github, &pull_request, recent_pr_time());
 
         let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .run_once()
             .await
             .unwrap();
@@ -2754,7 +2801,7 @@ mod tests {
             idle_worktrees(),
             FakeCodex::default(),
         )
-        .with_auto_review_teams([team_slug("some-org/eng-infra")])
+        .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
         .run_once()
         .await
         .unwrap();
@@ -2880,11 +2927,11 @@ mod tests {
         request_team(&github, &team_pr, recent_pr_time());
         let codex = FakeCodex::default();
         let maid = maid(github.clone(), idle_worktrees(), codex.clone())
-            .with_auto_review_teams([team_slug("some-org/eng-infra")])
+            .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .with_review_cadence(ReviewCadence::EveryHead);
 
         let first = maid.run_once().await.unwrap();
-        github.requested_teams.lock().unwrap().clear();
+        github.requested_reviewers.lock().unwrap().clear();
         *github.pull_requests.lock().unwrap() = vec![pushed(&team_pr, "b")];
         let after_push = maid.run_once().await.unwrap();
 

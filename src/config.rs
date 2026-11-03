@@ -1,6 +1,6 @@
 use crate::{
     auto_review::ReviewCadence,
-    domain::{CodexPromptTemplates, RepoSlug, TeamSlug},
+    domain::{CodexPromptTemplates, RepoSlug, RequestedReviewer},
     github::{
         DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
         GitHubApiRequestRate, GitHubNotificationWindow,
@@ -23,7 +23,7 @@ pub struct Config {
     pub auto_review_accounts: Vec<String>,
     pub auto_review_public_accounts: Vec<String>,
     pub auto_review_repos: Vec<RepoSlug>,
-    pub auto_review_teams: Vec<TeamSlug>,
+    pub auto_review_requested_reviewers: Vec<RequestedReviewer>,
     pub review_cadence: ReviewCadence,
     pub git_dir: PathBuf,
     pub daemon_pid_path: PathBuf,
@@ -75,7 +75,10 @@ impl Config {
             "auto_review_public_accounts",
         )?;
         let auto_review_repos = optional_repos(file.auto_review_repos, "auto_review_repos")?;
-        let auto_review_teams = optional_teams(file.auto_review_teams, "auto_review_teams")?;
+        let auto_review_requested_reviewers = optional_reviewers(
+            file.auto_review_requested_reviewers,
+            "auto_review_requested_reviewers",
+        )?;
         let review_cadence =
             ReviewCadence::from_continuous_review(file.continuous_review.unwrap_or(false));
         let git_dir = non_empty(file.git_dir)
@@ -130,7 +133,7 @@ impl Config {
             auto_review_accounts,
             auto_review_public_accounts,
             auto_review_repos,
-            auto_review_teams,
+            auto_review_requested_reviewers,
             review_cadence,
             git_dir,
             daemon_pid_path: maid_home.join("maid.pid"),
@@ -159,7 +162,7 @@ struct ConfigFile {
     auto_review_accounts: Option<Vec<String>>,
     auto_review_public_accounts: Option<Vec<String>>,
     auto_review_repos: Option<Vec<String>>,
-    auto_review_teams: Option<Vec<String>>,
+    auto_review_requested_reviewers: Option<Vec<String>>,
     continuous_review: Option<bool>,
     git_dir: Option<String>,
     task_limit_per_24h: Option<usize>,
@@ -250,19 +253,20 @@ fn optional_repos(value: Option<Vec<String>>, key: &str) -> Result<Vec<RepoSlug>
     Ok(repos)
 }
 
-fn optional_teams(value: Option<Vec<String>>, key: &str) -> Result<Vec<TeamSlug>> {
-    let Some(raw_teams) = value else {
+fn optional_reviewers(value: Option<Vec<String>>, key: &str) -> Result<Vec<RequestedReviewer>> {
+    let Some(raw_reviewers) = value else {
         return Ok(Vec::new());
     };
 
-    let mut teams = Vec::new();
-    for team in raw_teams {
-        let team = TeamSlug::parse(&team).with_context(|| format!("invalid {key} entry"))?;
-        if !teams.contains(&team) {
-            teams.push(team);
+    let mut reviewers = Vec::new();
+    for reviewer in raw_reviewers {
+        let reviewer =
+            RequestedReviewer::parse(&reviewer).with_context(|| format!("invalid {key} entry"))?;
+        if !reviewers.contains(&reviewer) {
+            reviewers.push(reviewer);
         }
     }
-    Ok(teams)
+    Ok(reviewers)
 }
 
 fn require_subset(logins: &[String], trusted_logins: &[String], key: &str) -> Result<()> {
@@ -392,7 +396,7 @@ master_accounts = ["dionysuzx"]
 auto_review_accounts = ["dionysuzx"]
 auto_review_public_accounts = ["dionysuzx"]
 auto_review_repos = ["dionysuzx/maid"]
-auto_review_teams = ["Some-Org/eng-infra"]
+auto_review_requested_reviewers = ["Some-Org/eng-infra", "maid-bot"]
 continuous_review = true
 git_dir = "~/.maid/git"
 task_limit_per_24h = 5
@@ -430,8 +434,11 @@ operator_mention = "operator {{{{request_text}}}}"
             Some(vec!["dionysuzx/maid".to_string()])
         );
         assert_eq!(
-            config.auto_review_teams,
-            Some(vec!["Some-Org/eng-infra".to_string()])
+            config.auto_review_requested_reviewers,
+            Some(vec![
+                "Some-Org/eng-infra".to_string(),
+                "maid-bot".to_string()
+            ])
         );
         assert_eq!(config.continuous_review, Some(true));
         assert_eq!(config.git_dir.as_deref(), Some("~/.maid/git"));
@@ -471,7 +478,7 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.auto_review_accounts, None);
         assert_eq!(config.auto_review_public_accounts, None);
         assert_eq!(config.auto_review_repos, None);
-        assert_eq!(config.auto_review_teams, None);
+        assert_eq!(config.auto_review_requested_reviewers, None);
         assert_eq!(config.git_dir, None);
         assert_eq!(config.task_limit_per_24h, None);
         assert_eq!(config.github_api_requests_per_hour, None);
@@ -608,30 +615,33 @@ operator_mention = "operator {{{{request_text}}}}"
     }
 
     #[test]
-    fn optional_teams_parse_to_slugs() {
+    fn optional_reviewers_parse_to_teams_and_accounts() {
+        let key = "auto_review_requested_reviewers";
         assert_eq!(
-            optional_teams(
+            optional_reviewers(
                 Some(vec![
                     "  Some-Org/Eng-Infra  ".to_string(),
                     "some-org/eng-infra".to_string(),
-                    "some-org/docs".to_string()
+                    "Maid-Bot".to_string(),
+                    "maid-bot".to_string()
                 ]),
-                "auto_review_teams"
+                key
             )
             .unwrap(),
             vec![
-                TeamSlug::parse("some-org/eng-infra").unwrap(),
-                TeamSlug::parse("some-org/docs").unwrap()
+                RequestedReviewer::parse("some-org/eng-infra").unwrap(),
+                RequestedReviewer::parse("maid-bot").unwrap()
             ]
         );
         assert_eq!(
-            optional_teams(Some(Vec::new()), "auto_review_teams").unwrap(),
-            Vec::<TeamSlug>::new()
+            optional_reviewers(Some(Vec::new()), key).unwrap(),
+            Vec::<RequestedReviewer>::new()
         );
-        assert!(optional_teams(Some(vec!["eng-infra".to_string()]), "auto_review_teams").is_err());
+        assert!(optional_reviewers(Some(vec!["some-org/".to_string()]), key).is_err());
+        assert!(optional_reviewers(Some(vec![" ".to_string()]), key).is_err());
         assert_eq!(
-            optional_teams(None, "auto_review_teams").unwrap(),
-            Vec::<TeamSlug>::new()
+            optional_reviewers(None, key).unwrap(),
+            Vec::<RequestedReviewer>::new()
         );
     }
 
