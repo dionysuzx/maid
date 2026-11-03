@@ -88,18 +88,6 @@ update:
 
 restart: stop start
 
-migrate-requested-reviewers-config:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    if [[ ! -f "{{config_file}}" ]]; then
-        echo "no config at {{config_file}}"
-        exit 0
-    fi
-
-    perl -pi -e 's/^auto_review_teams(\s*=)/auto_review_requested_reviewers$1/' "{{config_file}}"
-    grep -n '^auto_review_requested_reviewers' "{{config_file}}" || echo "no auto_review_teams to migrate"
-
 logs:
     #!/usr/bin/env bash
     set -euo pipefail
