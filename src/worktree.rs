@@ -1,5 +1,6 @@
 use crate::{
-    domain::{CodexTask, WorkTarget, validate_repo_name_part},
+    agent::AgentKind,
+    domain::{AgentTask, WorkTarget, validate_repo_name_part},
     maid::{PreparedWorktree, Worktrees},
 };
 use anyhow::{Context, Result, anyhow};
@@ -39,7 +40,12 @@ impl GitWorktrees {
             .join(format!("{}.git", target.repo())))
     }
 
-    pub fn worktree_dir(&self, target: &WorkTarget, task: &CodexTask) -> Result<PathBuf> {
+    pub fn worktree_dir(
+        &self,
+        target: &WorkTarget,
+        task: &AgentTask,
+        agent: AgentKind,
+    ) -> Result<PathBuf> {
         validate_repo_name_part(target.owner(), "repository owner")?;
         validate_repo_name_part(target.repo(), "repository name")?;
         Ok(self
@@ -49,7 +55,7 @@ impl GitWorktrees {
             .join(target.repo())
             .join(target.kind())
             .join(target.number().to_string())
-            .join(worktree_key(task)))
+            .join(worktree_key(task, agent)))
     }
 
     async fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<()> {
@@ -105,9 +111,14 @@ impl GitWorktrees {
 
 #[async_trait]
 impl Worktrees for GitWorktrees {
-    async fn prepare(&self, target: &WorkTarget, task: &CodexTask) -> Result<PreparedWorktree> {
+    async fn prepare(
+        &self,
+        target: &WorkTarget,
+        task: &AgentTask,
+        agent: AgentKind,
+    ) -> Result<PreparedWorktree> {
         let repo = self.repo_dir(target)?;
-        let worktree = self.worktree_dir(target, task)?;
+        let worktree = self.worktree_dir(target, task, agent)?;
         let _lock = self.acquire_repo_lock(&repo).await?;
         tokio::fs::create_dir_all(
             repo.parent()
@@ -209,9 +220,9 @@ fn absolute_root(root: PathBuf) -> PathBuf {
         .join(root)
 }
 
-fn worktree_key(task: &CodexTask) -> String {
+fn worktree_key(task: &AgentTask, agent: AgentKind) -> String {
     format!(
-        "{}-{:016x}",
+        "{}-{:016x}-{agent}",
         task.task_kind(),
         stable_hash(task.trigger_url())
     )
@@ -266,10 +277,10 @@ mod tests {
         WorkTarget::Issue(issue(owner, repo))
     }
 
-    fn task(trigger: &str) -> CodexTask {
-        CodexTask {
+    fn task(trigger: &str) -> AgentTask {
+        AgentTask {
             pr_url: "https://github.com/o/r/pull/46".to_string(),
-            origin: crate::domain::CodexTaskOrigin::Mention {
+            origin: crate::domain::AgentTaskOrigin::Mention {
                 mention_url: trigger.to_string(),
                 raw_body: "@maid-bot review".to_string(),
                 cleaned_text: "review".to_string(),
@@ -302,11 +313,17 @@ mod tests {
             worktrees.repo_dir(&pr).unwrap(),
             PathBuf::from("/tmp/maid-git/repos/dionysuzx/forkcast.git")
         );
-        let worktree = worktrees.worktree_dir(&pr, &task).unwrap();
+        let worktree = worktrees
+            .worktree_dir(&pr, &task, AgentKind::Codex)
+            .unwrap();
         assert!(worktree.starts_with("/tmp/maid-git/worktrees/dionysuzx/forkcast/pulls/46"));
         assert_eq!(
-            worktrees.worktree_dir(&pr, &task).unwrap(),
-            worktrees.worktree_dir(&pr, &task).unwrap()
+            worktrees
+                .worktree_dir(&pr, &task, AgentKind::Codex)
+                .unwrap(),
+            worktrees
+                .worktree_dir(&pr, &task, AgentKind::Codex)
+                .unwrap()
         );
     }
 
@@ -329,10 +346,34 @@ mod tests {
 
         assert_ne!(
             worktrees
-                .worktree_dir(&pr, &task("https://github.com/o/r/pull/46#issuecomment-2"))
+                .worktree_dir(
+                    &pr,
+                    &task("https://github.com/o/r/pull/46#issuecomment-2"),
+                    AgentKind::Codex
+                )
                 .unwrap(),
             worktrees
-                .worktree_dir(&pr, &task("https://github.com/o/r/pull/46#issuecomment-3"))
+                .worktree_dir(
+                    &pr,
+                    &task("https://github.com/o/r/pull/46#issuecomment-3"),
+                    AgentKind::Codex
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn uses_distinct_worktrees_for_agents_running_the_same_task() {
+        let worktrees = GitWorktrees::new("/tmp/maid-git", "token");
+        let pr = pr_target("dionysuzx", "forkcast");
+        let task = task("https://github.com/o/r/pull/46#issuecomment-2");
+
+        assert_ne!(
+            worktrees
+                .worktree_dir(&pr, &task, AgentKind::Codex)
+                .unwrap(),
+            worktrees
+                .worktree_dir(&pr, &task, AgentKind::Claude)
                 .unwrap()
         );
     }
@@ -361,11 +402,19 @@ mod tests {
         });
 
         let first = worktrees
-            .prepare(&pr, &task("https://github.com/o/r/pull/46#issuecomment-2"))
+            .prepare(
+                &pr,
+                &task("https://github.com/o/r/pull/46#issuecomment-2"),
+                AgentKind::Codex,
+            )
             .await
             .unwrap();
         let second = worktrees
-            .prepare(&pr, &task("https://github.com/o/r/pull/46#issuecomment-3"))
+            .prepare(
+                &pr,
+                &task("https://github.com/o/r/pull/46#issuecomment-3"),
+                AgentKind::Codex,
+            )
             .await
             .unwrap();
 
@@ -412,6 +461,7 @@ mod tests {
             .prepare(
                 &issue,
                 &task("https://github.com/o/r/issues/322#issuecomment-2"),
+                AgentKind::Codex,
             )
             .await
             .unwrap();
@@ -445,12 +495,20 @@ mod tests {
         );
         assert!(
             worktrees
-                .worktree_dir(&pr_target("../dionysuzx", "forkcast"), &task)
+                .worktree_dir(
+                    &pr_target("../dionysuzx", "forkcast"),
+                    &task,
+                    AgentKind::Codex
+                )
                 .is_err()
         );
         assert!(
             worktrees
-                .worktree_dir(&issue_target("dionysuzx", "forkcast/slash"), &task)
+                .worktree_dir(
+                    &issue_target("dionysuzx", "forkcast/slash"),
+                    &task,
+                    AgentKind::Codex
+                )
                 .is_err()
         );
     }

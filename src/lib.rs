@@ -1,4 +1,7 @@
+pub mod agent;
+pub mod agent_comment;
 pub mod auto_review;
+pub mod claude;
 pub mod codex;
 pub mod config;
 pub mod daemon_lock;

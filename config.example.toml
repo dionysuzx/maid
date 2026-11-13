@@ -25,7 +25,6 @@ continuous_review = false
 
 # Optional. Defaults shown below.
 git_dir = "~/.maid/git"
-codex_bin = "codex"
 max_concurrent_requests = 1
 
 # Optional. This is the one global GitHub REST request-rate knob. Every GitHub
@@ -38,17 +37,14 @@ github_notification_window_hours = 24
 # Optional. Prometheus metrics are served at /metrics on this address.
 metrics_bind_address = "127.0.0.1:9464"
 
-# Required. These values are passed to Codex.
-codex_model = "gpt-5.5"
-codex_reasoning_effort = "high"
-
 # Optional. Omitted by default for no task limit. Set to 0 to pause new starts.
 # task_limit_per_24h = 5
 
 # Optional. Leave omitted unless you need to pin api.github.com.
 # github_api_ip = "127.0.0.1"
 
-# Required. These templates are the full prompts Maid sends to Codex.
+# Required. These templates are the full prompts Maid sends to every agent.
+# Each comment Maid posts ends with the rendered prompt in a collapsed section.
 # Supported mention placeholders:
 # {{mention_url}}, {{target_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
 # Supported pull_request_opened placeholders:
@@ -56,7 +52,7 @@ codex_reasoning_effort = "high"
 # Supported operator_mention placeholders:
 # {{bot_login}}, {{trigger_author}}, {{mention_url}}, {{target_url}}, {{pr_url}},
 # {{raw_body}}, {{request_text}}, {{operator_trigger}}
-[codex_prompts]
+[prompts]
 mention = """
 You are responding to a GitHub mention.
 
@@ -106,3 +102,20 @@ Operator request:
 
 When finished, return only a concise final status for the calling process to use. Do not publish that status yourself or include tool logs or wrappers.
 """
+
+# Required. The coding agents Maid runs, one entry per kind ("codex" or
+# "claude"). Reviews and mentions run every agent in parallel, each in its own
+# worktree, and Maid posts one comment with a section per agent in this order.
+# Operator requests change the repository, so only the first agent runs them.
+# Each section names the agent's kind, model, and effort. `bin` defaults to the
+# kind. Codex receives `effort` as model_reasoning_effort.
+[[agents]]
+kind = "codex"
+model = "gpt-5.5"
+effort = "high"
+
+[[agents]]
+kind = "claude"
+bin = "claude"
+model = "claude-opus-5-5"
+effort = "high"

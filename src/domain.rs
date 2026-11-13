@@ -348,6 +348,14 @@ impl WorkTarget {
         }
     }
 
+    /// The commit an agent sees, when the target has a fixed one.
+    pub fn head(&self) -> Option<&CommitSha> {
+        match self {
+            Self::PullRequest(pr) => Some(&pr.head),
+            Self::Issue(_) => None,
+        }
+    }
+
     pub fn fetch_ref(&self) -> String {
         match self {
             // The listed head, not pull/N/head, so a later push cannot change what is reviewed.
@@ -455,15 +463,15 @@ fn is_github_login_byte(byte: u8) -> bool {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CodexTask {
+pub struct AgentTask {
     pub pr_url: String,
-    pub origin: CodexTaskOrigin,
+    pub origin: AgentTaskOrigin,
 }
 
-impl CodexTask {
-    pub fn prompt(&self, templates: &CodexPromptTemplates) -> Result<String> {
+impl AgentTask {
+    pub fn prompt(&self, templates: &PromptTemplates) -> Result<String> {
         match &self.origin {
-            CodexTaskOrigin::Mention {
+            AgentTaskOrigin::Mention {
                 mention_url,
                 raw_body,
                 cleaned_text,
@@ -477,14 +485,14 @@ impl CodexTask {
                     ("cleaned_text", cleaned_text.as_str()),
                 ],
             ),
-            CodexTaskOrigin::PullRequestOpened { author } => render_template(
+            AgentTaskOrigin::PullRequestOpened { author } => render_template(
                 &templates.pull_request_opened,
                 &[
                     ("pr_url", self.pr_url.as_str()),
                     ("author", author.as_str()),
                 ],
             ),
-            CodexTaskOrigin::OperatorMention {
+            AgentTaskOrigin::OperatorMention {
                 mention_url,
                 raw_body,
                 request_text,
@@ -508,9 +516,9 @@ impl CodexTask {
 
     pub fn trigger_url(&self) -> &str {
         match &self.origin {
-            CodexTaskOrigin::Mention { mention_url, .. }
-            | CodexTaskOrigin::OperatorMention { mention_url, .. } => mention_url,
-            CodexTaskOrigin::PullRequestOpened { .. } => &self.pr_url,
+            AgentTaskOrigin::Mention { mention_url, .. }
+            | AgentTaskOrigin::OperatorMention { mention_url, .. } => mention_url,
+            AgentTaskOrigin::PullRequestOpened { .. } => &self.pr_url,
         }
     }
 
@@ -520,7 +528,7 @@ impl CodexTask {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CodexTaskOrigin {
+pub enum AgentTaskOrigin {
     Mention {
         mention_url: String,
         raw_body: String,
@@ -538,7 +546,7 @@ pub enum CodexTaskOrigin {
     },
 }
 
-impl CodexTaskOrigin {
+impl AgentTaskOrigin {
     pub fn task_kind(&self) -> &'static str {
         match self {
             Self::Mention { .. } => "mention",
@@ -549,7 +557,7 @@ impl CodexTaskOrigin {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CodexPromptTemplates {
+pub struct PromptTemplates {
     pub mention: String,
     pub pull_request_opened: String,
     pub operator_mention: String,
@@ -563,12 +571,12 @@ fn render_template(template: &str, values: &[(&str, &str)]) -> Result<String> {
         rendered.push_str(&rest[..start]);
         let after_open = &rest[start + 2..];
         let Some(end) = after_open.find("}}") else {
-            return Err(anyhow!("Codex prompt template has an unclosed placeholder"));
+            return Err(anyhow!("prompt template has an unclosed placeholder"));
         };
 
         let name = after_open[..end].trim();
         let Some((_, value)) = values.iter().find(|(key, _)| *key == name) else {
-            return Err(anyhow!("unknown Codex prompt template placeholder: {name}"));
+            return Err(anyhow!("unknown prompt template placeholder: {name}"));
         };
         rendered.push_str(value);
         rest = &after_open[end + 2..];
@@ -715,9 +723,9 @@ mod tests {
 
     #[test]
     fn builds_codex_prompt_with_required_context() {
-        let task = CodexTask {
+        let task = AgentTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
-            origin: CodexTaskOrigin::Mention {
+            origin: AgentTaskOrigin::Mention {
                 mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
                 raw_body: "@maid-bot review".to_string(),
                 cleaned_text: "review".to_string(),
@@ -733,9 +741,9 @@ mod tests {
 
     #[test]
     fn builds_codex_prompt_for_automatic_pull_request_review() {
-        let task = CodexTask {
+        let task = AgentTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
-            origin: CodexTaskOrigin::PullRequestOpened {
+            origin: AgentTaskOrigin::PullRequestOpened {
                 author: "dionysuzx".to_string(),
             },
         };
@@ -748,15 +756,15 @@ mod tests {
 
     #[test]
     fn renders_configured_codex_prompt_templates() {
-        let task = CodexTask {
+        let task = AgentTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
-            origin: CodexTaskOrigin::Mention {
+            origin: AgentTaskOrigin::Mention {
                 mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
                 raw_body: "@maid-bot review".to_string(),
                 cleaned_text: "review".to_string(),
             },
         };
-        let templates = CodexPromptTemplates {
+        let templates = PromptTemplates {
             mention: "TARGET={{ target_url }} REQUEST={{cleaned_text}}".to_string(),
             pull_request_opened: String::new(),
             operator_mention: String::new(),
@@ -770,13 +778,13 @@ mod tests {
 
     #[test]
     fn rejects_unknown_codex_prompt_placeholders() {
-        let task = CodexTask {
+        let task = AgentTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
-            origin: CodexTaskOrigin::PullRequestOpened {
+            origin: AgentTaskOrigin::PullRequestOpened {
                 author: "dionysuzx".to_string(),
             },
         };
-        let templates = CodexPromptTemplates {
+        let templates = PromptTemplates {
             mention: String::new(),
             pull_request_opened: "{{missing}}".to_string(),
             operator_mention: String::new(),
@@ -787,9 +795,9 @@ mod tests {
 
     #[test]
     fn builds_operator_prompt_from_template() {
-        let task = CodexTask {
+        let task = AgentTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
-            origin: CodexTaskOrigin::OperatorMention {
+            origin: AgentTaskOrigin::OperatorMention {
                 mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
                 raw_body: "@maid-bot /operate ship it".to_string(),
                 request_text: "ship it".to_string(),
@@ -797,7 +805,7 @@ mod tests {
                 bot_login: "maid-bot".to_string(),
             },
         };
-        let templates = CodexPromptTemplates {
+        let templates = PromptTemplates {
             mention: String::new(),
             pull_request_opened: String::new(),
             operator_mention:
@@ -814,7 +822,7 @@ mod tests {
     #[test]
     fn reports_task_kind_for_logging() {
         assert_eq!(
-            CodexTaskOrigin::Mention {
+            AgentTaskOrigin::Mention {
                 mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
                 raw_body: "@maid-bot review".to_string(),
                 cleaned_text: "review".to_string(),
@@ -823,7 +831,7 @@ mod tests {
             "mention"
         );
         assert_eq!(
-            CodexTaskOrigin::OperatorMention {
+            AgentTaskOrigin::OperatorMention {
                 mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
                 raw_body: "@maid-bot /operate ship it".to_string(),
                 request_text: "ship it".to_string(),
@@ -834,7 +842,7 @@ mod tests {
             "operator_mention"
         );
         assert_eq!(
-            CodexTaskOrigin::PullRequestOpened {
+            AgentTaskOrigin::PullRequestOpened {
                 author: "dionysuzx".to_string(),
             }
             .task_kind(),
@@ -923,8 +931,8 @@ mod tests {
         );
     }
 
-    fn test_prompts() -> CodexPromptTemplates {
-        CodexPromptTemplates {
+    fn test_prompts() -> PromptTemplates {
+        PromptTemplates {
             mention: "\
 Mention URL:
 {{mention_url}}

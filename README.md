@@ -1,11 +1,11 @@
 ![Maid banner](assets/maid-banner-v2.jpg)
 
-Maid is a smol bot that runs local Codex on GitHub events.
+Maid is a smol bot that runs local coding agents (Codex and Claude Code) on GitHub events.
 
 It watches for opened PRs and issue or PR mentions to your configured GitHub bot account
 (a "maid), checks that the request came from a trusted master account, prepares
-an isolated worktree, runs `codex`, and posts Codex's final answer back as a
-comment. It can also run automatic reviews for configured repositories, for
+an isolated worktree, runs each configured agent in parallel, and posts one
+comment with every agent's answer and the exact prompt they received. It can also run automatic reviews for configured repositories, for
 configured accounts across all public repositories, or when a configured team
 or account is requested as a reviewer on an open pull request, and trusted
 users can request adhoc operator tasks with `/operate`.
@@ -15,7 +15,8 @@ for the source GitHub repo.
 
 ## Getting Started
 
-Maid expects Rust/Cargo, `git`, `gh`, `codex`, `just`, and `nvim` on `PATH`.
+Maid expects Rust/Cargo, `git`, `gh`, `just`, `nvim`, and each configured agent
+CLI (`codex`, `claude`) on `PATH`, authenticated for non-interactive use.
 Authenticate `gh` as the GitHub bot account before starting Maid.
 
 Clone the repo, create your local config, edit it, then start the bot:

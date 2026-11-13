@@ -608,6 +608,7 @@ dependencies = [
  "base64",
  "chrono",
  "dirs",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

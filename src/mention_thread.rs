@@ -1,4 +1,4 @@
-use crate::domain::{CodexTask, CodexTaskOrigin, CommentMention, MentionRequest, ReviewState};
+use crate::domain::{AgentTask, AgentTaskOrigin, CommentMention, MentionRequest, ReviewState};
 use crate::handled_marker::PendingHandledMarker;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,7 +89,7 @@ pub enum MentionNotificationPlan {
 pub enum MentionThreadAction {
     StartTask {
         mention: CommentMention,
-        task: CodexTask,
+        task: AgentTask,
     },
     MarkHandled {
         mention: CommentMention,
@@ -139,7 +139,7 @@ fn mention_action_for(observation: MentionObservation, bot_login: &str) -> Menti
             }
         }
         MentionDisposition::PendingRequest => MentionThreadAction::StartTask {
-            task: CodexTask {
+            task: AgentTask {
                 pr_url: observation.mention.target.html_url().to_string(),
                 origin: mention_task_origin(&observation.mention, observation.request, bot_login),
             },
@@ -152,9 +152,9 @@ fn mention_task_origin(
     mention: &CommentMention,
     request: MentionRequest,
     bot_login: &str,
-) -> CodexTaskOrigin {
+) -> AgentTaskOrigin {
     if let Some(operator_text) = request.operator_text() {
-        return CodexTaskOrigin::OperatorMention {
+        return AgentTaskOrigin::OperatorMention {
             mention_url: mention.html_url.clone(),
             raw_body: request.raw_body,
             request_text: operator_text,
@@ -163,7 +163,7 @@ fn mention_task_origin(
         };
     }
 
-    CodexTaskOrigin::Mention {
+    AgentTaskOrigin::Mention {
         mention_url: mention.html_url.clone(),
         raw_body: request.raw_body,
         cleaned_text: request.cleaned_text,
