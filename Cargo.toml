@@ -3,7 +3,7 @@ name = "maid"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A small polling bot runner that runs local Codex on GitHub PR mentions."
+description = "A GitHub bot that reviews pull requests with local coding agents."
 license = "MIT"
 repository = "https://github.com/dionysuzx/maid"
 

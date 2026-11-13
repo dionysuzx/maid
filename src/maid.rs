@@ -1708,14 +1708,14 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct BlockingCodex {
+    struct BlockingAgent {
         label: AgentLabel,
         calls: Arc<StdMutex<Vec<PathBuf>>>,
         entered: Arc<Barrier>,
         release: Arc<Notify>,
     }
 
-    impl BlockingCodex {
+    impl BlockingAgent {
         fn new() -> Self {
             Self {
                 label: FakeAgent::default().label,
@@ -1727,7 +1727,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Agent for BlockingCodex {
+    impl Agent for BlockingAgent {
         fn label(&self) -> &AgentLabel {
             &self.label
         }
@@ -1982,9 +1982,9 @@ mod tests {
     fn maid(
         github: FakeGithub,
         worktrees: FakeWorktrees,
-        codex: impl Agent + 'static,
+        agent: impl Agent + 'static,
     ) -> Maid<FakeGithub, FakeWorktrees> {
-        maid_with_agents(github, worktrees, vec![Arc::new(codex)])
+        maid_with_agents(github, worktrees, vec![Arc::new(agent)])
     }
 
     fn maid_with_agents(
@@ -2310,7 +2310,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = BlockingCodex::new();
+        let codex = BlockingAgent::new();
         let entered = codex.entered.clone();
         let release = codex.release.clone();
         let maid = maid(github.clone(), worktrees, codex).into_concurrent(1);
@@ -2326,7 +2326,7 @@ mod tests {
         entered.wait().await;
         assert!(
             github.posts.lock().unwrap().is_empty(),
-            "Codex is still running, so the response should not be posted yet"
+            "The agent is still running, so the response should not be posted yet"
         );
 
         release.notify_waiters();
@@ -2345,7 +2345,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = BlockingCodex::new();
+        let codex = BlockingAgent::new();
         let entered = codex.entered.clone();
         let release = codex.release.clone();
         let maid = maid(github.clone(), worktrees, codex).into_concurrent(1);
@@ -2376,7 +2376,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = BlockingCodex::new();
+        let codex = BlockingAgent::new();
         let entered = codex.entered.clone();
         let release = codex.release.clone();
         let maid = maid(github.clone(), worktrees, codex.clone()).into_concurrent(1);
@@ -3537,7 +3537,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = BlockingCodex::new();
+        let codex = BlockingAgent::new();
         let entered = codex.entered.clone();
         let release = codex.release.clone();
         let maid = maid(github.clone(), worktrees, codex.clone()).into_concurrent(1);
@@ -3661,7 +3661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_failure_does_not_post_or_mark() {
+    async fn agent_failure_does_not_post_or_mark() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
@@ -3820,7 +3820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_pending_mention_marker_without_rerunning_codex() {
+    async fn retries_pending_mention_marker_without_rerunning_agents() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("pending-handled-markers.json");
         let github = FakeGithub::default();

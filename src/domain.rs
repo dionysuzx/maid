@@ -650,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_codex_prompt_with_required_context() {
+    fn builds_mention_prompt_with_required_context() {
         let task = AgentTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
             origin: AgentTaskOrigin::Mention {
@@ -668,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_codex_prompt_for_automatic_pull_request_review() {
+    fn builds_prompt_for_automatic_pull_request_review() {
         let task = AgentTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
             origin: AgentTaskOrigin::PullRequestOpened {
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_configured_codex_prompt_templates() {
+    fn renders_configured_prompt_templates() {
         let task = AgentTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
             origin: AgentTaskOrigin::Mention {
@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_codex_prompt_placeholders() {
+    fn rejects_unknown_prompt_placeholders() {
         let task = AgentTask {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
             origin: AgentTaskOrigin::PullRequestOpened {
