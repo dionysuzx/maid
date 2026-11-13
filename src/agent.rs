@@ -86,7 +86,7 @@ impl AgentPanel {
         Ok(Self { agents })
     }
 
-    pub fn agents(&self) -> &[Arc<dyn Agent>] {
+    pub fn all(&self) -> &[Arc<dyn Agent>] {
         &self.agents
     }
 }
