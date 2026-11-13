@@ -102,7 +102,7 @@ impl PreparedWorktree {
 pub struct Maid<G, R> {
     github: G,
     worktrees: R,
-    agents: AgentPanel,
+    panel: AgentPanel,
     prompts: PromptTemplates,
     bot_login: String,
     master_accounts: HashSet<String>,
@@ -189,7 +189,7 @@ where
     pub fn new(
         github: G,
         worktrees: R,
-        agents: AgentPanel,
+        panel: AgentPanel,
         prompts: PromptTemplates,
         bot_login: impl Into<String>,
         master_accounts: impl IntoIterator<Item = impl Into<String>>,
@@ -197,7 +197,7 @@ where
         Self {
             github,
             worktrees,
-            agents,
+            panel,
             prompts,
             bot_login: bot_login.into(),
             master_accounts: normalized_logins(master_accounts),
@@ -931,7 +931,7 @@ where
     /// into one comment. The task fails only when every agent failed.
     async fn run_agents(&self, target: &WorkTarget, task: &AgentTask) -> Result<String> {
         let prompt = task.prompt(&self.prompts)?;
-        let agents = self.agents.agents();
+        let agents = self.panel.agents();
         let runs = join_all(
             agents
                 .iter()
