@@ -7,8 +7,7 @@ It watches for opened PRs and issue or PR mentions to your configured GitHub bot
 an isolated worktree, runs each configured agent in parallel, and posts one
 comment with every agent's answer and the exact prompt they received. It can also run automatic reviews for configured repositories, for
 configured accounts across all public repositories, or when a configured team
-or account is requested as a reviewer on an open pull request, and trusted
-users can request adhoc operator tasks with `/operate`.
+or account is requested as a reviewer on an open pull request.
 
 Each task runs in its own git worktree while sharing a cached bare repository
 for the source GitHub repo.

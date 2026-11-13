@@ -182,7 +182,6 @@ struct AgentFile {
 struct PromptsFile {
     mention: Option<String>,
     pull_request_opened: Option<String>,
-    operator_mention: Option<String>,
 }
 
 impl ConfigFile {
@@ -305,20 +304,17 @@ fn agent_config(agent: AgentFile) -> Result<AgentConfig> {
 
 fn required_prompts(value: Option<PromptsFile>) -> Result<PromptTemplates> {
     let Some(prompts) = value else {
-        bail!("prompts must include mention, pull_request_opened, and operator_mention templates");
+        bail!("prompts must include mention and pull_request_opened templates");
     };
 
     let mention =
         non_empty(prompts.mention).ok_or_else(|| anyhow!("prompts.mention must not be empty"))?;
     let pull_request_opened = non_empty(prompts.pull_request_opened)
         .ok_or_else(|| anyhow!("prompts.pull_request_opened must not be empty"))?;
-    let operator_mention = non_empty(prompts.operator_mention)
-        .ok_or_else(|| anyhow!("prompts.operator_mention must not be empty"))?;
 
     Ok(PromptTemplates {
         mention,
         pull_request_opened,
-        operator_mention,
     })
 }
 
@@ -443,7 +439,6 @@ effort = "max"
 [prompts]
 mention = "mention {{{{cleaned_text}}}}"
 pull_request_opened = "review {{{{pr_url}}}}"
-operator_mention = "operator {{{{request_text}}}}"
 "#
         )
         .unwrap();
@@ -503,10 +498,6 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(
             prompts.pull_request_opened.as_deref(),
             Some("review {{pr_url}}")
-        );
-        assert_eq!(
-            prompts.operator_mention.as_deref(),
-            Some("operator {{request_text}}")
         );
         assert_eq!(config.github_api_ip.as_deref(), Some("127.0.0.1"));
     }
@@ -577,7 +568,6 @@ operator_mention = "operator {{{{request_text}}}}"
             required_prompts(Some(PromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: None,
-                operator_mention: Some("operate".to_string()),
             }))
             .is_err()
         );
@@ -585,30 +575,18 @@ operator_mention = "operator {{{{request_text}}}}"
             required_prompts(Some(PromptsFile {
                 mention: Some(" ".to_string()),
                 pull_request_opened: Some("review".to_string()),
-                operator_mention: Some("operate".to_string()),
             }))
             .is_err()
         );
-        assert!(
-            required_prompts(Some(PromptsFile {
-                mention: Some("mention".to_string()),
-                pull_request_opened: Some("review".to_string()),
-                operator_mention: Some(" ".to_string()),
-            }))
-            .is_err()
-        );
-
         assert_eq!(
             required_prompts(Some(PromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: Some("review".to_string()),
-                operator_mention: Some("operate".to_string()),
             }))
             .unwrap(),
             PromptTemplates {
                 mention: "mention".to_string(),
                 pull_request_opened: "review".to_string(),
-                operator_mention: "operate".to_string(),
             }
         );
     }

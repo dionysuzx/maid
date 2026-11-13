@@ -1,4 +1,3 @@
-use crate::domain::{AgentTask, AgentTaskOrigin};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -62,8 +61,7 @@ pub struct AgentRun {
     pub session_id: Option<String>,
 }
 
-/// The agents Maid runs. Every agent answers reviews and mentions in parallel.
-/// Operator requests change the repository, so only the first agent runs them.
+/// The agents that answer every review and mention in parallel.
 #[derive(Clone)]
 pub struct AgentPanel {
     agents: Vec<Arc<dyn Agent>>,
@@ -88,13 +86,8 @@ impl AgentPanel {
         Ok(Self { agents })
     }
 
-    pub fn for_task(&self, task: &AgentTask) -> &[Arc<dyn Agent>] {
-        match task.origin {
-            AgentTaskOrigin::OperatorMention { .. } => &self.agents[..1],
-            AgentTaskOrigin::Mention { .. } | AgentTaskOrigin::PullRequestOpened { .. } => {
-                &self.agents
-            }
-        }
+    pub fn agents(&self) -> &[Arc<dyn Agent>] {
+        &self.agents
     }
 }
 

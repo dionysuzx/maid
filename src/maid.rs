@@ -501,7 +501,7 @@ where
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<Vec<TaskAssessment>> {
         let thread = self.load_mention_thread(notification).await?;
-        let plan = plan_mention_thread(thread, &self.bot_login);
+        let plan = plan_mention_thread(thread);
         self.apply_mention_thread_plan(notification, plan, observed_pending_markers)
             .await
     }
@@ -931,7 +931,7 @@ where
     /// into one comment. The task fails only when every agent failed.
     async fn run_agents(&self, target: &WorkTarget, task: &AgentTask) -> Result<String> {
         let prompt = task.prompt(&self.prompts)?;
-        let agents = self.agents.for_task(task);
+        let agents = self.agents.agents();
         let runs = join_all(
             agents
                 .iter()
@@ -1883,8 +1883,6 @@ mod tests {
         PromptTemplates {
             mention: "mention {{mention_url}}: {{cleaned_text}}".to_string(),
             pull_request_opened: "review {{pr_url}} by {{author}}".to_string(),
-            operator_mention: "operate {{mention_url}} for {{trigger_author}}: {{request_text}}"
-                .to_string(),
         }
     }
 
@@ -2113,50 +2111,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trusted_operate_mention_uses_operator_task_origin() {
-        let worktree = PathBuf::from("/tmp/maid-test-worktree");
-        let github = FakeGithub::default();
-        *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() = Some(Ok(Some(mention(
-            "dionysuzx",
-            "@maid-bot /operate implement and push",
-        ))));
-        let worktrees = FakeWorktrees {
-            worktree: worktree.clone(),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeAgent::default();
-
-        let report = maid(github.clone(), worktrees.clone(), codex.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.responded, 1);
-        assert_eq!(
-            *github.posts.lock().unwrap(),
-            vec![reply_to(
-                &WorkTarget::PullRequest(pr()),
-                "operate https://github.com/o/r/pull/1#issuecomment-2 for dionysuzx: implement and push"
-            )]
-        );
-        let calls = codex.calls.lock().unwrap();
-        assert_eq!(calls[0].0, worktree);
-        assert_eq!(
-            calls[0].1,
-            "operate https://github.com/o/r/pull/1#issuecomment-2 for dionysuzx: implement and push"
-        );
-    }
-
-    #[tokio::test]
-    async fn trusted_issue_operate_mention_runs_on_issue_target() {
+    async fn responds_to_issue_mention_on_issue_target() {
         let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![issue_notification("n1", "2")];
         *github.mention.lock().unwrap() = Some(Ok(Some(issue_mention(
             "dionysuzx",
-            "@maid-bot /operate fix this issue",
+            "@maid-bot explain this issue",
             "2",
         ))));
         let worktrees = FakeWorktrees {
@@ -2176,7 +2137,7 @@ mod tests {
             *github.posts.lock().unwrap(),
             vec![reply_to(
                 &WorkTarget::Issue(issue()),
-                "operate https://github.com/o/r/issues/322#issuecomment-2 for dionysuzx: fix this issue"
+                "mention https://github.com/o/r/issues/322#issuecomment-2: explain this issue"
             )]
         );
         assert_eq!(
@@ -2188,7 +2149,7 @@ mod tests {
         assert_eq!(calls[0].0, worktree);
         assert_eq!(
             calls[0].1,
-            "operate https://github.com/o/r/issues/322#issuecomment-2 for dionysuzx: fix this issue"
+            "mention https://github.com/o/r/issues/322#issuecomment-2: explain this issue"
         );
     }
 
@@ -3805,44 +3766,6 @@ mod tests {
 
         assert_eq!(report.failed, 1);
         assert!(github.posts.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn operator_requests_run_only_the_lead_agent() {
-        let github = FakeGithub::default();
-        *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() = Some(Ok(Some(mention(
-            "dionysuzx",
-            "@maid-bot /operate implement and push",
-        ))));
-        let codex = FakeAgent::new(AgentKind::Codex, Some("pushed"));
-        let claude = FakeAgent::new(AgentKind::Claude, Some("pushed too"));
-
-        let report = maid_with_agents(
-            github.clone(),
-            idle_worktrees(),
-            vec![Arc::new(codex.clone()), Arc::new(claude.clone())],
-        )
-        .run_once()
-        .await
-        .unwrap();
-
-        assert_eq!(report.responded, 1);
-        assert_eq!(
-            codex.prompts(),
-            vec![
-                "operate https://github.com/o/r/pull/1#issuecomment-2 for dionysuzx: implement and push"
-            ]
-        );
-        assert!(claude.prompts().is_empty());
-        assert_eq!(
-            *github.posts.lock().unwrap(),
-            vec![agent_comment(
-                Some(&pr().head),
-                &[(&codex.label, AgentReply::Responded("pushed"))],
-                "operate https://github.com/o/r/pull/1#issuecomment-2 for dionysuzx: implement and push",
-            )]
-        );
     }
 
     #[tokio::test]
