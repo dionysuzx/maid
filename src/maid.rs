@@ -1,10 +1,12 @@
+use crate::agent::{Agent, AgentKind, AgentPanel, AgentRun};
+use crate::agent_comment::{AgentReply, agent_comment};
 use crate::auto_review::{
-    AutoReviewAuthor, ReviewCadence, authorizing_reviewer, auto_review_comment, auto_review_task,
+    AutoReviewAuthor, ReviewCadence, authorizing_reviewer, auto_review_task,
     classify_auto_review_author,
 };
 use crate::domain::{
-    CodexTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
-    PullRequest, RepoSlug, RequestedReviewer, ReviewState, TreeSha, WorkTarget,
+    AgentTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
+    PromptTemplates, PullRequest, RepoSlug, RequestedReviewer, ReviewState, TreeSha, WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -16,9 +18,10 @@ use crate::mention_thread::{
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::reviewed_head::{MemoryReviewedHeadStore, ReviewedHeadStore};
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures_util::future::join_all;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -56,13 +59,13 @@ pub trait GithubClient: Send + Sync {
 
 #[async_trait]
 pub trait Worktrees: Send + Sync {
-    async fn prepare(&self, target: &WorkTarget, task: &CodexTask) -> Result<PreparedWorktree>;
+    async fn prepare(
+        &self,
+        target: &WorkTarget,
+        task: &AgentTask,
+        agent: AgentKind,
+    ) -> Result<PreparedWorktree>;
     async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()>;
-}
-
-#[async_trait]
-pub trait CodexRunner: Send + Sync {
-    async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,28 +98,12 @@ impl PreparedWorktree {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CodexRun {
-    pub response: String,
-    pub session_id: Option<String>,
-}
-
-impl CodexRun {
-    pub fn resume_command(&self) -> Option<(&str, String)> {
-        self.session_id.as_deref().map(|session_id| {
-            (
-                session_id,
-                format!("codex resume --include-non-interactive --all {session_id}"),
-            )
-        })
-    }
-}
-
 #[derive(Clone)]
-pub struct Maid<G, R, C> {
+pub struct Maid<G, R> {
     github: G,
     worktrees: R,
-    codex: C,
+    agents: AgentPanel,
+    prompts: PromptTemplates,
     bot_login: String,
     master_accounts: HashSet<String>,
     auto_review_accounts: HashSet<String>,
@@ -194,30 +181,29 @@ pub struct PollReport {
     pub in_flight: usize,
 }
 
-impl<G, R, C> Maid<G, R, C>
+impl<G, R> Maid<G, R>
 where
     G: GithubClient,
     R: Worktrees,
-    C: CodexRunner,
 {
     pub fn new(
         github: G,
         worktrees: R,
-        codex: C,
+        agents: AgentPanel,
+        prompts: PromptTemplates,
         bot_login: impl Into<String>,
         master_accounts: impl IntoIterator<Item = impl Into<String>>,
-        auto_review_accounts: impl IntoIterator<Item = impl Into<String>>,
-        auto_review_repos: impl IntoIterator<Item = RepoSlug>,
     ) -> Self {
         Self {
             github,
             worktrees,
-            codex,
+            agents,
+            prompts,
             bot_login: bot_login.into(),
             master_accounts: normalized_logins(master_accounts),
-            auto_review_accounts: normalized_logins(auto_review_accounts),
+            auto_review_accounts: HashSet::new(),
             auto_review_public_accounts: HashSet::new(),
-            auto_review_repos: auto_review_repos.into_iter().collect(),
+            auto_review_repos: Vec::new(),
             auto_review_requested_reviewers: Vec::new(),
             review_request_window: ChronoDuration::hours(24),
             review_cadence: ReviewCadence::Once,
@@ -226,6 +212,19 @@ where
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
             reviewed_heads: Arc::new(MemoryReviewedHeadStore::default()),
         }
+    }
+
+    pub fn with_auto_review_accounts(
+        mut self,
+        accounts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.auto_review_accounts = normalized_logins(accounts);
+        self
+    }
+
+    pub fn with_auto_review_repos(mut self, repos: impl IntoIterator<Item = RepoSlug>) -> Self {
+        self.auto_review_repos = repos.into_iter().collect();
+        self
     }
 
     pub fn with_public_auto_review_accounts(
@@ -286,7 +285,7 @@ where
         self
     }
 
-    pub fn into_concurrent(self, max_concurrent_requests: usize) -> ConcurrentMaid<G, R, C> {
+    pub fn into_concurrent(self, max_concurrent_requests: usize) -> ConcurrentMaid<G, R> {
         ConcurrentMaid {
             maid: self,
             work: WorkQueue::new(max_concurrent_requests),
@@ -502,7 +501,7 @@ where
         observed_pending_markers: &mut HashSet<PendingHandledMarker>,
     ) -> Result<Vec<TaskAssessment>> {
         let thread = self.load_mention_thread(notification).await?;
-        let plan = plan_mention_thread(thread, &self.bot_login);
+        let plan = plan_mention_thread(thread);
         self.apply_mention_thread_plan(notification, plan, observed_pending_markers)
             .await
     }
@@ -821,7 +820,7 @@ where
         &self,
         notification: Notification,
         mention: Box<CommentMention>,
-        task: CodexTask,
+        task: AgentTask,
     ) -> Result<TaskStartOutcome> {
         self.github.mark_mention_started(&mention).await?;
         info!(
@@ -856,54 +855,35 @@ where
         &self,
         notification: Notification,
         mention: Box<CommentMention>,
-        task: CodexTask,
+        task: AgentTask,
     ) -> Result<()> {
-        let worktree = self.worktrees.prepare(&mention.target, &task).await?;
-        let result = async {
-            let codex_run = self.codex.run(worktree.path(), &task).await?;
+        let comment = self.run_agents(&mention.target, &task).await?;
 
-            self.github
-                .post_comment(&mention.target, &codex_run.response)
-                .await?;
-            let marker = PendingHandledMarker::for_mention(&mention);
-            self.pending_handled_markers.record(&marker)?;
-            if let Err(err) = self.github.mark_mention_handled(&mention).await {
-                error!(
-                    notification_id = notification.id,
-                    target = %mention.target.html_url(),
-                    mention = %mention.html_url,
-                    error = ?err,
-                    "failed to mark mention handled after posting response"
-                );
-            }
-            if let Some((session_id, resume_command)) = codex_run.resume_command() {
-                info!(
-                    notification_id = notification.id,
-                    target = %mention.target.html_url(),
-                    mention = %mention.html_url,
-                    codex_session_id = %session_id,
-                    codex_resume = %resume_command,
-                    "responded to mention"
-                );
-            } else {
-                info!(
-                    notification_id = notification.id,
-                    target = %mention.target.html_url(),
-                    mention = %mention.html_url,
-                    "responded to mention"
-                );
-            }
-            Ok(())
+        self.github.post_comment(&mention.target, &comment).await?;
+        let marker = PendingHandledMarker::for_mention(&mention);
+        self.pending_handled_markers.record(&marker)?;
+        if let Err(err) = self.github.mark_mention_handled(&mention).await {
+            error!(
+                notification_id = notification.id,
+                target = %mention.target.html_url(),
+                mention = %mention.html_url,
+                error = ?err,
+                "failed to mark mention handled after posting response"
+            );
         }
-        .await;
-
-        self.cleanup_worktree(worktree, result).await
+        info!(
+            notification_id = notification.id,
+            target = %mention.target.html_url(),
+            mention = %mention.html_url,
+            "responded to mention"
+        );
+        Ok(())
     }
 
     async fn start_auto_review_task(
         &self,
         pr: PullRequest,
-        task: CodexTask,
+        task: AgentTask,
         tree: TreeSha,
     ) -> Result<TaskStartOutcome> {
         if let Err(err) = self.github.mark_pr_started(&pr).await {
@@ -929,52 +909,96 @@ where
     async fn finish_auto_review_task(
         &self,
         pr: PullRequest,
-        task: CodexTask,
+        task: AgentTask,
         tree: TreeSha,
     ) -> Result<()> {
-        let target = WorkTarget::PullRequest(pr.clone());
-        let worktree = self.worktrees.prepare(&target, &task).await?;
-        let result = async {
-            let codex_run = self.codex.run(worktree.path(), &task).await?;
+        let comment = self
+            .run_agents(&WorkTarget::PullRequest(pr.clone()), &task)
+            .await?;
 
-            self.github
-                .post_pr_comment(&pr, &auto_review_comment(&pr, &codex_run.response))
-                .await?;
-            self.reviewed_heads.record(&pr, &tree)?;
-
-            if let Some((session_id, resume_command)) = codex_run.resume_command() {
-                info!(
-                    pr = %pr.html_url,
-                    head = %pr.head,
-                    author = %pr.author,
-                    codex_session_id = %session_id,
-                    codex_resume = %resume_command,
-                    "responded to auto-review pull request"
-                );
-            } else {
-                info!(
-                    pr = %pr.html_url,
-                    head = %pr.head,
-                    author = %pr.author,
-                    "responded to auto-review pull request"
-                );
-            }
-            Ok(())
-        }
-        .await;
-
-        self.cleanup_worktree(worktree, result).await
+        self.github.post_pr_comment(&pr, &comment).await?;
+        self.reviewed_heads.record(&pr, &tree)?;
+        info!(
+            pr = %pr.html_url,
+            head = %pr.head,
+            author = %pr.author,
+            "responded to auto-review pull request"
+        );
+        Ok(())
     }
 
-    async fn cleanup_worktree(
+    /// Runs the task on its agents in parallel and stitches their responses
+    /// into one comment. The task fails only when every agent failed.
+    async fn run_agents(&self, target: &WorkTarget, task: &AgentTask) -> Result<String> {
+        let prompt = task.prompt(&self.prompts)?;
+        let agents = self.agents.all();
+        let runs = join_all(
+            agents
+                .iter()
+                .map(|agent| self.run_agent(agent.as_ref(), target, task, &prompt)),
+        )
+        .await;
+        if runs.iter().all(Result::is_err) {
+            bail!("every agent failed");
+        }
+
+        let replies: Vec<_> = agents
+            .iter()
+            .zip(&runs)
+            .map(|(agent, run)| {
+                let reply = match run {
+                    Ok(run) => AgentReply::Responded(&run.response),
+                    Err(_) => AgentReply::Failed,
+                };
+                (agent.label(), reply)
+            })
+            .collect();
+        Ok(agent_comment(target.head(), &replies, &prompt))
+    }
+
+    async fn run_agent(
+        &self,
+        agent: &dyn Agent,
+        target: &WorkTarget,
+        task: &AgentTask,
+        prompt: &str,
+    ) -> Result<AgentRun> {
+        let label = agent.label();
+        let worktree = self.worktrees.prepare(target, task, label.kind).await?;
+        let run = agent.run(worktree.path(), prompt).await;
+        let run = self.cleanup_worktree(worktree, run).await;
+        match &run {
+            Ok(run) => info!(
+                target = %target.html_url(),
+                trigger = %task.trigger_url(),
+                agent = %label,
+                resume = run
+                    .session_id
+                    .as_deref()
+                    .map(|session_id| label.kind.resume_command(session_id))
+                    .unwrap_or_default(),
+                "agent responded"
+            ),
+            Err(err) => error!(
+                target = %target.html_url(),
+                trigger = %task.trigger_url(),
+                agent = %label,
+                error = ?err,
+                "agent failed"
+            ),
+        }
+        run
+    }
+
+    async fn cleanup_worktree<T>(
         &self,
         worktree: PreparedWorktree,
-        task_result: Result<()>,
-    ) -> Result<()> {
+        task_result: Result<T>,
+    ) -> Result<T> {
         let cleanup_result = self.worktrees.cleanup(worktree).await;
         match (task_result, cleanup_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(err)) => Err(err),
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(err)) => Err(err),
             (Err(err), Ok(())) => Err(err),
             (Err(err), Err(cleanup_err)) => {
                 error!(
@@ -1002,16 +1026,15 @@ where
 }
 
 #[derive(Clone)]
-pub struct ConcurrentMaid<G, R, C> {
-    maid: Maid<G, R, C>,
+pub struct ConcurrentMaid<G, R> {
+    maid: Maid<G, R>,
     work: WorkQueue,
 }
 
-impl<G, R, C> ConcurrentMaid<G, R, C>
+impl<G, R> ConcurrentMaid<G, R>
 where
     G: GithubClient + Clone + 'static,
     R: Worktrees + Clone + 'static,
-    C: CodexRunner + Clone + 'static,
 {
     pub async fn run_once(&self) -> Result<PollReport> {
         let pending_markers = self.maid.pending_handled_markers.pending()?;
@@ -1256,11 +1279,11 @@ enum TaskIntent {
     Mention {
         notification: Notification,
         mention: Box<CommentMention>,
-        task: CodexTask,
+        task: AgentTask,
     },
     AutoReviewPullRequest {
         pr: PullRequest,
-        task: CodexTask,
+        task: AgentTask,
         tree: TreeSha,
     },
 }
@@ -1300,11 +1323,11 @@ enum StartedTask {
     Mention {
         notification: Notification,
         mention: Box<CommentMention>,
-        task: CodexTask,
+        task: AgentTask,
     },
     AutoReviewPullRequest {
         pr: PullRequest,
-        task: CodexTask,
+        task: AgentTask,
         tree: TreeSha,
     },
 }
@@ -1392,7 +1415,8 @@ fn deduplicate_auto_review_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CodexTaskOrigin, CommitSha, Issue, TreeSha};
+    use crate::agent::AgentLabel;
+    use crate::domain::{AgentTaskOrigin, CommitSha, Issue, TreeSha};
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use std::collections::HashMap;
@@ -1615,7 +1639,8 @@ mod tests {
         async fn prepare(
             &self,
             target: &WorkTarget,
-            _task: &CodexTask,
+            _task: &AgentTask,
+            _agent: AgentKind,
         ) -> Result<PreparedWorktree> {
             self.calls.lock().unwrap().push(target.repo_key());
             if let Some(message) = self.error.lock().unwrap().take() {
@@ -1629,39 +1654,71 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct FakeCodex {
-        calls: Arc<StdMutex<Vec<(PathBuf, CodexTask)>>>,
-        error: Arc<StdMutex<Option<String>>>,
+    #[derive(Clone)]
+    struct FakeAgent {
+        label: AgentLabel,
+        response: Option<&'static str>,
+        calls: Arc<StdMutex<Vec<(PathBuf, String)>>>,
+    }
+
+    impl FakeAgent {
+        fn new(kind: AgentKind, response: Option<&'static str>) -> Self {
+            Self {
+                label: AgentLabel {
+                    kind,
+                    model: format!("{kind}-model"),
+                    effort: "high".to_string(),
+                },
+                response,
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            let calls = self.calls.lock().unwrap();
+            calls.iter().map(|(_, prompt)| prompt.clone()).collect()
+        }
+    }
+
+    impl Default for FakeAgent {
+        fn default() -> Self {
+            Self::new(AgentKind::Codex, Some("codex response"))
+        }
     }
 
     #[async_trait]
-    impl CodexRunner for FakeCodex {
-        async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
+    impl Agent for FakeAgent {
+        fn label(&self) -> &AgentLabel {
+            &self.label
+        }
+
+        async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((worktree.to_path_buf(), task.clone()));
-            if let Some(message) = self.error.lock().unwrap().take() {
-                return Err(anyhow!(message));
-            }
-            Ok(CodexRun {
-                response: "codex response".to_string(),
-                session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
+                .push((worktree.to_path_buf(), prompt.to_string()));
+            let response = self
+                .response
+                .ok_or_else(|| anyhow!("{} failed", self.label.kind))?;
+            Ok(AgentRun {
+                response: response.to_string(),
+                session_id: None,
             })
         }
     }
 
     #[derive(Clone)]
-    struct BlockingCodex {
-        calls: Arc<StdMutex<Vec<(PathBuf, CodexTask)>>>,
+    struct BlockingAgent {
+        label: AgentLabel,
+        calls: Arc<StdMutex<Vec<PathBuf>>>,
         entered: Arc<Barrier>,
         release: Arc<Notify>,
     }
 
-    impl BlockingCodex {
+    impl BlockingAgent {
         fn new() -> Self {
             Self {
+                label: FakeAgent::default().label,
                 calls: Arc::new(StdMutex::new(Vec::new())),
                 entered: Arc::new(Barrier::new(2)),
                 release: Arc::new(Notify::new()),
@@ -1670,17 +1727,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl CodexRunner for BlockingCodex {
-        async fn run(&self, worktree: &Path, task: &CodexTask) -> Result<CodexRun> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((worktree.to_path_buf(), task.clone()));
+    impl Agent for BlockingAgent {
+        fn label(&self) -> &AgentLabel {
+            &self.label
+        }
+
+        async fn run(&self, worktree: &Path, _prompt: &str) -> Result<AgentRun> {
+            self.calls.lock().unwrap().push(worktree.to_path_buf());
             self.entered.wait().await;
             self.release.notified().await;
-            Ok(CodexRun {
+            Ok(AgentRun {
                 response: "codex response".to_string(),
-                session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
+                session_id: None,
             })
         }
     }
@@ -1796,8 +1854,36 @@ mod tests {
         }
     }
 
+    fn reply_to(target: &WorkTarget, prompt: &str) -> String {
+        agent_comment(
+            target.head(),
+            &[(
+                &FakeAgent::default().label,
+                AgentReply::Responded("codex response"),
+            )],
+            prompt,
+        )
+    }
+
+    fn mention_reply(cleaned_text: &str) -> String {
+        reply_to(
+            &WorkTarget::PullRequest(pr()),
+            &format!("mention https://github.com/o/r/pull/1#issuecomment-2: {cleaned_text}"),
+        )
+    }
+
     fn review_of(pr: &PullRequest) -> String {
-        auto_review_comment(pr, "codex response")
+        reply_to(
+            &WorkTarget::PullRequest(pr.clone()),
+            &format!("review {} by {}", pr.html_url, pr.author),
+        )
+    }
+
+    fn templates() -> PromptTemplates {
+        PromptTemplates {
+            mention: "mention {{mention_url}}: {{cleaned_text}}".to_string(),
+            pull_request_opened: "review {{pr_url}} by {{author}}".to_string(),
+        }
     }
 
     fn sha(prefix: &str) -> CommitSha {
@@ -1893,26 +1979,32 @@ mod tests {
         }
     }
 
-    fn maid<C>(
+    fn maid(
         github: FakeGithub,
         worktrees: FakeWorktrees,
-        codex: C,
-    ) -> Maid<FakeGithub, FakeWorktrees, C>
-    where
-        C: CodexRunner,
-    {
+        agent: impl Agent + 'static,
+    ) -> Maid<FakeGithub, FakeWorktrees> {
+        maid_with_agents(github, worktrees, vec![Arc::new(agent)])
+    }
+
+    fn maid_with_agents(
+        github: FakeGithub,
+        worktrees: FakeWorktrees,
+        agents: Vec<Arc<dyn Agent>>,
+    ) -> Maid<FakeGithub, FakeWorktrees> {
         Maid::new(
             github,
             worktrees,
-            codex,
+            AgentPanel::new(agents).unwrap(),
+            templates(),
             "maid-bot",
             ["dionysuzx"],
-            ["dionysuzx"],
-            [RepoSlug {
-                owner: "o".to_string(),
-                repo: "r".to_string(),
-            }],
         )
+        .with_auto_review_accounts(["dionysuzx"])
+        .with_auto_review_repos([RepoSlug {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+        }])
     }
 
     fn at_limit_recorder() -> FixedTaskStartRecorder {
@@ -1936,31 +2028,14 @@ mod tests {
     }
 
     #[test]
-    fn builds_codex_resume_command_from_session_id() {
-        let run = CodexRun {
-            response: "done".to_string(),
-            session_id: Some("019e64fd-8369-7453-9cdc-4b14b388f618".to_string()),
-        };
-
-        assert_eq!(
-            run.resume_command(),
-            Some((
-                "019e64fd-8369-7453-9cdc-4b14b388f618",
-                "codex resume --include-non-interactive --all 019e64fd-8369-7453-9cdc-4b14b388f618"
-                    .to_string()
-            ))
-        );
-    }
-
-    #[test]
     fn task_keys_allow_distinct_mentions_on_the_same_pull_request() {
         let first_mention = mention_with_comment("dionysuzx", "@maid-bot first", "2");
         let second_mention = mention_with_comment("dionysuzx", "@maid-bot second", "3");
         let first = TaskIntent::Mention {
             notification: notification_with_comment("n1", "2"),
-            task: CodexTask {
+            task: AgentTask {
                 pr_url: first_mention.target.html_url().to_string(),
-                origin: CodexTaskOrigin::Mention {
+                origin: AgentTaskOrigin::Mention {
                     mention_url: first_mention.html_url.clone(),
                     raw_body: first_mention.body.clone(),
                     cleaned_text: "first".to_string(),
@@ -1970,9 +2045,9 @@ mod tests {
         };
         let second = TaskIntent::Mention {
             notification: notification_with_comment("n1", "3"),
-            task: CodexTask {
+            task: AgentTask {
                 pr_url: second_mention.target.html_url().to_string(),
-                origin: CodexTaskOrigin::Mention {
+                origin: AgentTaskOrigin::Mention {
                     mention_url: second_mention.html_url.clone(),
                     raw_body: second_mention.body.clone(),
                     cleaned_text: "second".to_string(),
@@ -1998,7 +2073,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
@@ -2006,7 +2081,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(
+            *github.posts.lock().unwrap(),
+            vec![mention_reply("please review this PR")]
+        );
         assert!(github.marks.lock().unwrap().is_empty());
         assert_eq!(
             *github.events.lock().unwrap(),
@@ -2026,71 +2104,20 @@ mod tests {
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
-        assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/pull/1");
         assert_eq!(
-            calls[0].1.origin,
-            CodexTaskOrigin::Mention {
-                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
-                raw_body: "@maid-bot please review this PR".to_string(),
-                cleaned_text: "please review this PR".to_string(),
-            }
+            calls[0].1,
+            "mention https://github.com/o/r/pull/1#issuecomment-2: please review this PR"
         );
     }
 
     #[tokio::test]
-    async fn trusted_operate_mention_uses_operator_task_origin() {
-        let worktree = PathBuf::from("/tmp/maid-test-worktree");
-        let github = FakeGithub::default();
-        *github.notifications.lock().unwrap() = vec![notification("n1")];
-        *github.mention.lock().unwrap() = Some(Ok(Some(mention(
-            "dionysuzx",
-            "@maid-bot /operate implement and push",
-        ))));
-        let worktrees = FakeWorktrees {
-            worktree: worktree.clone(),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeCodex::default();
-
-        let report = maid(github.clone(), worktrees.clone(), codex.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
-        let calls = codex.calls.lock().unwrap();
-        assert_eq!(calls[0].0, worktree);
-        assert_eq!(
-            calls[0].1.origin,
-            CodexTaskOrigin::OperatorMention {
-                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
-                raw_body: "@maid-bot /operate implement and push".to_string(),
-                request_text: "implement and push".to_string(),
-                trigger_author: "dionysuzx".to_string(),
-                bot_login: "maid-bot".to_string(),
-            }
-        );
-        let templates = crate::domain::CodexPromptTemplates {
-            mention: String::new(),
-            pull_request_opened: String::new(),
-            operator_mention: "operate {{request_text}} for {{trigger_author}}".to_string(),
-        };
-        assert_eq!(
-            calls[0].1.prompt(&templates).unwrap(),
-            "operate implement and push for dionysuzx"
-        );
-    }
-
-    #[tokio::test]
-    async fn trusted_issue_operate_mention_runs_on_issue_target() {
+    async fn responds_to_issue_mention_on_issue_target() {
         let worktree = PathBuf::from("/tmp/maid-test-worktree");
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![issue_notification("n1", "2")];
         *github.mention.lock().unwrap() = Some(Ok(Some(issue_mention(
             "dionysuzx",
-            "@maid-bot /operate fix this issue",
+            "@maid-bot explain this issue",
             "2",
         ))));
         let worktrees = FakeWorktrees {
@@ -2098,7 +2125,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
@@ -2106,7 +2133,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(
+            *github.posts.lock().unwrap(),
+            vec![reply_to(
+                &WorkTarget::Issue(issue()),
+                "mention https://github.com/o/r/issues/322#issuecomment-2: explain this issue"
+            )]
+        );
         assert_eq!(
             *github.events.lock().unwrap(),
             vec!["start", "post", "handled"]
@@ -2114,16 +2147,9 @@ mod tests {
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
-        assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/issues/322");
         assert_eq!(
-            calls[0].1.origin,
-            CodexTaskOrigin::OperatorMention {
-                mention_url: "https://github.com/o/r/issues/322#issuecomment-2".to_string(),
-                raw_body: "@maid-bot /operate fix this issue".to_string(),
-                request_text: "fix this issue".to_string(),
-                trigger_author: "dionysuzx".to_string(),
-                bot_login: "maid-bot".to_string(),
-            }
+            calls[0].1,
+            "mention https://github.com/o/r/issues/322#issuecomment-2: explain this issue"
         );
     }
 
@@ -2137,7 +2163,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
@@ -2152,12 +2178,9 @@ mod tests {
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
-        assert_eq!(calls[0].1.pr_url, "https://github.com/o/r/pull/1");
         assert_eq!(
-            calls[0].1.origin,
-            CodexTaskOrigin::PullRequestOpened {
-                author: "dionysuzx".to_string(),
-            }
+            calls[0].1,
+            "review https://github.com/o/r/pull/1 by dionysuzx"
         );
     }
 
@@ -2171,20 +2194,21 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = Maid::new(
             github.clone(),
             worktrees.clone(),
-            codex.clone(),
+            AgentPanel::new(vec![Arc::new(codex.clone())]).unwrap(),
+            templates(),
             "maid-bot",
             ["dionysuzx"],
-            Vec::<String>::new(),
-            [RepoSlug {
-                owner: "configured".to_string(),
-                repo: "repo".to_string(),
-            }],
         )
+        .with_auto_review_accounts(Vec::<String>::new())
+        .with_auto_review_repos([RepoSlug {
+            owner: "configured".to_string(),
+            repo: "repo".to_string(),
+        }])
         .with_public_auto_review_accounts(["Dionysuzx"])
         .run_once()
         .await
@@ -2201,10 +2225,8 @@ mod tests {
         let calls = codex.calls.lock().unwrap();
         assert_eq!(calls[0].0, worktree);
         assert_eq!(
-            calls[0].1.origin,
-            CodexTaskOrigin::PullRequestOpened {
-                author: "dionysuzx".to_string(),
-            }
+            calls[0].1,
+            "review https://github.com/o/r/pull/1 by dionysuzx"
         );
     }
 
@@ -2218,20 +2240,21 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = Maid::new(
             github.clone(),
             worktrees,
-            codex,
+            AgentPanel::new(vec![Arc::new(codex)]).unwrap(),
+            templates(),
             "maid-bot",
             ["dionysuzx"],
-            Vec::<String>::new(),
-            [RepoSlug {
-                owner: "o".to_string(),
-                repo: "r".to_string(),
-            }],
         )
+        .with_auto_review_accounts(Vec::<String>::new())
+        .with_auto_review_repos([RepoSlug {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+        }])
         .with_public_auto_review_accounts(["dionysuzx"])
         .run_once()
         .await
@@ -2251,20 +2274,21 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = Maid::new(
             github.clone(),
             worktrees,
-            codex,
+            AgentPanel::new(vec![Arc::new(codex)]).unwrap(),
+            templates(),
             "maid-bot",
             ["repo-author", "public-author"],
-            ["repo-author"],
-            [RepoSlug {
-                owner: "private".to_string(),
-                repo: "repo".to_string(),
-            }],
         )
+        .with_auto_review_accounts(["repo-author"])
+        .with_auto_review_repos([RepoSlug {
+            owner: "private".to_string(),
+            repo: "repo".to_string(),
+        }])
         .with_public_auto_review_accounts(["public-author"])
         .run_once()
         .await
@@ -2286,7 +2310,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = BlockingCodex::new();
+        let codex = BlockingAgent::new();
         let entered = codex.entered.clone();
         let release = codex.release.clone();
         let maid = maid(github.clone(), worktrees, codex).into_concurrent(1);
@@ -2302,7 +2326,7 @@ mod tests {
         entered.wait().await;
         assert!(
             github.posts.lock().unwrap().is_empty(),
-            "Codex is still running, so the response should not be posted yet"
+            "The agent is still running, so the response should not be posted yet"
         );
 
         release.notify_waiters();
@@ -2321,7 +2345,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = BlockingCodex::new();
+        let codex = BlockingAgent::new();
         let entered = codex.entered.clone();
         let release = codex.release.clone();
         let maid = maid(github.clone(), worktrees, codex).into_concurrent(1);
@@ -2352,7 +2376,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = BlockingCodex::new();
+        let codex = BlockingAgent::new();
         let entered = codex.entered.clone();
         let release = codex.release.clone();
         let maid = maid(github.clone(), worktrees, codex.clone()).into_concurrent(1);
@@ -2388,7 +2412,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let task_starts = at_limit_recorder();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
@@ -2415,7 +2439,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let task_starts = at_limit_recorder();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
@@ -2441,7 +2465,7 @@ mod tests {
         *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
         request_team(&github, &pull_request, recent_pr_time());
         let worktrees = idle_worktrees();
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .with_auto_review_requested_reviewers([reviewer("Some-Org/Eng-Infra")])
@@ -2458,10 +2482,8 @@ mod tests {
         assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
         let calls = codex.calls.lock().unwrap();
         assert_eq!(
-            calls[0].1.origin,
-            CodexTaskOrigin::PullRequestOpened {
-                author: "contributor".to_string(),
-            }
+            calls[0].1,
+            "review https://github.com/o/r/pull/1 by contributor"
         );
     }
 
@@ -2484,7 +2506,7 @@ mod tests {
             recent_pr_time(),
         );
 
-        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+        let report = maid(github.clone(), idle_worktrees(), FakeAgent::default())
             .with_auto_review_requested_reviewers([
                 reviewer("some-org/eng-infra"),
                 reviewer("Maid-Bot"),
@@ -2506,7 +2528,7 @@ mod tests {
         let pull_request = pr_with_author("contributor");
         *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
         request_team(&github, &pull_request, recent_pr_time());
-        let maid = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+        let maid = maid(github.clone(), idle_worktrees(), FakeAgent::default())
             .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")]);
 
         let first = maid.run_once().await.unwrap();
@@ -2525,7 +2547,7 @@ mod tests {
         *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
         *github.public_pull_requests.lock().unwrap() = vec![pull_request.clone()];
         request_team(&github, &pull_request, recent_pr_time());
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), idle_worktrees(), codex.clone())
             .with_public_auto_review_accounts(["dionysuzx"])
@@ -2558,7 +2580,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(old_author_pr.html_url.clone(), old_pr_time());
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), idle_worktrees(), codex.clone())
             .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
@@ -2567,18 +2589,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 2);
-        let urls = codex
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, task)| task.pr_url.clone())
-            .collect::<Vec<_>>();
         assert_eq!(
-            urls,
+            codex.prompts(),
             vec![
-                "https://github.com/o/r/pull/2".to_string(),
-                "https://github.com/o/r/pull/3".to_string(),
+                "review https://github.com/o/r/pull/2 by contributor",
+                "review https://github.com/o/r/pull/3 by dionysuzx",
             ]
         );
     }
@@ -2608,7 +2623,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(author_only_on_updated.html_url.clone(), recent_pr_time());
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), idle_worktrees(), codex.clone())
             .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
@@ -2619,18 +2634,11 @@ mod tests {
         assert_eq!(report.seen, 3);
         assert_eq!(report.responded, 2);
         assert_eq!(report.skipped, 1);
-        let urls = codex
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, task)| task.pr_url.clone())
-            .collect::<Vec<_>>();
         assert_eq!(
-            urls,
+            codex.prompts(),
             vec![
-                "https://github.com/o/r/pull/3".to_string(),
-                "https://github.com/o/r/pull/9".to_string(),
+                "review https://github.com/o/r/pull/3 by dionysuzx",
+                "review https://github.com/o/r/pull/9 by contributor",
             ]
         );
     }
@@ -2656,7 +2664,7 @@ mod tests {
             .unwrap()
             .insert(other_team.html_url.clone(), recent_pr_time());
 
-        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+        let report = maid(github.clone(), idle_worktrees(), FakeAgent::default())
             .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .run_once()
             .await
@@ -2675,7 +2683,7 @@ mod tests {
         let team_pr = pr_with_author_and_number("contributor", 9);
         *github.pull_requests.lock().unwrap() = vec![author_pr.clone(), team_pr.clone()];
         request_team(&github, &team_pr, recent_pr_time());
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), idle_worktrees(), codex.clone())
             .run_once()
@@ -2687,14 +2695,10 @@ mod tests {
             vec![OpenPullRequestOrder::NewestCreated]
         );
         assert_eq!(report.responded, 1);
-        let urls = codex
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, task)| task.pr_url.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(urls, vec!["https://github.com/o/r/pull/3".to_string()]);
+        assert_eq!(
+            codex.prompts(),
+            vec!["review https://github.com/o/r/pull/3 by dionysuzx"]
+        );
     }
 
     #[tokio::test]
@@ -2704,7 +2708,7 @@ mod tests {
         *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
         request_team(&github, &pull_request, recent_pr_time());
 
-        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+        let report = maid(github.clone(), idle_worktrees(), FakeAgent::default())
             .run_once()
             .await
             .unwrap();
@@ -2720,7 +2724,7 @@ mod tests {
         *github.pull_requests.lock().unwrap() = vec![own.clone()];
         request_team(&github, &own, recent_pr_time());
         let worktrees = idle_worktrees();
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let own_report = maid(github.clone(), worktrees.clone(), codex.clone())
             .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
@@ -2734,12 +2738,13 @@ mod tests {
         let unwatched = Maid::new(
             github.clone(),
             worktrees,
-            codex,
+            AgentPanel::new(vec![Arc::new(codex)]).unwrap(),
+            templates(),
             "maid-bot",
             ["dionysuzx"],
-            ["dionysuzx"],
-            Vec::<RepoSlug>::new(),
         )
+        .with_auto_review_accounts(["dionysuzx"])
+        .with_auto_review_repos(Vec::<RepoSlug>::new())
         .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")]);
         let contributor = pr_with_author("contributor");
         *github.pull_requests.lock().unwrap() = vec![contributor.clone()];
@@ -2759,7 +2764,7 @@ mod tests {
         request_team(&github, &pull_request, recent_pr_time());
         let task_starts = at_limit_recorder();
 
-        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+        let report = maid(github.clone(), idle_worktrees(), FakeAgent::default())
             .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .with_task_start_recorder(task_starts.clone())
             .run_once()
@@ -2782,7 +2787,7 @@ mod tests {
         *github.pull_requests.lock().unwrap() = vec![pull_request.clone()];
         request_team(&github, &pull_request, recent_pr_time());
 
-        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+        let report = maid(github.clone(), idle_worktrees(), FakeAgent::default())
             .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .run_once()
             .await
@@ -2799,7 +2804,7 @@ mod tests {
         let without_pull_request = maid(
             notification_only.clone(),
             idle_worktrees(),
-            FakeCodex::default(),
+            FakeAgent::default(),
         )
         .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
         .run_once()
@@ -2820,7 +2825,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
@@ -2841,7 +2846,7 @@ mod tests {
         *github.pull_requests.lock().unwrap() = vec![pr()];
         *github.pr_started_error.lock().unwrap() = Some("reaction failed".to_string());
 
-        let report = maid(github.clone(), idle_worktrees(), FakeCodex::default())
+        let report = maid(github.clone(), idle_worktrees(), FakeAgent::default())
             .run_once()
             .await
             .unwrap();
@@ -2854,7 +2859,7 @@ mod tests {
     async fn review_once_ignores_new_heads() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), idle_worktrees(), codex.clone());
 
         let first = maid.run_once().await.unwrap();
@@ -2871,7 +2876,7 @@ mod tests {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
         let worktrees = idle_worktrees();
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), worktrees, codex.clone())
             .with_review_cadence(ReviewCadence::EveryHead);
 
@@ -2898,7 +2903,7 @@ mod tests {
     async fn continuous_review_skips_a_new_head_with_the_reviewed_code() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), idle_worktrees(), codex.clone())
             .with_review_cadence(ReviewCadence::EveryHead);
 
@@ -2925,7 +2930,7 @@ mod tests {
         let team_pr = pr_with_author("contributor");
         *github.pull_requests.lock().unwrap() = vec![team_pr.clone()];
         request_team(&github, &team_pr, recent_pr_time());
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), idle_worktrees(), codex.clone())
             .with_auto_review_requested_reviewers([reviewer("some-org/eng-infra")])
             .with_review_cadence(ReviewCadence::EveryHead);
@@ -2949,7 +2954,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
@@ -2974,7 +2979,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
@@ -2997,7 +3002,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
@@ -3022,7 +3027,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3053,7 +3058,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .with_observed_notification_store(observed_notifications)
@@ -3087,7 +3092,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .with_observed_notification_store(observed_notifications)
@@ -3116,7 +3121,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), worktrees.clone(), codex.clone());
 
         let first = maid.run_once().await.unwrap();
@@ -3142,7 +3147,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
@@ -3166,7 +3171,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3174,7 +3179,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![mention_reply("review")]);
     }
 
     #[tokio::test]
@@ -3187,7 +3192,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), worktrees, codex);
 
         let first_report = maid.run_once().await.unwrap();
@@ -3216,7 +3221,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), worktrees, codex);
 
         let first_report = maid.run_once().await.unwrap();
@@ -3251,7 +3256,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3290,7 +3295,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3324,7 +3329,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3352,7 +3357,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3392,7 +3397,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3422,7 +3427,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3457,7 +3462,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), worktrees, codex).into_concurrent(4);
 
         let report = maid.run_once().await.unwrap();
@@ -3499,7 +3504,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), worktrees, codex).into_concurrent(4);
 
         let report = maid.run_once().await.unwrap();
@@ -3532,7 +3537,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = BlockingCodex::new();
+        let codex = BlockingAgent::new();
         let entered = codex.entered.clone();
         let release = codex.release.clone();
         let maid = maid(github.clone(), worktrees, codex.clone()).into_concurrent(1);
@@ -3560,7 +3565,7 @@ mod tests {
         assert_eq!(second_report.started, 0);
         assert_eq!(third_report.started, 0);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![mention_reply("review")]);
         assert_eq!(
             *github.started_mentions.lock().unwrap(),
             vec!["https://api.github.com/repos/o/r/issues/comments/2"]
@@ -3590,7 +3595,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3618,7 +3623,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees.clone(), codex.clone())
             .run_once()
@@ -3642,7 +3647,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(Some("clone failed".to_string()))),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex.clone())
             .run_once()
@@ -3656,7 +3661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_failure_does_not_post_or_mark() {
+    async fn agent_failure_does_not_post_or_mark() {
         let github = FakeGithub::default();
         *github.notifications.lock().unwrap() = vec![notification("n1")];
         *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot review"))));
@@ -3665,8 +3670,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
-        *codex.error.lock().unwrap() = Some("codex failed".to_string());
+        let codex = FakeAgent::new(AgentKind::Codex, None);
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3676,6 +3680,92 @@ mod tests {
         assert_eq!(report.failed, 1);
         assert!(github.posts.lock().unwrap().is_empty());
         assert!(github.marks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_review_posts_every_agent_review_in_one_comment() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let worktrees = idle_worktrees();
+        let codex = FakeAgent::new(AgentKind::Codex, Some("codex review"));
+        let claude = FakeAgent::new(AgentKind::Claude, Some("claude review"));
+
+        let report = maid_with_agents(
+            github.clone(),
+            worktrees.clone(),
+            vec![Arc::new(codex.clone()), Arc::new(claude.clone())],
+        )
+        .run_once()
+        .await
+        .unwrap();
+
+        let prompt = "review https://github.com/o/r/pull/1 by dionysuzx";
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.posts.lock().unwrap(),
+            vec![agent_comment(
+                Some(&pr().head),
+                &[
+                    (&codex.label, AgentReply::Responded("codex review")),
+                    (&claude.label, AgentReply::Responded("claude review")),
+                ],
+                prompt,
+            )]
+        );
+        assert_eq!(codex.prompts(), vec![prompt]);
+        assert_eq!(claude.prompts(), vec![prompt]);
+        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r", "o/r"]);
+    }
+
+    #[tokio::test]
+    async fn posts_the_reviews_that_succeeded_when_one_agent_fails() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        let codex = FakeAgent::new(AgentKind::Codex, None);
+        let claude = FakeAgent::new(AgentKind::Claude, Some("claude review"));
+
+        let report = maid_with_agents(
+            github.clone(),
+            idle_worktrees(),
+            vec![Arc::new(codex.clone()), Arc::new(claude.clone())],
+        )
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(report.responded, 1);
+        assert_eq!(
+            *github.posts.lock().unwrap(),
+            vec![agent_comment(
+                Some(&pr().head),
+                &[
+                    (&codex.label, AgentReply::Failed),
+                    (&claude.label, AgentReply::Responded("claude review")),
+                ],
+                "review https://github.com/o/r/pull/1 by dionysuzx",
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_agent_failing_fails_the_task_without_posting() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+
+        let report = maid_with_agents(
+            github.clone(),
+            idle_worktrees(),
+            vec![
+                Arc::new(FakeAgent::new(AgentKind::Codex, None)),
+                Arc::new(FakeAgent::new(AgentKind::Claude, None)),
+            ],
+        )
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert!(github.posts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3689,7 +3779,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3712,7 +3802,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
 
         let report = maid(github.clone(), worktrees, codex)
             .run_once()
@@ -3720,7 +3810,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.responded, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![mention_reply("review")]);
         assert!(github.marks.lock().unwrap().is_empty());
         assert!(github.handled_mentions.lock().unwrap().is_empty());
         assert_eq!(
@@ -3730,7 +3820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_pending_mention_marker_without_rerunning_codex() {
+    async fn retries_pending_mention_marker_without_rerunning_agents() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("pending-handled-markers.json");
         let github = FakeGithub::default();
@@ -3742,7 +3832,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), worktrees, codex.clone())
             .with_pending_handled_marker_store(
                 crate::handled_marker::FilePendingHandledMarkerStore::new(&marker_path),
@@ -3757,7 +3847,7 @@ mod tests {
         assert_eq!(first_report.responded, 1);
         assert_eq!(second_report.skipped, 1);
         assert_eq!(third_report.skipped, 1);
-        assert_eq!(*github.posts.lock().unwrap(), vec!["codex response"]);
+        assert_eq!(*github.posts.lock().unwrap(), vec![mention_reply("review")]);
         assert_eq!(codex.calls.lock().unwrap().len(), 1);
         assert_eq!(*github.marks.lock().unwrap(), vec!["n1", "n1"]);
         assert!(
@@ -3785,7 +3875,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid =
             maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
 
@@ -3826,7 +3916,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid =
             maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
 
@@ -3862,7 +3952,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid =
             maid(github.clone(), worktrees, codex.clone()).with_pending_handled_marker_store(store);
 
@@ -3894,7 +3984,7 @@ mod tests {
             calls: Arc::new(StdMutex::new(Vec::new())),
             error: Arc::new(StdMutex::new(None)),
         };
-        let codex = FakeCodex::default();
+        let codex = FakeAgent::default();
         let maid = maid(github.clone(), worktrees, codex.clone())
             .with_pending_handled_marker_store(store)
             .into_concurrent(4);

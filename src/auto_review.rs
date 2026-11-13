@@ -1,4 +1,4 @@
-use crate::domain::{CodexTask, CodexTaskOrigin, CommitSha, PullRequest, RequestedReviewer};
+use crate::domain::{AgentTask, AgentTaskOrigin, CommitSha, PullRequest, RequestedReviewer};
 use chrono::{DateTime, Duration, Utc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,16 +70,10 @@ impl ReviewCadence {
     }
 }
 
-/// Heads a review with the commit it covers, since the author may push again
-/// before it posts. GitHub links the bare SHA.
-pub fn auto_review_comment(pr: &PullRequest, review: &str) -> String {
-    format!("Reviewed at {}.\n\n{review}", pr.head)
-}
-
-pub fn auto_review_task(pr: &PullRequest) -> CodexTask {
-    CodexTask {
+pub fn auto_review_task(pr: &PullRequest) -> AgentTask {
+    AgentTask {
         pr_url: pr.html_url.clone(),
-        origin: CodexTaskOrigin::PullRequestOpened {
+        origin: AgentTaskOrigin::PullRequestOpened {
             author: pr.author.clone(),
         },
     }
@@ -100,25 +94,6 @@ mod tests {
         assert!(!ReviewCadence::Once.needs_review(&second, Some(&first)));
         assert!(!ReviewCadence::EveryHead.needs_review(&first, Some(&first)));
         assert!(ReviewCadence::EveryHead.needs_review(&second, Some(&first)));
-    }
-
-    #[test]
-    fn review_comment_names_the_reviewed_commit() {
-        let pr = PullRequest {
-            owner: "o".to_string(),
-            repo: "r".to_string(),
-            number: 1,
-            author: "dionysuzx".to_string(),
-            api_url: "https://api.github.com/repos/o/r/pulls/1".to_string(),
-            html_url: "https://github.com/o/r/pull/1".to_string(),
-            clone_url: "https://github.com/o/r.git".to_string(),
-            head: sha('a'),
-        };
-
-        assert_eq!(
-            auto_review_comment(&pr, "1. **[P1] Bug.**"),
-            format!("Reviewed at {}.\n\n1. **[P1] Bug.**", "a".repeat(40))
-        );
     }
 
     #[test]

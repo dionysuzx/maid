@@ -1,6 +1,7 @@
 use crate::{
+    agent::AgentKind,
     auto_review::ReviewCadence,
-    domain::{CodexPromptTemplates, RepoSlug, RequestedReviewer},
+    domain::{PromptTemplates, RepoSlug, RequestedReviewer},
     github::{
         DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
         GitHubApiRequestRate, GitHubNotificationWindow,
@@ -35,12 +36,18 @@ pub struct Config {
     pub max_concurrent_requests: usize,
     pub github_api_requests_per_hour: GitHubApiRequestRate,
     pub github_notification_window: GitHubNotificationWindow,
-    pub codex_bin: String,
-    pub codex_model: String,
-    pub codex_reasoning_effort: String,
-    pub codex_prompts: CodexPromptTemplates,
+    pub agents: Vec<AgentConfig>,
+    pub prompts: PromptTemplates,
     pub github_api_ip: Option<IpAddr>,
     pub metrics_bind_address: SocketAddr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentConfig {
+    pub kind: AgentKind,
+    pub bin: String,
+    pub model: String,
+    pub effort: String,
 }
 
 impl Config {
@@ -100,20 +107,10 @@ impl Config {
             file.github_notification_window_hours
                 .unwrap_or(DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS),
         )?;
-        let codex_bin = normalize_command(non_empty(file.codex_bin))?;
-        let codex_model = required_string(file.codex_model, "codex_model")
-            .with_context(|| format!("codex_model is required in {}", config_path.display()))?;
-        let codex_reasoning_effort =
-            required_string(file.codex_reasoning_effort, "codex_reasoning_effort").with_context(
-                || {
-                    format!(
-                        "codex_reasoning_effort is required in {}",
-                        config_path.display()
-                    )
-                },
-            )?;
-        let codex_prompts = required_codex_prompts(file.codex_prompts)
-            .with_context(|| format!("codex_prompts is required in {}", config_path.display()))?;
+        let agents = required_agents(file.agents)
+            .with_context(|| format!("agents is required in {}", config_path.display()))?;
+        let prompts = required_prompts(file.prompts)
+            .with_context(|| format!("prompts is required in {}", config_path.display()))?;
         let github_api_ip = non_empty(file.github_api_ip)
             .map(|value| value.parse::<IpAddr>())
             .transpose()
@@ -145,10 +142,8 @@ impl Config {
             max_concurrent_requests,
             github_api_requests_per_hour,
             github_notification_window,
-            codex_bin,
-            codex_model,
-            codex_reasoning_effort,
-            codex_prompts,
+            agents,
+            prompts,
             github_api_ip,
             metrics_bind_address,
         })
@@ -169,19 +164,24 @@ struct ConfigFile {
     max_concurrent_requests: Option<usize>,
     github_api_requests_per_hour: Option<u32>,
     github_notification_window_hours: Option<u32>,
-    codex_bin: Option<String>,
-    codex_model: Option<String>,
-    codex_reasoning_effort: Option<String>,
-    codex_prompts: Option<CodexPromptsFile>,
+    agents: Option<Vec<AgentFile>>,
+    prompts: Option<PromptsFile>,
     github_api_ip: Option<String>,
     metrics_bind_address: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+struct AgentFile {
+    kind: AgentKind,
+    bin: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
-struct CodexPromptsFile {
+struct PromptsFile {
     mention: Option<String>,
     pull_request_opened: Option<String>,
-    operator_mention: Option<String>,
 }
 
 impl ConfigFile {
@@ -278,24 +278,43 @@ fn require_subset(logins: &[String], trusted_logins: &[String], key: &str) -> Re
     Ok(())
 }
 
-fn required_codex_prompts(value: Option<CodexPromptsFile>) -> Result<CodexPromptTemplates> {
+fn required_agents(value: Option<Vec<AgentFile>>) -> Result<Vec<AgentConfig>> {
+    let agents = value.unwrap_or_default();
+    if agents.is_empty() {
+        bail!("agents must list at least one [[agents]] entry");
+    }
+
+    agents
+        .into_iter()
+        .enumerate()
+        .map(|(index, agent)| {
+            agent_config(agent).with_context(|| format!("invalid agents entry {}", index + 1))
+        })
+        .collect()
+}
+
+fn agent_config(agent: AgentFile) -> Result<AgentConfig> {
+    Ok(AgentConfig {
+        kind: agent.kind,
+        bin: normalize_command(non_empty(agent.bin), agent.kind.as_str())?,
+        model: required_string(agent.model, "model")?,
+        effort: required_string(agent.effort, "effort")?,
+    })
+}
+
+fn required_prompts(value: Option<PromptsFile>) -> Result<PromptTemplates> {
     let Some(prompts) = value else {
-        bail!(
-            "codex_prompts must include mention, pull_request_opened, and operator_mention templates"
-        );
+        bail!("prompts must include mention and pull_request_opened templates");
     };
 
-    let mention = non_empty(prompts.mention)
-        .ok_or_else(|| anyhow!("codex_prompts.mention must not be empty"))?;
+    let mention =
+        non_empty(prompts.mention).ok_or_else(|| anyhow!("prompts.mention must not be empty"))?;
     let pull_request_opened = non_empty(prompts.pull_request_opened)
-        .ok_or_else(|| anyhow!("codex_prompts.pull_request_opened must not be empty"))?;
-    let operator_mention = non_empty(prompts.operator_mention)
-        .ok_or_else(|| anyhow!("codex_prompts.operator_mention must not be empty"))?;
+        .ok_or_else(|| anyhow!("prompts.pull_request_opened must not be empty"))?;
 
-    Ok(CodexPromptTemplates {
+    Ok(PromptTemplates {
         mention,
         pull_request_opened,
-        operator_mention,
     })
 }
 
@@ -340,9 +359,9 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
         .join(path))
 }
 
-fn normalize_command(command: Option<String>) -> Result<String> {
+fn normalize_command(command: Option<String>, default: &str) -> Result<String> {
     let Some(command) = command else {
-        return Ok("codex".to_string());
+        return Ok(default.to_string());
     };
 
     if !command.contains('/') {
@@ -404,15 +423,22 @@ max_concurrent_requests = 3
 github_api_requests_per_hour = 1200
 github_notification_window_hours = 96
 metrics_bind_address = "127.0.0.1:9999"
-codex_bin = "codex-test"
-codex_model = "gpt-test"
-codex_reasoning_effort = "high"
 github_api_ip = "127.0.0.1"
 
-[codex_prompts]
+[[agents]]
+kind = "codex"
+bin = "codex-test"
+model = "gpt-test"
+effort = "high"
+
+[[agents]]
+kind = "claude"
+model = "claude-test"
+effort = "max"
+
+[prompts]
 mention = "mention {{{{cleaned_text}}}}"
 pull_request_opened = "review {{{{pr_url}}}}"
-operator_mention = "operator {{{{request_text}}}}"
 "#
         )
         .unwrap();
@@ -450,23 +476,44 @@ operator_mention = "operator {{{{request_text}}}}"
             config.metrics_bind_address.as_deref(),
             Some("127.0.0.1:9999")
         );
-        assert_eq!(config.codex_bin.as_deref(), Some("codex-test"));
-        assert_eq!(config.codex_model.as_deref(), Some("gpt-test"));
-        assert_eq!(config.codex_reasoning_effort.as_deref(), Some("high"));
-        let codex_prompts = config.codex_prompts.unwrap();
         assert_eq!(
-            codex_prompts.mention.as_deref(),
-            Some("mention {{cleaned_text}}")
+            required_agents(config.agents).unwrap(),
+            vec![
+                AgentConfig {
+                    kind: AgentKind::Codex,
+                    bin: "codex-test".to_string(),
+                    model: "gpt-test".to_string(),
+                    effort: "high".to_string(),
+                },
+                AgentConfig {
+                    kind: AgentKind::Claude,
+                    bin: "claude".to_string(),
+                    model: "claude-test".to_string(),
+                    effort: "max".to_string(),
+                },
+            ]
         );
+        let prompts = config.prompts.unwrap();
+        assert_eq!(prompts.mention.as_deref(), Some("mention {{cleaned_text}}"));
         assert_eq!(
-            codex_prompts.pull_request_opened.as_deref(),
+            prompts.pull_request_opened.as_deref(),
             Some("review {{pr_url}}")
         );
-        assert_eq!(
-            codex_prompts.operator_mention.as_deref(),
-            Some("operator {{request_text}}")
-        );
         assert_eq!(config.github_api_ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn example_config_lists_valid_agents_and_prompts() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let config = ConfigFile::read(&path).unwrap();
+
+        let kinds: Vec<_> = required_agents(config.agents)
+            .unwrap()
+            .into_iter()
+            .map(|agent| agent.kind)
+            .collect();
+        assert_eq!(kinds, vec![AgentKind::Codex, AgentKind::Claude]);
+        assert!(required_prompts(config.prompts).is_ok());
     }
 
     #[test]
@@ -484,48 +531,62 @@ operator_mention = "operator {{{{request_text}}}}"
         assert_eq!(config.github_api_requests_per_hour, None);
         assert_eq!(config.github_notification_window_hours, None);
         assert_eq!(config.metrics_bind_address, None);
-        assert_eq!(config.codex_prompts, None);
+        assert_eq!(config.agents, None);
+        assert_eq!(config.prompts, None);
     }
 
     #[test]
-    fn requires_codex_prompt_templates() {
-        assert!(required_codex_prompts(None).is_err());
+    fn requires_complete_agent_entries() {
+        let agent = || AgentFile {
+            kind: AgentKind::Claude,
+            bin: None,
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
+        };
+
+        assert!(required_agents(None).is_err());
+        assert!(required_agents(Some(Vec::new())).is_err());
+        assert!(required_agents(Some(vec![agent()])).is_ok());
+        for broken in [
+            AgentFile {
+                model: None,
+                ..agent()
+            },
+            AgentFile {
+                effort: Some(" ".to_string()),
+                ..agent()
+            },
+        ] {
+            assert!(required_agents(Some(vec![agent(), broken])).is_err());
+        }
+    }
+
+    #[test]
+    fn requires_prompt_templates() {
+        assert!(required_prompts(None).is_err());
         assert!(
-            required_codex_prompts(Some(CodexPromptsFile {
+            required_prompts(Some(PromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: None,
-                operator_mention: Some("operate".to_string()),
             }))
             .is_err()
         );
         assert!(
-            required_codex_prompts(Some(CodexPromptsFile {
+            required_prompts(Some(PromptsFile {
                 mention: Some(" ".to_string()),
                 pull_request_opened: Some("review".to_string()),
-                operator_mention: Some("operate".to_string()),
             }))
             .is_err()
         );
-        assert!(
-            required_codex_prompts(Some(CodexPromptsFile {
-                mention: Some("mention".to_string()),
-                pull_request_opened: Some("review".to_string()),
-                operator_mention: Some(" ".to_string()),
-            }))
-            .is_err()
-        );
-
         assert_eq!(
-            required_codex_prompts(Some(CodexPromptsFile {
+            required_prompts(Some(PromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: Some("review".to_string()),
-                operator_mention: Some("operate".to_string()),
             }))
             .unwrap(),
-            CodexPromptTemplates {
+            PromptTemplates {
                 mention: "mention".to_string(),
                 pull_request_opened: "review".to_string(),
-                operator_mention: "operate".to_string(),
             }
         );
     }
@@ -542,11 +603,11 @@ operator_mention = "operator {{{{request_text}}}}"
     #[test]
     fn requires_non_empty_strings() {
         assert_eq!(
-            required_string(Some("  gpt-test  ".to_string()), "codex_model").unwrap(),
+            required_string(Some("  gpt-test  ".to_string()), "model").unwrap(),
             "gpt-test"
         );
-        assert!(required_string(None, "codex_model").is_err());
-        assert!(required_string(Some("  ".to_string()), "codex_model").is_err());
+        assert!(required_string(None, "model").is_err());
+        assert!(required_string(Some("  ".to_string()), "model").is_err());
     }
 
     #[test]
@@ -696,16 +757,16 @@ operator_mention = "operator {{{{request_text}}}}"
     }
 
     #[test]
-    fn absolutizes_path_like_codex_commands() {
+    fn absolutizes_path_like_agent_commands() {
         let current_dir = env::current_dir().unwrap();
 
-        assert_eq!(normalize_command(None).unwrap(), "codex");
+        assert_eq!(normalize_command(None, "codex").unwrap(), "codex");
         assert_eq!(
-            normalize_command(Some("codex-test".to_string())).unwrap(),
+            normalize_command(Some("codex-test".to_string()), "codex").unwrap(),
             "codex-test"
         );
         assert_eq!(
-            normalize_command(Some("./bin/codex-test".to_string())).unwrap(),
+            normalize_command(Some("./bin/codex-test".to_string()), "codex").unwrap(),
             current_dir
                 .join("./bin/codex-test")
                 .to_string_lossy()

@@ -3,7 +3,7 @@ name = "maid"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A small polling bot runner that runs local Codex on GitHub PR mentions."
+description = "A GitHub bot that reviews pull requests with local coding agents."
 license = "MIT"
 repository = "https://github.com/dionysuzx/maid"
 
@@ -13,6 +13,7 @@ async-trait = "0.1.88"
 base64 = "0.22.1"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 dirs = "6.0.0"
+futures-util = { version = "0.3.32", default-features = false, features = ["alloc"] }
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"

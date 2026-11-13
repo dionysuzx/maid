@@ -1,7 +1,9 @@
 use anyhow::Result;
 use maid::{
+    agent::{Agent, AgentKind, AgentPanel},
+    claude::ClaudeCli,
     codex::CodexCli,
-    config::Config,
+    config::{AgentConfig, Config},
     daemon_lock::DaemonLock,
     github::GitHubRestClient,
     handled_marker::FilePendingHandledMarkerStore,
@@ -12,7 +14,7 @@ use maid::{
     task_limit::FileTaskStartRecorder,
     worktree::GitWorktrees,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -36,17 +38,13 @@ async fn main() -> Result<()> {
             config.github_notification_window,
         ),
         GitWorktrees::new(config.git_dir.clone(), config.github_token.clone()),
-        CodexCli::with_options(
-            config.codex_bin.clone(),
-            config.codex_model.clone(),
-            config.codex_reasoning_effort.clone(),
-            config.codex_prompts.clone(),
-        ),
+        AgentPanel::new(config.agents.iter().map(agent).collect())?,
+        config.prompts.clone(),
         config.bot_login.clone(),
         config.master_accounts.clone(),
-        config.auto_review_accounts.clone(),
-        config.auto_review_repos.clone(),
     )
+    .with_auto_review_accounts(config.auto_review_accounts.clone())
+    .with_auto_review_repos(config.auto_review_repos.clone())
     .with_public_auto_review_accounts(config.auto_review_public_accounts.clone())
     .with_auto_review_requested_reviewers(config.auto_review_requested_reviewers.clone())
     .with_review_request_window_hours(config.github_notification_window.as_hours())
@@ -101,6 +99,12 @@ async fn main() -> Result<()> {
         github_notification_window_hours = config.github_notification_window.as_hours(),
         task_limit_per_24h = %task_limit_per_24h,
         max_concurrent_requests = config.max_concurrent_requests,
+        agents = %config
+            .agents
+            .iter()
+            .map(|agent| agent.kind.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
         master_accounts = config.master_accounts.len(),
         auto_review_accounts = config.auto_review_accounts.len(),
         auto_review_public_accounts = config.auto_review_public_accounts.len(),
@@ -118,6 +122,21 @@ async fn main() -> Result<()> {
     let _ = metrics_server.await;
 
     Ok(())
+}
+
+fn agent(config: &AgentConfig) -> Arc<dyn Agent> {
+    match config.kind {
+        AgentKind::Codex => Arc::new(CodexCli::new(
+            config.bin.clone(),
+            config.model.clone(),
+            config.effort.clone(),
+        )),
+        AgentKind::Claude => Arc::new(ClaudeCli::new(
+            config.bin.clone(),
+            config.model.clone(),
+            config.effort.clone(),
+        )),
+    }
 }
 
 async fn shutdown_signal() {
