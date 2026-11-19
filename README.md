@@ -13,3 +13,4 @@ just init    # creates ~/.maid/config.toml
 just config  # edit it; config.example.toml documents every option
 just start   # then: just status, just logs, just stop
 ```
+
