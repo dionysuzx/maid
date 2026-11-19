@@ -9,7 +9,7 @@
 
 use crate::{
     agent::AgentLabel,
-    domain::{ChangedFile, PullRequestDiff},
+    domain::{ChangedFile, CommitSha, PullRequestDiff},
     jev::{Answer, NoulCriteria, Question, Questions, SystemOne},
     review_tier::ReviewTier,
 };
@@ -96,7 +96,7 @@ impl<'a> MergeEvidence<'a> {
             .files
             .iter()
             .zip(self.shown_patches())
-            .all(|(file, patch)| patch.is_some() || !file.has_line_changes());
+            .all(|(file, patch)| patch.is_some() || file.is_pure_rename());
         if every_file_listed && every_change_shown {
             Coverage::Complete
         } else {
@@ -149,9 +149,10 @@ impl<'a> MergeEvidence<'a> {
 }
 
 impl ChangedFile {
-    /// A pure rename or mode change has no patch to show.
-    fn has_line_changes(&self) -> bool {
-        self.additions + self.deletions > 0
+    /// A pure rename has no patch to show. Binary changes have no patch and
+    /// no line counts either, so the status is what tells them apart.
+    fn is_pure_rename(&self) -> bool {
+        self.status == "renamed" && self.additions + self.deletions == 0
     }
 }
 
@@ -251,51 +252,63 @@ impl MergeConfidence {
     pub fn score(&self) -> Probability {
         self.worst_finding.needs_no_reviewer().and(self.contained)
     }
-
-    pub fn needs_reviewer(&self, coverage: Coverage, threshold: Probability) -> bool {
-        coverage == Coverage::Partial || self.score() < threshold
-    }
 }
 
-/// The comment section for a judged pull request.
-pub fn judged_section(
-    model: &str,
-    confidence: &MergeConfidence,
-    coverage: Coverage,
-    threshold: Probability,
-    questions: &Questions,
-) -> String {
-    let score = confidence.score();
-    let verdict = if coverage == Coverage::Partial {
-        format!(
-            "🔴 **Merge confidence {score} / 1.00**, but Jev saw only part of the diff: \
-             ask a reviewer."
-        )
-    } else if confidence.needs_reviewer(coverage, threshold) {
-        format!(
-            "🔴 **Merge confidence {score} / 1.00**, below the {threshold} threshold: ask a reviewer."
-        )
-    } else {
-        format!(
-            "🟢 **Merge confidence {score} / 1.00**, at or above the {threshold} threshold: \
-             this can merge without another reviewer."
-        )
-    };
-    let worst = &confidence.worst_finding;
-    let tiers: Vec<_> = ReviewTier::ALL
-        .iter()
-        .map(|tier| format!("{tier} {}", worst.of(*tier)))
-        .chain([format!("{NO_FINDING} {}", worst.none)])
-        .collect();
+/// What Jev concluded about one commit of a pull request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Judgment {
+    /// The concrete model Jev resolved to.
+    pub model: String,
+    pub commit: CommitSha,
+    pub confidence: MergeConfidence,
+    pub coverage: Coverage,
+}
 
-    format!(
-        "### jev · {model}\n\n{verdict}\n\n\
-         - Most serious finding: {}\n\
-         - A missed defect stays contained: {}\n\n{}",
-        tiers.join(" · "),
-        confidence.contained,
-        questions_details(questions)
-    )
+impl Judgment {
+    /// A partial view of the diff could hide the defect that should have
+    /// stopped the merge, so it always needs a reviewer.
+    pub fn needs_reviewer(&self, threshold: Probability) -> bool {
+        self.coverage == Coverage::Partial || self.confidence.score() < threshold
+    }
+
+    /// The comment section. The verdict names its commit, since a later push
+    /// is code Jev never judged.
+    pub fn section(&self, threshold: Probability, questions: &Questions) -> String {
+        let score = self.confidence.score();
+        let verdict = if self.coverage == Coverage::Partial {
+            format!(
+                "🔴 **Merge confidence {score} / 1.00**, but Jev saw only part of the diff: \
+                 ask a reviewer."
+            )
+        } else if self.needs_reviewer(threshold) {
+            format!(
+                "🔴 **Merge confidence {score} / 1.00**, below the {threshold} threshold: \
+                 ask a reviewer."
+            )
+        } else {
+            format!(
+                "🟢 **Merge confidence {score} / 1.00**, at or above the {threshold} threshold: \
+                 this commit can merge without another reviewer."
+            )
+        };
+        let worst = &self.confidence.worst_finding;
+        let tiers: Vec<_> = ReviewTier::ALL
+            .iter()
+            .map(|tier| format!("{tier} {}", worst.of(*tier)))
+            .chain([format!("{NO_FINDING} {}", worst.none)])
+            .collect();
+
+        format!(
+            "### jev · {}\nAt {}.\n\n{verdict}\n\n\
+             - Most serious finding: {}\n\
+             - A missed defect stays contained: {}\n\n{}",
+            self.model,
+            self.commit,
+            tiers.join(" · "),
+            self.confidence.contained,
+            questions_details(questions)
+        )
+    }
 }
 
 /// The comment section when Jev could not judge the pull request.
@@ -408,13 +421,22 @@ mod tests {
         assert_close(risky_change.score(), 0.2);
     }
 
+    fn judgment(confidence: MergeConfidence, coverage: Coverage) -> Judgment {
+        Judgment {
+            model: "jev-1.13.0".to_string(),
+            commit: CommitSha::parse(&"a".repeat(40)).unwrap(),
+            confidence,
+            coverage,
+        }
+    }
+
     #[test]
     fn a_score_at_the_threshold_merges_without_a_reviewer() {
         let at = confidence(0.0, 0.0, 0.0, 1.0, 0.8);
 
-        assert!(!at.needs_reviewer(Coverage::Complete, p(0.8)));
-        assert!(at.needs_reviewer(Coverage::Complete, p(0.81)));
-        assert!(at.needs_reviewer(Coverage::Partial, p(0.0)));
+        assert!(!judgment(at, Coverage::Complete).needs_reviewer(p(0.8)));
+        assert!(judgment(at, Coverage::Complete).needs_reviewer(p(0.81)));
+        assert!(judgment(at, Coverage::Partial).needs_reviewer(p(0.0)));
     }
 
     #[test]
@@ -528,7 +550,10 @@ mod tests {
             ..changed_file("src/new_name.rs", None)
         };
         let complete = diff(vec![changed_file("src/a.rs", Some("+a")), rename]);
-        let binary = diff(vec![changed_file("logo.png", None)]);
+        let binary = diff(vec![ChangedFile {
+            additions: 0,
+            ..changed_file("logo.png", None)
+        }]);
         let over_budget = diff(vec![changed_file(
             "src/huge.rs",
             Some(&"+".repeat(PATCH_BUDGET + 1)),
@@ -548,35 +573,21 @@ mod tests {
     fn judged_section_shows_the_verdict_and_what_it_rests_on() {
         let questions = questions();
 
-        let green = judged_section(
-            "jev-1.13.0",
-            &confidence(0.02, 0.08, 0.3, 0.6, 0.9),
-            Coverage::Complete,
-            p(0.8),
-            &questions,
-        );
-        let red = judged_section(
-            "jev-1.13.0",
-            &confidence(0.6, 0.2, 0.1, 0.1, 0.9),
-            Coverage::Complete,
-            p(0.8),
-            &questions,
-        );
-        let partial = judged_section(
-            "jev-1.13.0",
-            &confidence(0.0, 0.0, 0.0, 1.0, 1.0),
-            Coverage::Partial,
-            p(0.8),
-            &questions,
-        );
+        let green = judgment(confidence(0.02, 0.08, 0.3, 0.6, 0.9), Coverage::Complete)
+            .section(p(0.8), &questions);
+        let red = judgment(confidence(0.6, 0.2, 0.1, 0.1, 0.9), Coverage::Complete)
+            .section(p(0.8), &questions);
+        let partial = judgment(confidence(0.0, 0.0, 0.0, 1.0, 1.0), Coverage::Partial)
+            .section(p(0.8), &questions);
 
-        assert!(green.starts_with(
-            "### jev · jev-1.13.0\n\n🟢 **Merge confidence 0.81 / 1.00**, at or above the 0.80 \
-             threshold: this can merge without another reviewer.\n\n\
+        let sha = "a".repeat(40);
+        assert!(green.starts_with(&format!(
+            "### jev · jev-1.13.0\nAt {sha}.\n\n🟢 **Merge confidence 0.81 / 1.00**, at or above \
+             the 0.80 threshold: this commit can merge without another reviewer.\n\n\
              - Most serious finding: must 0.02 · should 0.08 · could 0.30 · none 0.60\n\
              - A missed defect stays contained: 0.90\n\n\
-             <details>\n<summary>Jev questions</summary>\n\n```json\n{"
-        ));
+             <details>\n<summary>Jev questions</summary>\n\n```json\n{{"
+        )));
         assert!(red.contains(
             "🔴 **Merge confidence 0.18 / 1.00**, below the 0.80 threshold: ask a reviewer."
         ));

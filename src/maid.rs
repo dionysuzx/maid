@@ -18,7 +18,7 @@ use crate::mention_thread::{
     MentionThreadPlan, MentionThreadRead, choose_mention_thread_read, plan_mention_thread,
 };
 use crate::merge_confidence::{
-    self, Coverage, MergeConfidence, MergeEvidence, MergeJudge, failed_section, judged_section,
+    self, Judgment, MergeConfidence, MergeEvidence, MergeJudge, failed_section,
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::reviewed_head::{MemoryReviewedHeadStore, ReviewedHeadStore};
@@ -984,15 +984,15 @@ where
     ) -> String {
         let questions = merge_confidence::questions();
         match self.judge_merge(judge, pr, replies, &questions).await {
-            Ok((model, confidence, coverage)) => {
+            Ok(judgment) => {
                 info!(
                     pr = %pr.html_url,
                     head = %pr.head,
-                    merge_confidence = %confidence.score(),
-                    coverage = ?coverage,
+                    merge_confidence = %judgment.confidence.score(),
+                    coverage = ?judgment.coverage,
                     "judged merge confidence"
                 );
-                judged_section(&model, &confidence, coverage, judge.threshold, &questions)
+                judgment.section(judge.threshold, &questions)
             }
             Err(err) => {
                 error!(
@@ -1012,7 +1012,7 @@ where
         pr: &PullRequest,
         replies: &PanelReplies,
         questions: &Questions,
-    ) -> Result<(String, MergeConfidence, Coverage)> {
+    ) -> Result<Judgment> {
         let diff = self.github.pull_request_diff(pr).await?;
         let evidence = MergeEvidence {
             pr_url: &pr.html_url,
@@ -1020,8 +1020,12 @@ where
             diff: &diff,
         };
         let decision = judge.jev.decide(&evidence.state(), questions).await?;
-        let confidence = MergeConfidence::from_answers(&decision.answers)?;
-        Ok((decision.model, confidence, evidence.coverage()))
+        Ok(Judgment {
+            model: decision.model,
+            commit: pr.head.clone(),
+            confidence: MergeConfidence::from_answers(&decision.answers)?,
+            coverage: evidence.coverage(),
+        })
     }
 
     async fn run_agent(
@@ -2366,7 +2370,10 @@ mod tests {
             .unwrap()
             .split_once(&format!("\n\n<details>{prompt}"))
             .unwrap();
-        assert!(merge.starts_with("### jev · jev-1.13.0\n\n🟢 **Merge confidence 0.81 / 1.00**"));
+        assert!(merge.starts_with(&format!(
+            "### jev · jev-1.13.0\nAt {}.\n\n🟢 **Merge confidence 0.81 / 1.00**",
+            pr().head
+        )));
         let states = jev.states.lock().unwrap();
         assert_eq!(
             states[0]["reviews"][0]["review"].as_str(),

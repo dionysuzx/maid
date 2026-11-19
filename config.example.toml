@@ -98,8 +98,12 @@ please review
 # confidence: the chance the pull request can merge without another reviewer.
 # Jev reads the reviews and the diff. The score needs the reviews to raise no
 # must or should finding, and a defect they missed to stay contained. Reviews
-# at or above merge_threshold are marked green, others red. Needs the
-# TYPESAFE_API_KEY environment variable; a .env file beside the justfile works.
+# at or above merge_threshold are marked green, others red, and so is any
+# review where Jev saw only part of the diff. Needs the TYPESAFE_API_KEY
+# environment variable. Maid keeps it out of the agents' environment, but
+# agents can still read any file Maid's user can, such as a .env beside the
+# justfile. Guard such files with the host's agent sandbox, as for the GitHub
+# token.
 # [jev]
 # model = "jev-latest"
 # merge_threshold = 0.8
