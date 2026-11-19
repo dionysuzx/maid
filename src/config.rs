@@ -6,6 +6,8 @@ use crate::{
         DEFAULT_GITHUB_API_REQUESTS_PER_HOUR, DEFAULT_GITHUB_NOTIFICATION_WINDOW_HOURS,
         GitHubApiRequestRate, GitHubNotificationWindow,
     },
+    jev,
+    merge_confidence::Probability,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -38,8 +40,20 @@ pub struct Config {
     pub github_notification_window: GitHubNotificationWindow,
     pub agents: Vec<AgentConfig>,
     pub prompts: PromptTemplates,
+    pub jev: Option<JevConfig>,
     pub github_api_ip: Option<IpAddr>,
     pub metrics_bind_address: SocketAddr,
+}
+
+/// The environment variable that holds the TypeSafe API key Jev needs.
+pub const TYPESAFE_API_KEY: &str = "TYPESAFE_API_KEY";
+const DEFAULT_MERGE_THRESHOLD: f64 = 0.8;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JevConfig {
+    pub api_key: String,
+    pub model: String,
+    pub merge_threshold: Probability,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +125,7 @@ impl Config {
             .with_context(|| format!("agents is required in {}", config_path.display()))?;
         let prompts = required_prompts(file.prompts)
             .with_context(|| format!("prompts is required in {}", config_path.display()))?;
+        let jev = jev_config(file.jev, env::var(TYPESAFE_API_KEY).ok())?;
         let github_api_ip = non_empty(file.github_api_ip)
             .map(|value| value.parse::<IpAddr>())
             .transpose()
@@ -144,6 +159,7 @@ impl Config {
             github_notification_window,
             agents,
             prompts,
+            jev,
             github_api_ip,
             metrics_bind_address,
         })
@@ -166,6 +182,7 @@ struct ConfigFile {
     github_notification_window_hours: Option<u32>,
     agents: Option<Vec<AgentFile>>,
     prompts: Option<PromptsFile>,
+    jev: Option<JevFile>,
     github_api_ip: Option<String>,
     metrics_bind_address: Option<String>,
 }
@@ -182,6 +199,12 @@ struct AgentFile {
 struct PromptsFile {
     mention: Option<String>,
     pull_request_opened: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+struct JevFile {
+    model: Option<String>,
+    merge_threshold: Option<f64>,
 }
 
 impl ConfigFile {
@@ -316,6 +339,24 @@ fn required_prompts(value: Option<PromptsFile>) -> Result<PromptTemplates> {
         mention,
         pull_request_opened,
     })
+}
+
+/// A `[jev]` table turns Jev on, and then the API key must be set.
+fn jev_config(file: Option<JevFile>, api_key: Option<String>) -> Result<Option<JevConfig>> {
+    let Some(file) = file else {
+        return Ok(None);
+    };
+    let api_key = non_empty(api_key)
+        .ok_or_else(|| anyhow!("[jev] needs the {TYPESAFE_API_KEY} environment variable"))?;
+    let model = non_empty(file.model).unwrap_or_else(|| jev::DEFAULT_MODEL.to_string());
+    let merge_threshold = Probability::new(file.merge_threshold.unwrap_or(DEFAULT_MERGE_THRESHOLD))
+        .context("jev.merge_threshold must be from 0 to 1")?;
+
+    Ok(Some(JevConfig {
+        api_key,
+        model,
+        merge_threshold,
+    }))
 }
 
 fn normalize_logins(raw_logins: Vec<String>, key: &str) -> Result<Vec<String>> {
@@ -514,6 +555,60 @@ pull_request_opened = "review {{{{pr_url}}}}"
             .collect();
         assert_eq!(kinds, vec![AgentKind::Codex, AgentKind::Claude]);
         assert!(required_prompts(config.prompts).is_ok());
+    }
+
+    #[test]
+    fn jev_is_off_without_a_jev_table() {
+        assert_eq!(jev_config(None, Some("key".to_string())).unwrap(), None);
+    }
+
+    #[test]
+    fn jev_table_reads_its_values_and_defaults() {
+        let file: ConfigFile = toml::from_str(
+            r#"
+[jev]
+model = "jev-1.13.0"
+merge_threshold = 0.9
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            jev_config(file.jev, Some("key".to_string())).unwrap(),
+            Some(JevConfig {
+                api_key: "key".to_string(),
+                model: "jev-1.13.0".to_string(),
+                merge_threshold: Probability::new(0.9).unwrap(),
+            })
+        );
+        assert_eq!(
+            jev_config(Some(JevFile::default()), Some("key".to_string())).unwrap(),
+            Some(JevConfig {
+                api_key: "key".to_string(),
+                model: "jev-latest".to_string(),
+                merge_threshold: Probability::new(0.8).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn jev_needs_an_api_key_and_a_threshold_from_zero_to_one() {
+        assert_eq!(
+            jev_config(Some(JevFile::default()), Some(" ".to_string()))
+                .unwrap_err()
+                .to_string(),
+            "[jev] needs the TYPESAFE_API_KEY environment variable"
+        );
+        let too_high = JevFile {
+            model: None,
+            merge_threshold: Some(1.5),
+        };
+        assert_eq!(
+            jev_config(Some(too_high), Some("key".to_string()))
+                .unwrap_err()
+                .to_string(),
+            "jev.merge_threshold must be from 0 to 1"
+        );
     }
 
     #[test]

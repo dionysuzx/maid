@@ -1,7 +1,8 @@
 use crate::{
     domain::{
-        CommentMention, CommitSha, Issue, Notification, OpenPullRequest, OpenPullRequestOrder,
-        PullRequest, RepoSlug, RequestedReviewer, ReviewState, TeamSlug, TreeSha, WorkTarget,
+        ChangedFile, CommentMention, CommitSha, Issue, Notification, OpenPullRequest,
+        OpenPullRequestOrder, PullRequest, RepoSlug, RequestedReviewer, ReviewState, TeamSlug,
+        TreeSha, WorkTarget,
     },
     maid::GithubClient,
 };
@@ -428,6 +429,24 @@ impl GithubClient for GitHubRestClient {
         );
         let commit = self.get::<ApiGitCommit>(&url).await?;
         TreeSha::parse(&commit.tree.sha)
+    }
+
+    async fn pull_request_files(&self, pr: &PullRequest) -> Result<Vec<ChangedFile>> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}/files?per_page=100",
+            pr.owner, pr.repo, pr.number
+        );
+        let files = self.get::<Vec<ApiChangedFile>>(&url).await?;
+        Ok(files
+            .into_iter()
+            .map(|file| ChangedFile {
+                path: file.filename,
+                status: file.status,
+                additions: file.additions,
+                deletions: file.deletions,
+                patch: file.patch,
+            })
+            .collect())
     }
 
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
@@ -1573,6 +1592,15 @@ struct ApiPullRequest {
 #[derive(Debug, Deserialize)]
 struct ApiCommitRef {
     sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiChangedFile {
+    filename: String,
+    status: String,
+    additions: u64,
+    deletions: u64,
+    patch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

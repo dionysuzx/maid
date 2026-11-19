@@ -1,19 +1,24 @@
-use crate::agent::{Agent, AgentKind, AgentPanel, AgentRun};
+use crate::agent::{Agent, AgentKind, AgentLabel, AgentPanel, AgentRun};
 use crate::agent_comment::{AgentReply, agent_comment};
 use crate::auto_review::{
     AutoReviewAuthor, ReviewCadence, authorizing_reviewer, auto_review_task,
     classify_auto_review_author,
 };
 use crate::domain::{
-    AgentTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
-    PromptTemplates, PullRequest, RepoSlug, RequestedReviewer, ReviewState, TreeSha, WorkTarget,
+    AgentTask, ChangedFile, CommentMention, CommitSha, MentionRequest, Notification,
+    OpenPullRequest, OpenPullRequestOrder, PromptTemplates, PullRequest, RepoSlug,
+    RequestedReviewer, ReviewState, TreeSha, WorkTarget,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
 };
+use crate::jev::Questions;
 use crate::mention_thread::{
     MentionNotificationPlan, MentionObservation, MentionThread, MentionThreadAction,
     MentionThreadPlan, MentionThreadRead, choose_mention_thread_read, plan_mention_thread,
+};
+use crate::merge_confidence::{
+    self, MergeConfidence, MergeEvidence, MergeJudge, failed_section, judged_section,
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::reviewed_head::{MemoryReviewedHeadStore, ReviewedHeadStore};
@@ -45,6 +50,8 @@ pub trait GithubClient: Send + Sync {
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
     /// The tree at the pull request's head commit.
     async fn head_tree(&self, pr: &PullRequest) -> Result<TreeSha>;
+    /// The first 100 files the pull request changes, which is GitHub's page limit.
+    async fn pull_request_files(&self, pr: &PullRequest) -> Result<Vec<ChangedFile>>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -116,6 +123,7 @@ pub struct Maid<G, R> {
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
     observed_notifications: Arc<dyn ObservedNotificationStore>,
     reviewed_heads: Arc<dyn ReviewedHeadStore>,
+    merge_judge: Option<MergeJudge>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,6 +219,7 @@ where
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
             reviewed_heads: Arc::new(MemoryReviewedHeadStore::default()),
+            merge_judge: None,
         }
     }
 
@@ -282,6 +291,12 @@ where
         reviewed_heads: impl ReviewedHeadStore + 'static,
     ) -> Self {
         self.reviewed_heads = Arc::new(reviewed_heads);
+        self
+    }
+
+    /// Adds a Jev merge-confidence section to every automatic review.
+    pub fn with_merge_judge(mut self, merge_judge: MergeJudge) -> Self {
+        self.merge_judge = Some(merge_judge);
         self
     }
 
@@ -857,7 +872,10 @@ where
         mention: Box<CommentMention>,
         task: AgentTask,
     ) -> Result<()> {
-        let comment = self.run_agents(&mention.target, &task).await?;
+        let comment = self
+            .run_agents(&mention.target, &task)
+            .await?
+            .comment(mention.target.head(), None);
 
         self.github.post_comment(&mention.target, &comment).await?;
         let marker = PendingHandledMarker::for_mention(&mention);
@@ -912,9 +930,14 @@ where
         task: AgentTask,
         tree: TreeSha,
     ) -> Result<()> {
-        let comment = self
+        let replies = self
             .run_agents(&WorkTarget::PullRequest(pr.clone()), &task)
             .await?;
+        let merge_section = match &self.merge_judge {
+            Some(judge) => Some(self.merge_section(judge, &pr, &replies).await),
+            None => None,
+        };
+        let comment = replies.comment(Some(&pr.head), merge_section.as_deref());
 
         self.github.post_pr_comment(&pr, &comment).await?;
         self.reviewed_heads.record(&pr, &tree)?;
@@ -927,9 +950,9 @@ where
         Ok(())
     }
 
-    /// Runs the task on its agents in parallel and stitches their responses
-    /// into one comment. The task fails only when every agent failed.
-    async fn run_agents(&self, target: &WorkTarget, task: &AgentTask) -> Result<String> {
+    /// Runs the task on its agents in parallel. The task fails only when every
+    /// agent failed.
+    async fn run_agents(&self, target: &WorkTarget, task: &AgentTask) -> Result<PanelReplies> {
         let prompt = task.prompt(&self.prompts)?;
         let agents = self.agents.all();
         let runs = join_all(
@@ -942,18 +965,61 @@ where
             bail!("every agent failed");
         }
 
-        let replies: Vec<_> = agents
+        let replies = agents
             .iter()
-            .zip(&runs)
-            .map(|(agent, run)| {
-                let reply = match run {
-                    Ok(run) => AgentReply::Responded(&run.response),
-                    Err(_) => AgentReply::Failed,
-                };
-                (agent.label(), reply)
-            })
+            .zip(runs)
+            .map(|(agent, run)| (agent.label().clone(), run.ok().map(|run| run.response)))
             .collect();
-        Ok(agent_comment(target.head(), &replies, &prompt))
+        Ok(PanelReplies { prompt, replies })
+    }
+
+    /// Jev's section of a review comment. A failure becomes a section that
+    /// says so, since the agents' reviews are worth posting without it.
+    async fn merge_section(
+        &self,
+        judge: &MergeJudge,
+        pr: &PullRequest,
+        replies: &PanelReplies,
+    ) -> String {
+        let questions = merge_confidence::questions();
+        match self.judge_merge(judge, pr, replies, &questions).await {
+            Ok((model, confidence)) => {
+                info!(
+                    pr = %pr.html_url,
+                    head = %pr.head,
+                    merge_confidence = %confidence.score(),
+                    "judged merge confidence"
+                );
+                judged_section(&model, &confidence, judge.threshold, &questions)
+            }
+            Err(err) => {
+                error!(
+                    pr = %pr.html_url,
+                    head = %pr.head,
+                    error = ?err,
+                    "failed to judge merge confidence"
+                );
+                failed_section(&questions)
+            }
+        }
+    }
+
+    async fn judge_merge(
+        &self,
+        judge: &MergeJudge,
+        pr: &PullRequest,
+        replies: &PanelReplies,
+        questions: &Questions,
+    ) -> Result<(String, MergeConfidence)> {
+        let changed_files: Vec<ChangedFile> = self.github.pull_request_files(pr).await?;
+        let evidence = MergeEvidence {
+            pr_url: &pr.html_url,
+            reviews: replies.reviews(),
+            changed_files: &changed_files,
+        };
+        let decision = judge.jev.decide(&evidence.state(), questions).await?;
+        let confidence = MergeConfidence::from_answers(&decision.answers)?;
+        Ok((decision.model, confidence))
     }
 
     async fn run_agent(
@@ -1022,6 +1088,36 @@ where
                 Ok(false)
             }
         }
+    }
+}
+
+/// What each agent answered, in panel order, and the prompt they all received.
+/// A failed agent has no response.
+struct PanelReplies {
+    prompt: String,
+    replies: Vec<(AgentLabel, Option<String>)>,
+}
+
+impl PanelReplies {
+    fn reviews(&self) -> Vec<(&AgentLabel, &str)> {
+        self.replies
+            .iter()
+            .filter_map(|(label, response)| Some((label, response.as_deref()?)))
+            .collect()
+    }
+
+    fn comment(&self, commit: Option<&CommitSha>, merge_section: Option<&str>) -> String {
+        let replies: Vec<_> = self
+            .replies
+            .iter()
+            .map(|(label, response)| {
+                let reply = response
+                    .as_deref()
+                    .map_or(AgentReply::Failed, AgentReply::Responded);
+                (label, reply)
+            })
+            .collect();
+        agent_comment(commit, &replies, merge_section, &self.prompt)
     }
 }
 
@@ -1415,10 +1511,12 @@ fn deduplicate_auto_review_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentLabel;
-    use crate::domain::{AgentTaskOrigin, CommitSha, Issue, TreeSha};
+    use crate::domain::{AgentTaskOrigin, Issue};
+    use crate::jev::{Answer, Decision, SystemOne};
+    use crate::merge_confidence::Probability;
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
@@ -1440,6 +1538,7 @@ mod tests {
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         head_trees: Arc<StdMutex<HashMap<CommitSha, TreeSha>>>,
+        changed_files: Arc<StdMutex<Vec<ChangedFile>>>,
         posts: Arc<StdMutex<Vec<String>>>,
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
@@ -1528,6 +1627,10 @@ mod tests {
                 .get(&pr.head)
                 .cloned()
                 .unwrap_or_else(|| TreeSha::parse(&pr.head.to_string()).unwrap()))
+        }
+
+        async fn pull_request_files(&self, _pr: &PullRequest) -> Result<Vec<ChangedFile>> {
+            Ok(self.changed_files.lock().unwrap().clone())
         }
 
         async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
@@ -1707,6 +1810,52 @@ mod tests {
         }
     }
 
+    /// Answers every question set with one decision, or fails without one.
+    #[derive(Clone, Default)]
+    struct FakeJev {
+        decision: Option<Decision>,
+        states: Arc<StdMutex<Vec<Value>>>,
+    }
+
+    impl FakeJev {
+        fn answering(must: f64, should: f64, could: f64, none: f64, contained: f64) -> Self {
+            let probabilities = HashMap::from([
+                ("must".to_string(), must),
+                ("should".to_string(), should),
+                ("could".to_string(), could),
+                ("none".to_string(), none),
+            ]);
+            Self {
+                decision: Some(Decision {
+                    model: "jev-1.13.0".to_string(),
+                    answers: HashMap::from([
+                        (
+                            "worst_finding".to_string(),
+                            Answer::Choice { probabilities },
+                        ),
+                        ("contained".to_string(), Answer::Noul { noul: contained }),
+                    ]),
+                }),
+                states: Arc::default(),
+            }
+        }
+
+        fn judge(&self) -> MergeJudge {
+            MergeJudge {
+                jev: Arc::new(self.clone()),
+                threshold: Probability::new(0.8).unwrap(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SystemOne for FakeJev {
+        async fn decide(&self, state: &Value, _questions: &Questions) -> Result<Decision> {
+            self.states.lock().unwrap().push(state.clone());
+            self.decision.clone().ok_or_else(|| anyhow!("Jev is down"))
+        }
+    }
+
     #[derive(Clone)]
     struct BlockingAgent {
         label: AgentLabel,
@@ -1861,6 +2010,7 @@ mod tests {
                 &FakeAgent::default().label,
                 AgentReply::Responded("codex response"),
             )],
+            None,
             prompt,
         )
     }
@@ -2182,6 +2332,78 @@ mod tests {
             calls[0].1,
             "review https://github.com/o/r/pull/1 by dionysuzx"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_review_ends_with_jevs_merge_confidence() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+        *github.changed_files.lock().unwrap() = vec![ChangedFile {
+            path: "src/lib.rs".to_string(),
+            status: "modified".to_string(),
+            additions: 1,
+            deletions: 0,
+            patch: Some("+pub mod jev;".to_string()),
+        }];
+        let jev = FakeJev::answering(0.02, 0.08, 0.3, 0.6, 0.9);
+
+        maid(github.clone(), idle_worktrees(), FakeAgent::default())
+            .with_merge_judge(jev.judge())
+            .run_once()
+            .await
+            .unwrap();
+
+        let posts = github.posts.lock().unwrap();
+        let review = review_of(&pr());
+        let (agents, prompt) = review.split_once("\n\n<details>").unwrap();
+        let (merge, _) = posts[0]
+            .strip_prefix(&format!("{agents}\n\n---\n\n"))
+            .unwrap()
+            .split_once(&format!("\n\n<details>{prompt}"))
+            .unwrap();
+        assert!(merge.starts_with("### jev · jev-1.13.0\n\n🟢 **Merge confidence 0.81 / 1.00**"));
+        let states = jev.states.lock().unwrap();
+        assert_eq!(
+            states[0]["reviews"][0]["review"].as_str(),
+            Some("codex response")
+        );
+        assert_eq!(
+            states[0]["changed_files"][0]["patch"].as_str(),
+            Some("+pub mod jev;")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_review_posts_the_reviews_when_jev_fails() {
+        let github = FakeGithub::default();
+        *github.pull_requests.lock().unwrap() = vec![pr()];
+
+        let report = maid(github.clone(), idle_worktrees(), FakeAgent::default())
+            .with_merge_judge(FakeJev::default().judge())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.responded, 1);
+        let posts = github.posts.lock().unwrap();
+        assert!(posts[0].contains("\n\n---\n\n### jev\n\nFailed. The error is in Maid's logs."));
+    }
+
+    #[tokio::test]
+    async fn mentions_do_not_ask_jev() {
+        let github = FakeGithub::default();
+        *github.notifications.lock().unwrap() = vec![notification("n1")];
+        *github.mention.lock().unwrap() = Some(Ok(Some(mention("dionysuzx", "@maid-bot why?"))));
+        let jev = FakeJev::answering(0.0, 0.0, 0.0, 1.0, 1.0);
+
+        maid(github.clone(), idle_worktrees(), FakeAgent::default())
+            .with_merge_judge(jev.judge())
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(*github.posts.lock().unwrap(), vec![mention_reply("why?")]);
+        assert!(jev.states.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3709,6 +3931,7 @@ mod tests {
                     (&codex.label, AgentReply::Responded("codex review")),
                     (&claude.label, AgentReply::Responded("claude review")),
                 ],
+                None,
                 prompt,
             )]
         );
@@ -3742,6 +3965,7 @@ mod tests {
                     (&codex.label, AgentReply::Failed),
                     (&claude.label, AgentReply::Responded("claude review")),
                 ],
+                None,
                 "review https://github.com/o/r/pull/1 by dionysuzx",
             )]
         );
