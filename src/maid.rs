@@ -1106,10 +1106,10 @@ struct PanelReplies {
 }
 
 impl PanelReplies {
-    fn reviews(&self) -> Vec<(&AgentLabel, &str)> {
+    fn reviews(&self) -> Vec<(&AgentLabel, Option<&str>)> {
         self.replies
             .iter()
-            .filter_map(|(label, response)| Some((label, response.as_deref()?)))
+            .map(|(label, response)| (label, response.as_deref()))
             .collect()
     }
 

@@ -1633,6 +1633,7 @@ struct ApiPullRequestDiffStat {
 struct ApiBaseRef {
     #[serde(rename = "ref")]
     ref_name: String,
+    sha: String,
 }
 
 #[derive(Debug, Deserialize)]

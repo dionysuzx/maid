@@ -4,8 +4,9 @@
 //! Skipping a reviewer needs both answers to favor it: the reviews leave
 //! nothing that needs a person (no must or should finding), and a defect the
 //! reviews missed would stay contained. The merge confidence is the chance
-//! that both hold. Jev must also have seen the whole diff, since the part it
-//! missed could hide the defect that should have stopped the merge.
+//! that both hold. Jev must also have every agent's review and the whole
+//! diff, since what it missed could hide the defect that should have stopped
+//! the merge.
 
 use crate::{
     agent::AgentLabel,
@@ -73,18 +74,21 @@ pub struct MergeJudge {
     pub threshold: Probability,
 }
 
-/// Whether Jev saw the whole change.
+/// Whether Jev saw everything a merge decision rests on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Coverage {
     Complete,
+    /// An agent failed, so its review is missing.
+    MissingReview,
     /// Some files or patches were left out.
-    Partial,
+    PartialDiff,
 }
 
 /// What Jev reads: the reviews to judge, and the change they judged.
 pub struct MergeEvidence<'a> {
     pub pr_url: &'a str,
-    pub reviews: Vec<(&'a AgentLabel, &'a str)>,
+    /// Every agent in the panel, with no review when it failed.
+    pub reviews: Vec<(&'a AgentLabel, Option<&'a str>)>,
     pub diff: &'a PullRequestDiff,
 }
 
@@ -92,10 +96,12 @@ impl<'a> MergeEvidence<'a> {
     pub fn coverage(&self) -> Coverage {
         let every_file_listed = self.diff.files.len() as u64 == self.diff.changed_files;
         let every_patch_shown = self.shown_patches().iter().all(Option::is_some);
-        if every_file_listed && every_patch_shown {
-            Coverage::Complete
+        if self.reviews.iter().any(|(_, review)| review.is_none()) {
+            Coverage::MissingReview
+        } else if !(every_file_listed && every_patch_shown) {
+            Coverage::PartialDiff
         } else {
-            Coverage::Partial
+            Coverage::Complete
         }
     }
 
@@ -255,17 +261,22 @@ pub struct Judgment {
 }
 
 impl Judgment {
-    /// A partial view of the diff could hide the defect that should have
-    /// stopped the merge, so it always needs a reviewer.
+    /// Incomplete evidence could hide the defect that should have stopped
+    /// the merge, so it always needs a reviewer.
     pub fn needs_reviewer(&self, threshold: Probability) -> bool {
-        self.coverage == Coverage::Partial || self.confidence.score() < threshold
+        self.coverage != Coverage::Complete || self.confidence.score() < threshold
     }
 
     /// The comment section. It names the commit and base it judged, since a
     /// later push or retarget is a diff Jev never saw.
     pub fn section(&self, threshold: Probability, questions: &Questions) -> String {
         let score = self.confidence.score();
-        let verdict = if self.coverage == Coverage::Partial {
+        let verdict = if self.coverage == Coverage::MissingReview {
+            format!(
+                "🔴 **Merge confidence {score} / 1.00**, but an agent's review failed: \
+                 ask a reviewer."
+            )
+        } else if self.coverage == Coverage::PartialDiff {
             format!(
                 "🔴 **Merge confidence {score} / 1.00**, but Jev saw only part of the diff: \
                  ask a reviewer."
@@ -430,7 +441,8 @@ mod tests {
 
         assert!(!judgment(at, Coverage::Complete).needs_reviewer(p(0.8)));
         assert!(judgment(at, Coverage::Complete).needs_reviewer(p(0.81)));
-        assert!(judgment(at, Coverage::Partial).needs_reviewer(p(0.0)));
+        assert!(judgment(at, Coverage::PartialDiff).needs_reviewer(p(0.0)));
+        assert!(judgment(at, Coverage::MissingReview).needs_reviewer(p(0.0)));
     }
 
     #[test]
@@ -510,7 +522,7 @@ mod tests {
 
         let state = MergeEvidence {
             pr_url: "https://github.com/o/r/pull/1",
-            reviews: vec![(&codex, "No findings.")],
+            reviews: vec![(&codex, Some("No findings."))],
             diff: &diff,
         }
         .state();
@@ -555,9 +567,32 @@ mod tests {
         };
 
         assert_eq!(evidence(&complete).coverage(), Coverage::Complete);
-        assert_eq!(evidence(&binary).coverage(), Coverage::Partial);
-        assert_eq!(evidence(&over_budget).coverage(), Coverage::Partial);
-        assert_eq!(evidence(&unlisted).coverage(), Coverage::Partial);
+        assert_eq!(evidence(&binary).coverage(), Coverage::PartialDiff);
+        assert_eq!(evidence(&over_budget).coverage(), Coverage::PartialDiff);
+        assert_eq!(evidence(&unlisted).coverage(), Coverage::PartialDiff);
+    }
+
+    #[test]
+    fn a_failed_agent_leaves_the_evidence_incomplete() {
+        let codex = AgentLabel {
+            kind: AgentKind::Codex,
+            model: "gpt-5.5".to_string(),
+            effort: "high".to_string(),
+        };
+        let claude = AgentLabel {
+            kind: AgentKind::Claude,
+            model: "claude-opus-5-5".to_string(),
+            effort: "high".to_string(),
+        };
+        let diff = diff(vec![changed_file("src/a.rs", Some("+a"))]);
+        let evidence = MergeEvidence {
+            pr_url: "https://github.com/o/r/pull/1",
+            reviews: vec![(&codex, None), (&claude, Some("No findings."))],
+            diff: &diff,
+        };
+
+        assert_eq!(evidence.coverage(), Coverage::MissingReview);
+        assert_eq!(evidence.state()["reviews"][0]["review"], Value::Null);
     }
 
     #[test]
@@ -568,7 +603,9 @@ mod tests {
             .section(p(0.8), &questions);
         let red = judgment(confidence(0.6, 0.2, 0.1, 0.1, 0.9), Coverage::Complete)
             .section(p(0.8), &questions);
-        let partial = judgment(confidence(0.0, 0.0, 0.0, 1.0, 1.0), Coverage::Partial)
+        let partial = judgment(confidence(0.0, 0.0, 0.0, 1.0, 1.0), Coverage::PartialDiff)
+            .section(p(0.8), &questions);
+        let missing = judgment(confidence(0.0, 0.0, 0.0, 1.0, 1.0), Coverage::MissingReview)
             .section(p(0.8), &questions);
 
         let sha = "a".repeat(40);
@@ -584,6 +621,9 @@ mod tests {
         ));
         assert!(partial.contains(
             "🔴 **Merge confidence 1.00 / 1.00**, but Jev saw only part of the diff: ask a reviewer."
+        ));
+        assert!(missing.contains(
+            "🔴 **Merge confidence 1.00 / 1.00**, but an agent's review failed: ask a reviewer."
         ));
         assert!(failed_section(&questions).starts_with("### jev\n\nFailed."));
     }
