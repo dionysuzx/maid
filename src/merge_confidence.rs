@@ -4,11 +4,12 @@
 //! Skipping a reviewer needs both answers to favor it: the reviews leave
 //! nothing that needs a person (no must or should finding), and a defect the
 //! reviews missed would stay contained. The merge confidence is the chance
-//! that both hold.
+//! that both hold. Jev must also have seen the whole diff, since the part it
+//! missed could hide the defect that should have stopped the merge.
 
 use crate::{
     agent::AgentLabel,
-    domain::ChangedFile,
+    domain::{ChangedFile, PullRequestDiff},
     jev::{Answer, NoulCriteria, Question, Questions, SystemOne},
     review_tier::ReviewTier,
 };
@@ -72,30 +73,49 @@ pub struct MergeJudge {
     pub threshold: Probability,
 }
 
+/// Whether Jev saw the whole change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Coverage {
+    Complete,
+    /// Some files or patches were left out.
+    Partial,
+}
+
 /// What Jev reads: the reviews to judge, and the change they judged.
 pub struct MergeEvidence<'a> {
     pub pr_url: &'a str,
     pub reviews: Vec<(&'a AgentLabel, &'a str)>,
-    pub changed_files: &'a [ChangedFile],
+    pub diff: &'a PullRequestDiff,
 }
 
-impl MergeEvidence<'_> {
+impl<'a> MergeEvidence<'a> {
+    pub fn coverage(&self) -> Coverage {
+        let every_file_listed = self.diff.files.len() as u64 == self.diff.changed_files;
+        let every_change_shown = self
+            .diff
+            .files
+            .iter()
+            .zip(self.shown_patches())
+            .all(|(file, patch)| patch.is_some() || !file.has_line_changes());
+        if every_file_listed && every_change_shown {
+            Coverage::Complete
+        } else {
+            Coverage::Partial
+        }
+    }
+
     pub fn state(&self) -> Value {
         let reviews: Vec<_> = self
             .reviews
             .iter()
             .map(|(reviewer, review)| json!({"reviewer": reviewer.to_string(), "review": review}))
             .collect();
-        let mut patch_budget = PATCH_BUDGET;
         let changed_files: Vec<_> = self
-            .changed_files
+            .diff
+            .files
             .iter()
-            .map(|file| {
-                let patch = file
-                    .patch
-                    .as_deref()
-                    .filter(|patch| patch.len() <= patch_budget);
-                patch_budget -= patch.map_or(0, str::len);
+            .zip(self.shown_patches())
+            .map(|(file, patch)| {
                 json!({
                     "path": file.path,
                     "status": file.status,
@@ -111,6 +131,27 @@ impl MergeEvidence<'_> {
             "reviews": reviews,
             "changed_files": changed_files,
         })
+    }
+
+    /// Each file's patch, in order, while the budget lasts.
+    fn shown_patches(&self) -> Vec<Option<&'a str>> {
+        let mut budget = PATCH_BUDGET;
+        self.diff
+            .files
+            .iter()
+            .map(|file| {
+                let patch = file.patch.as_deref().filter(|patch| patch.len() <= budget);
+                budget -= patch.map_or(0, str::len);
+                patch
+            })
+            .collect()
+    }
+}
+
+impl ChangedFile {
+    /// A pure rename or mode change has no patch to show.
+    fn has_line_changes(&self) -> bool {
+        self.additions + self.deletions > 0
     }
 }
 
@@ -211,8 +252,8 @@ impl MergeConfidence {
         self.worst_finding.needs_no_reviewer().and(self.contained)
     }
 
-    pub fn needs_reviewer(&self, threshold: Probability) -> bool {
-        self.score() < threshold
+    pub fn needs_reviewer(&self, coverage: Coverage, threshold: Probability) -> bool {
+        coverage == Coverage::Partial || self.score() < threshold
     }
 }
 
@@ -220,11 +261,17 @@ impl MergeConfidence {
 pub fn judged_section(
     model: &str,
     confidence: &MergeConfidence,
+    coverage: Coverage,
     threshold: Probability,
     questions: &Questions,
 ) -> String {
     let score = confidence.score();
-    let verdict = if confidence.needs_reviewer(threshold) {
+    let verdict = if coverage == Coverage::Partial {
+        format!(
+            "🔴 **Merge confidence {score} / 1.00**, but Jev saw only part of the diff: \
+             ask a reviewer."
+        )
+    } else if confidence.needs_reviewer(coverage, threshold) {
         format!(
             "🔴 **Merge confidence {score} / 1.00**, below the {threshold} threshold: ask a reviewer."
         )
@@ -326,6 +373,21 @@ mod tests {
         }
     }
 
+    fn diff(files: Vec<ChangedFile>) -> PullRequestDiff {
+        PullRequestDiff {
+            changed_files: files.len() as u64,
+            files,
+        }
+    }
+
+    fn evidence(diff: &PullRequestDiff) -> MergeEvidence<'_> {
+        MergeEvidence {
+            pr_url: "https://github.com/o/r/pull/1",
+            reviews: Vec::new(),
+            diff,
+        }
+    }
+
     #[test]
     fn probabilities_stay_from_zero_to_one() {
         assert!(Probability::new(0.0).is_ok());
@@ -350,8 +412,9 @@ mod tests {
     fn a_score_at_the_threshold_merges_without_a_reviewer() {
         let at = confidence(0.0, 0.0, 0.0, 1.0, 0.8);
 
-        assert!(!at.needs_reviewer(p(0.8)));
-        assert!(at.needs_reviewer(p(0.81)));
+        assert!(!at.needs_reviewer(Coverage::Complete, p(0.8)));
+        assert!(at.needs_reviewer(Coverage::Complete, p(0.81)));
+        assert!(at.needs_reviewer(Coverage::Partial, p(0.0)));
     }
 
     #[test]
@@ -423,16 +486,16 @@ mod tests {
             effort: "high".to_string(),
         };
         let huge = "+".repeat(PATCH_BUDGET);
-        let files = [
+        let diff = diff(vec![
             changed_file("src/a.rs", Some("+a")),
             changed_file("src/huge.rs", Some(&huge)),
             changed_file("src/b.rs", Some("+b")),
-        ];
+        ]);
 
         let state = MergeEvidence {
             pr_url: "https://github.com/o/r/pull/1",
             reviews: vec![(&codex, "No findings.")],
-            changed_files: &files,
+            diff: &diff,
         }
         .state();
 
@@ -458,18 +521,51 @@ mod tests {
     }
 
     #[test]
+    fn coverage_is_complete_only_when_jev_sees_every_changed_line() {
+        let rename = ChangedFile {
+            status: "renamed".to_string(),
+            additions: 0,
+            ..changed_file("src/new_name.rs", None)
+        };
+        let complete = diff(vec![changed_file("src/a.rs", Some("+a")), rename]);
+        let binary = diff(vec![changed_file("logo.png", None)]);
+        let over_budget = diff(vec![changed_file(
+            "src/huge.rs",
+            Some(&"+".repeat(PATCH_BUDGET + 1)),
+        )]);
+        let unlisted = PullRequestDiff {
+            changed_files: 301,
+            ..diff(vec![changed_file("src/a.rs", Some("+a"))])
+        };
+
+        assert_eq!(evidence(&complete).coverage(), Coverage::Complete);
+        assert_eq!(evidence(&binary).coverage(), Coverage::Partial);
+        assert_eq!(evidence(&over_budget).coverage(), Coverage::Partial);
+        assert_eq!(evidence(&unlisted).coverage(), Coverage::Partial);
+    }
+
+    #[test]
     fn judged_section_shows_the_verdict_and_what_it_rests_on() {
         let questions = questions();
 
         let green = judged_section(
             "jev-1.13.0",
             &confidence(0.02, 0.08, 0.3, 0.6, 0.9),
+            Coverage::Complete,
             p(0.8),
             &questions,
         );
         let red = judged_section(
             "jev-1.13.0",
             &confidence(0.6, 0.2, 0.1, 0.1, 0.9),
+            Coverage::Complete,
+            p(0.8),
+            &questions,
+        );
+        let partial = judged_section(
+            "jev-1.13.0",
+            &confidence(0.0, 0.0, 0.0, 1.0, 1.0),
+            Coverage::Partial,
             p(0.8),
             &questions,
         );
@@ -483,6 +579,9 @@ mod tests {
         ));
         assert!(red.contains(
             "🔴 **Merge confidence 0.18 / 1.00**, below the 0.80 threshold: ask a reviewer."
+        ));
+        assert!(partial.contains(
+            "🔴 **Merge confidence 1.00 / 1.00**, but Jev saw only part of the diff: ask a reviewer."
         ));
         assert!(failed_section(&questions).starts_with("### jev\n\nFailed."));
     }

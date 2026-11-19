@@ -12,6 +12,8 @@ use std::{
 };
 
 pub const DEFAULT_MODEL: &str = "jev-latest";
+/// The environment variable that holds the TypeSafe API key.
+pub const API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 const SYSTEM_ONE_URL: &str = "https://api.typesafe.ai/v1/systemone";
 
 /// Questions keyed by a name of the caller's choosing. Jev answers each one

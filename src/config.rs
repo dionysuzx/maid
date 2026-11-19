@@ -45,8 +45,6 @@ pub struct Config {
     pub metrics_bind_address: SocketAddr,
 }
 
-/// The environment variable that holds the TypeSafe API key Jev needs.
-pub const TYPESAFE_API_KEY: &str = "TYPESAFE_API_KEY";
 const DEFAULT_MERGE_THRESHOLD: f64 = 0.8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,7 +123,7 @@ impl Config {
             .with_context(|| format!("agents is required in {}", config_path.display()))?;
         let prompts = required_prompts(file.prompts)
             .with_context(|| format!("prompts is required in {}", config_path.display()))?;
-        let jev = jev_config(file.jev, env::var(TYPESAFE_API_KEY).ok())?;
+        let jev = jev_config(file.jev, env::var(jev::API_KEY_ENV).ok())?;
         let github_api_ip = non_empty(file.github_api_ip)
             .map(|value| value.parse::<IpAddr>())
             .transpose()
@@ -347,7 +345,7 @@ fn jev_config(file: Option<JevFile>, api_key: Option<String>) -> Result<Option<J
         return Ok(None);
     };
     let api_key = non_empty(api_key)
-        .ok_or_else(|| anyhow!("[jev] needs the {TYPESAFE_API_KEY} environment variable"))?;
+        .ok_or_else(|| anyhow!("[jev] needs the {} environment variable", jev::API_KEY_ENV))?;
     let model = non_empty(file.model).unwrap_or_else(|| jev::DEFAULT_MODEL.to_string());
     let merge_threshold = Probability::new(file.merge_threshold.unwrap_or(DEFAULT_MERGE_THRESHOLD))
         .context("jev.merge_threshold must be from 0 to 1")?;

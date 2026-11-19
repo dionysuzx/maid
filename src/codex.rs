@@ -1,11 +1,10 @@
-use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun};
+use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun, agent_command};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -54,7 +53,7 @@ impl Agent for CodexCli {
         let output_file = NamedTempFile::new().context("failed to create Codex output file")?;
         let output_path = output_file.path().to_path_buf();
 
-        let mut command = Command::new(&self.bin);
+        let mut command = agent_command(&self.bin);
         command.arg("--ask-for-approval").arg("never");
         command.arg("--model").arg(&self.label.model);
         command.arg("--config").arg(codex_config_string(

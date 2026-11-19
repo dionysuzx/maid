@@ -1,8 +1,8 @@
 use crate::{
     domain::{
         ChangedFile, CommentMention, CommitSha, Issue, Notification, OpenPullRequest,
-        OpenPullRequestOrder, PullRequest, RepoSlug, RequestedReviewer, ReviewState, TeamSlug,
-        TreeSha, WorkTarget,
+        OpenPullRequestOrder, PullRequest, PullRequestDiff, RepoSlug, RequestedReviewer,
+        ReviewState, TeamSlug, TreeSha, WorkTarget,
     },
     maid::GithubClient,
 };
@@ -431,22 +431,38 @@ impl GithubClient for GitHubRestClient {
         TreeSha::parse(&commit.tree.sha)
     }
 
-    async fn pull_request_files(&self, pr: &PullRequest) -> Result<Vec<ChangedFile>> {
+    async fn pull_request_diff(&self, pr: &PullRequest) -> Result<PullRequestDiff> {
+        let current = self.get::<ApiPullRequestDiffStat>(&pr.api_url).await?;
+        if current.head.sha != pr.head.to_string() {
+            bail!(
+                "{} moved from {} to {} during the review",
+                pr.html_url,
+                pr.head,
+                current.head.sha
+            );
+        }
+        // A comparison pins the diff to the reviewed commit, where the pull
+        // request files endpoint would follow a later push. Its first page
+        // carries every listed file; per_page only limits the commits.
         let url = format!(
-            "https://api.github.com/repos/{}/{}/pulls/{}/files?per_page=100",
-            pr.owner, pr.repo, pr.number
+            "https://api.github.com/repos/{}/{}/compare/{}...{}?per_page=1",
+            pr.owner, pr.repo, current.base.sha, pr.head
         );
-        let files = self.get::<Vec<ApiChangedFile>>(&url).await?;
-        Ok(files
-            .into_iter()
-            .map(|file| ChangedFile {
-                path: file.filename,
-                status: file.status,
-                additions: file.additions,
-                deletions: file.deletions,
-                patch: file.patch,
-            })
-            .collect())
+        let comparison = self.get::<ApiComparison>(&url).await?;
+        Ok(PullRequestDiff {
+            files: comparison
+                .files
+                .into_iter()
+                .map(|file| ChangedFile {
+                    path: file.filename,
+                    status: file.status,
+                    additions: file.additions,
+                    deletions: file.deletions,
+                    patch: file.patch,
+                })
+                .collect(),
+            changed_files: current.changed_files,
+        })
     }
 
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
@@ -1592,6 +1608,19 @@ struct ApiPullRequest {
 #[derive(Debug, Deserialize)]
 struct ApiCommitRef {
     sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiPullRequestDiffStat {
+    head: ApiCommitRef,
+    base: ApiCommitRef,
+    changed_files: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiComparison {
+    #[serde(default)]
+    files: Vec<ApiChangedFile>,
 }
 
 #[derive(Debug, Deserialize)]

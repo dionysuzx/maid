@@ -1,7 +1,22 @@
+use crate::jev;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::{fmt, path::Path, sync::Arc};
+use tokio::process::Command;
+
+/// Environment variables that hold Maid's own credentials.
+const MAID_SECRETS: &[&str] = &[jev::API_KEY_ENV];
+
+/// Starts an agent CLI without Maid's credentials in its environment, since
+/// agents run commands from the pull requests they review.
+pub fn agent_command(bin: &str) -> Command {
+    let mut command = Command::new(bin);
+    for secret in MAID_SECRETS {
+        command.env_remove(secret);
+    }
+    command
+}
 
 #[async_trait]
 pub trait Agent: Send + Sync {
@@ -114,6 +129,18 @@ mod tests {
             model: "model".to_string(),
             effort: "high".to_string(),
         }))
+    }
+
+    #[test]
+    fn agent_commands_drop_maids_credentials() {
+        let command = agent_command("codex");
+
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(name, value)| name == "TYPESAFE_API_KEY" && value.is_none())
+        );
     }
 
     #[test]

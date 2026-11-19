@@ -5,8 +5,8 @@ use crate::auto_review::{
     classify_auto_review_author,
 };
 use crate::domain::{
-    AgentTask, ChangedFile, CommentMention, CommitSha, MentionRequest, Notification,
-    OpenPullRequest, OpenPullRequestOrder, PromptTemplates, PullRequest, RepoSlug,
+    AgentTask, CommentMention, CommitSha, MentionRequest, Notification, OpenPullRequest,
+    OpenPullRequestOrder, PromptTemplates, PullRequest, PullRequestDiff, RepoSlug,
     RequestedReviewer, ReviewState, TreeSha, WorkTarget,
 };
 use crate::handled_marker::{
@@ -18,7 +18,7 @@ use crate::mention_thread::{
     MentionThreadPlan, MentionThreadRead, choose_mention_thread_read, plan_mention_thread,
 };
 use crate::merge_confidence::{
-    self, MergeConfidence, MergeEvidence, MergeJudge, failed_section, judged_section,
+    self, Coverage, MergeConfidence, MergeEvidence, MergeJudge, failed_section, judged_section,
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
 use crate::reviewed_head::{MemoryReviewedHeadStore, ReviewedHeadStore};
@@ -50,8 +50,9 @@ pub trait GithubClient: Send + Sync {
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
     /// The tree at the pull request's head commit.
     async fn head_tree(&self, pr: &PullRequest) -> Result<TreeSha>;
-    /// The first 100 files the pull request changes, which is GitHub's page limit.
-    async fn pull_request_files(&self, pr: &PullRequest) -> Result<Vec<ChangedFile>>;
+    /// The diff at the pull request's head commit. Fails when the author has
+    /// pushed since, so the diff always matches the commit the agents read.
+    async fn pull_request_diff(&self, pr: &PullRequest) -> Result<PullRequestDiff>;
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
     async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
@@ -983,14 +984,15 @@ where
     ) -> String {
         let questions = merge_confidence::questions();
         match self.judge_merge(judge, pr, replies, &questions).await {
-            Ok((model, confidence)) => {
+            Ok((model, confidence, coverage)) => {
                 info!(
                     pr = %pr.html_url,
                     head = %pr.head,
                     merge_confidence = %confidence.score(),
+                    coverage = ?coverage,
                     "judged merge confidence"
                 );
-                judged_section(&model, &confidence, judge.threshold, &questions)
+                judged_section(&model, &confidence, coverage, judge.threshold, &questions)
             }
             Err(err) => {
                 error!(
@@ -1010,16 +1012,16 @@ where
         pr: &PullRequest,
         replies: &PanelReplies,
         questions: &Questions,
-    ) -> Result<(String, MergeConfidence)> {
-        let changed_files: Vec<ChangedFile> = self.github.pull_request_files(pr).await?;
+    ) -> Result<(String, MergeConfidence, Coverage)> {
+        let diff = self.github.pull_request_diff(pr).await?;
         let evidence = MergeEvidence {
             pr_url: &pr.html_url,
             reviews: replies.reviews(),
-            changed_files: &changed_files,
+            diff: &diff,
         };
         let decision = judge.jev.decide(&evidence.state(), questions).await?;
         let confidence = MergeConfidence::from_answers(&decision.answers)?;
-        Ok((decision.model, confidence))
+        Ok((decision.model, confidence, evidence.coverage()))
     }
 
     async fn run_agent(
@@ -1511,7 +1513,7 @@ fn deduplicate_auto_review_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AgentTaskOrigin, Issue};
+    use crate::domain::{AgentTaskOrigin, ChangedFile, Issue};
     use crate::jev::{Answer, Decision, SystemOne};
     use crate::merge_confidence::Probability;
     use anyhow::{Result, anyhow};
@@ -1538,7 +1540,7 @@ mod tests {
         public_pull_requests: Arc<StdMutex<Vec<PullRequest>>>,
         public_pull_request_authors: Arc<StdMutex<Vec<String>>>,
         head_trees: Arc<StdMutex<HashMap<CommitSha, TreeSha>>>,
-        changed_files: Arc<StdMutex<Vec<ChangedFile>>>,
+        diff: Arc<StdMutex<PullRequestDiff>>,
         posts: Arc<StdMutex<Vec<String>>>,
         marks: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<String>>>,
@@ -1629,8 +1631,8 @@ mod tests {
                 .unwrap_or_else(|| TreeSha::parse(&pr.head.to_string()).unwrap()))
         }
 
-        async fn pull_request_files(&self, _pr: &PullRequest) -> Result<Vec<ChangedFile>> {
-            Ok(self.changed_files.lock().unwrap().clone())
+        async fn pull_request_diff(&self, _pr: &PullRequest) -> Result<PullRequestDiff> {
+            Ok(self.diff.lock().unwrap().clone())
         }
 
         async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
@@ -2338,13 +2340,16 @@ mod tests {
     async fn auto_review_ends_with_jevs_merge_confidence() {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
-        *github.changed_files.lock().unwrap() = vec![ChangedFile {
-            path: "src/lib.rs".to_string(),
-            status: "modified".to_string(),
-            additions: 1,
-            deletions: 0,
-            patch: Some("+pub mod jev;".to_string()),
-        }];
+        *github.diff.lock().unwrap() = PullRequestDiff {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".to_string(),
+                status: "modified".to_string(),
+                additions: 1,
+                deletions: 0,
+                patch: Some("+pub mod jev;".to_string()),
+            }],
+            changed_files: 1,
+        };
         let jev = FakeJev::answering(0.02, 0.08, 0.3, 0.6, 0.9);
 
         maid(github.clone(), idle_worktrees(), FakeAgent::default())
