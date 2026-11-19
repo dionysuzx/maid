@@ -8,17 +8,20 @@ pub enum AgentReply<'a> {
     Failed,
 }
 
-/// One section per agent, in panel order, then the exact prompt every agent
-/// received. Each section names its commit, since the author may push again
-/// before the comment posts. GitHub links the bare SHA.
+/// One section per agent, in panel order, then Jev's merge-confidence section
+/// when there is one, then the exact prompt every agent received. Each agent
+/// section names its commit, since the author may push again before the
+/// comment posts. GitHub links the bare SHA.
 pub fn agent_comment(
     commit: Option<&CommitSha>,
     replies: &[(&AgentLabel, AgentReply<'_>)],
+    merge_section: Option<&str>,
     prompt: &str,
 ) -> String {
     let sections: Vec<String> = replies
         .iter()
         .map(|(label, reply)| agent_section(label, commit, *reply))
+        .chain(merge_section.map(str::to_string))
         .collect();
 
     format!(
@@ -78,6 +81,7 @@ mod tests {
                 (&codex, AgentReply::Responded("1. **[P1] Bug.**")),
                 (&claude, AgentReply::Failed),
             ],
+            None,
             "please review\n",
         );
 
@@ -96,9 +100,25 @@ mod tests {
     fn omits_the_commit_when_the_target_has_none() {
         let codex = label(AgentKind::Codex, "gpt-5.5");
 
-        let comment = agent_comment(None, &[(&codex, AgentReply::Responded("done"))], "p");
+        let comment = agent_comment(None, &[(&codex, AgentReply::Responded("done"))], None, "p");
 
         assert!(comment.starts_with("### codex · gpt-5.5 · high\n\ndone\n\n<details>"));
+    }
+
+    #[test]
+    fn places_the_merge_section_after_the_agents_and_before_the_prompt() {
+        let codex = label(AgentKind::Codex, "gpt-5.5");
+
+        let comment = agent_comment(
+            None,
+            &[(&codex, AgentReply::Responded("done"))],
+            Some("### jev · jev-1.13.0\n\nverdict"),
+            "p",
+        );
+
+        assert!(comment.starts_with(
+            "### codex · gpt-5.5 · high\n\ndone\n\n---\n\n### jev · jev-1.13.0\n\nverdict\n\n<details>"
+        ));
     }
 
     #[test]
@@ -108,6 +128,7 @@ mod tests {
         let comment = agent_comment(
             None,
             &[(&codex, AgentReply::Responded("done"))],
+            None,
             "quoted:\n````rust\nfn main() {}\n````",
         );
 

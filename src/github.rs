@@ -1,7 +1,8 @@
 use crate::{
     domain::{
-        CommentMention, CommitSha, Issue, Notification, OpenPullRequest, OpenPullRequestOrder,
-        PullRequest, RepoSlug, RequestedReviewer, ReviewState, TeamSlug, TreeSha, WorkTarget,
+        ChangedFile, CommentMention, CommitSha, Issue, Notification, OpenPullRequest,
+        OpenPullRequestOrder, PullRequest, PullRequestDiff, RepoSlug, RequestedReviewer,
+        ReviewState, TeamSlug, TreeSha, WorkTarget,
     },
     maid::GithubClient,
 };
@@ -428,6 +429,37 @@ impl GithubClient for GitHubRestClient {
         );
         let commit = self.get::<ApiGitCommit>(&url).await?;
         TreeSha::parse(&commit.tree.sha)
+    }
+
+    async fn pull_request_diff(&self, pr: &PullRequest) -> Result<PullRequestDiff> {
+        // The files endpoint follows the pull request's current head and base,
+        // so reading the same head and base on both sides of it pins the files
+        // to the reviewed commit and the diff GitHub shows.
+        let before = self.reviewed_pull_request(pr).await?;
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}/files?per_page=100",
+            pr.owner, pr.repo, pr.number
+        );
+        let files = self.get::<Vec<ApiChangedFile>>(&url).await?;
+        let after = self.reviewed_pull_request(pr).await?;
+        if after != before {
+            bail!("{} changed while Maid read its diff", pr.html_url);
+        }
+
+        Ok(PullRequestDiff {
+            base_ref: before.base.ref_name,
+            files: files
+                .into_iter()
+                .map(|file| ChangedFile {
+                    path: file.filename,
+                    status: file.status,
+                    additions: file.additions,
+                    deletions: file.deletions,
+                    patch: file.patch,
+                })
+                .collect(),
+            changed_files: before.changed_files,
+        })
     }
 
     async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()> {
@@ -1249,6 +1281,21 @@ impl GitHubRestClient {
         Ok(comments)
     }
 
+    /// The pull request's diff summary, failing when the author has pushed
+    /// since the review started.
+    async fn reviewed_pull_request(&self, pr: &PullRequest) -> Result<ApiPullRequestDiffStat> {
+        let current = self.get::<ApiPullRequestDiffStat>(&pr.api_url).await?;
+        if current.head.sha != pr.head.to_string() {
+            bail!(
+                "{} moved from {} to {} during the review",
+                pr.html_url,
+                pr.head,
+                current.head.sha
+            );
+        }
+        Ok(current)
+    }
+
     async fn pull_request_from_url(&self, pr_url: &str) -> Result<PullRequest> {
         let pr = self.get::<ApiPullRequest>(pr_url).await?;
         Ok(Self::open_pull_request_from_api(pr)?.pull_request)
@@ -1570,9 +1617,32 @@ struct ApiPullRequest {
     base: ApiPullRequestBase,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 struct ApiCommitRef {
     sha: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct ApiPullRequestDiffStat {
+    head: ApiCommitRef,
+    base: ApiBaseRef,
+    changed_files: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct ApiBaseRef {
+    #[serde(rename = "ref")]
+    ref_name: String,
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiChangedFile {
+    filename: String,
+    status: String,
+    additions: u64,
+    deletions: u64,
+    patch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

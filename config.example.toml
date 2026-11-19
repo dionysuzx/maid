@@ -46,15 +46,21 @@ metrics_bind_address = "127.0.0.1:9464"
 # Required. These templates are the full prompts Maid sends to every agent.
 # Each comment Maid posts ends with the rendered prompt in a collapsed section.
 # Supported mention placeholders:
-# {{mention_url}}, {{target_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
+# {{mention_url}}, {{target_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}},
+# {{review_tiers}}
 # Supported pull_request_opened placeholders:
-# {{pr_url}}, {{author}}
+# {{pr_url}}, {{author}}, {{review_tiers}}
+# {{review_tiers}} is Maid's definition of the must, should, and could finding
+# tiers. Jev's merge-confidence question uses the same definitions.
 [prompts]
 mention = """
 You are responding to a GitHub mention.
 
 Inspect the worktree in your current working directory and answer the request.
 Return only the GitHub comment body to post. Do not include tool logs or wrappers.
+
+If you review code, label each finding with one of these tiers, most serious first:
+{{review_tiers}}
 
 Mention URL:
 {{mention_url}}
@@ -74,6 +80,10 @@ You are responding automatically to a GitHub pull request opened by a trusted ac
 Inspect the worktree in your current working directory and review the pull request.
 Return only the GitHub comment body to post. Do not include tool logs or wrappers.
 
+Label each finding with one of these tiers, most serious first. Say so when there
+are no findings.
+{{review_tiers}}
+
 Pull request URL:
 {{pr_url}}
 
@@ -83,6 +93,20 @@ Opened by:
 Review request:
 please review
 """
+
+# Optional. Ends every automatic pull request review with Jev's merge
+# confidence: the chance the pull request can merge without another reviewer.
+# Jev reads the reviews and the diff. The score needs the reviews to raise no
+# must or should finding, and a defect they missed to stay contained. Reviews
+# at or above merge_threshold are marked green, others red, and so is any
+# review where Jev saw only part of the diff. Needs the TYPESAFE_API_KEY
+# environment variable. Maid keeps it out of the agents' environment, but
+# agents can still read any file Maid's user can, such as a .env beside the
+# justfile. Guard such files with the host's agent sandbox, as for the GitHub
+# token.
+# [jev]
+# model = "jev-latest"
+# merge_threshold = 0.8
 
 # Required. The coding agents Maid runs, one entry per kind ("codex" or
 # "claude"). Reviews and mentions run every agent in parallel, each in its own

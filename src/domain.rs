@@ -1,3 +1,4 @@
+use crate::review_tier::ReviewTier;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -275,6 +276,27 @@ impl PullRequest {
     }
 }
 
+/// What a pull request changes at one head commit against its base branch.
+/// Maid reads one page of files, and GitHub leaves out the patch of a binary
+/// file, a pure rename, or a very large diff, so the list can be partial.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PullRequestDiff {
+    pub base_ref: String,
+    pub files: Vec<ChangedFile>,
+    /// How many files the pull request changes, listed or not.
+    pub changed_files: u64,
+}
+
+/// One file a pull request changes, as GitHub lists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangedFile {
+    pub path: String,
+    pub status: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub patch: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Issue {
     pub owner: String,
@@ -454,6 +476,7 @@ pub struct AgentTask {
 
 impl AgentTask {
     pub fn prompt(&self, templates: &PromptTemplates) -> Result<String> {
+        let review_tiers = ReviewTier::rubric();
         match &self.origin {
             AgentTaskOrigin::Mention {
                 mention_url,
@@ -467,6 +490,7 @@ impl AgentTask {
                     ("target_url", self.pr_url.as_str()),
                     ("raw_body", raw_body.as_str()),
                     ("cleaned_text", cleaned_text.as_str()),
+                    ("review_tiers", review_tiers.as_str()),
                 ],
             ),
             AgentTaskOrigin::PullRequestOpened { author } => render_template(
@@ -474,6 +498,7 @@ impl AgentTask {
                 &[
                     ("pr_url", self.pr_url.as_str()),
                     ("author", author.as_str()),
+                    ("review_tiers", review_tiers.as_str()),
                 ],
             ),
         }
@@ -717,6 +742,32 @@ mod tests {
         };
 
         assert!(task.prompt(&templates).is_err());
+    }
+
+    #[test]
+    fn renders_the_review_tiers_into_either_template() {
+        let review = AgentTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: AgentTaskOrigin::PullRequestOpened {
+                author: "dionysuzx".to_string(),
+            },
+        };
+        let mention = AgentTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: AgentTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot review".to_string(),
+                cleaned_text: "review".to_string(),
+            },
+        };
+        let templates = PromptTemplates {
+            mention: "Tiers:\n{{review_tiers}}".to_string(),
+            pull_request_opened: "Tiers:\n{{review_tiers}}".to_string(),
+        };
+
+        let expected = format!("Tiers:\n{}", ReviewTier::rubric());
+        assert_eq!(review.prompt(&templates).unwrap(), expected);
+        assert_eq!(mention.prompt(&templates).unwrap(), expected);
     }
 
     #[test]

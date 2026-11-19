@@ -7,7 +7,9 @@ use maid::{
     daemon_lock::DaemonLock,
     github::GitHubRestClient,
     handled_marker::FilePendingHandledMarkerStore,
+    jev::JevClient,
     maid::Maid,
+    merge_confidence::MergeJudge,
     observed_notification::FileObservedNotificationStore,
     polling_metrics::{PollingMetrics, PollingMetricsEndpoint},
     reviewed_head::FileReviewedHeadStore,
@@ -61,7 +63,14 @@ async fn main() -> Result<()> {
     ))
     .with_reviewed_head_store(FileReviewedHeadStore::new(
         config.reviewed_head_ledger_path.clone(),
-    ))
+    ));
+    let maid = match &config.jev {
+        Some(jev) => maid.with_merge_judge(MergeJudge {
+            jev: Arc::new(JevClient::new(jev.api_key.clone(), jev.model.clone())),
+            threshold: jev.merge_threshold,
+        }),
+        None => maid,
+    }
     .into_concurrent(config.max_concurrent_requests);
 
     let task_limit_per_24h = config
@@ -111,6 +120,10 @@ async fn main() -> Result<()> {
         auto_review_repos = config.auto_review_repos.len(),
         auto_review_requested_reviewers = config.auto_review_requested_reviewers.len(),
         review_cadence = ?config.review_cadence,
+        merge_threshold = %config
+            .jev
+            .as_ref()
+            .map_or_else(|| "off".to_string(), |jev| jev.merge_threshold.to_string()),
         metrics_bind_address = %config.metrics_bind_address,
         "maid started"
     );

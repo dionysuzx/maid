@@ -1,9 +1,9 @@
-use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun};
+use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun, agent_command};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::{path::Path, process::Stdio};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::io::AsyncWriteExt;
 
 /// Runs Claude Code in print mode without permission checks, matching Codex's
 /// full-access sandbox.
@@ -37,7 +37,7 @@ impl Agent for ClaudeCli {
     }
 
     async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun> {
-        let mut child = Command::new(&self.bin)
+        let mut child = agent_command(&self.bin)
             .arg("--print")
             .arg("--output-format")
             .arg("json")
