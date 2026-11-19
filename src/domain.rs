@@ -276,11 +276,12 @@ impl PullRequest {
     }
 }
 
-/// What a pull request changes at one head commit. GitHub lists at most 300
-/// files and leaves out the patch of a binary file or a very large diff, so
-/// the list can be partial.
+/// What a pull request changes at one head commit against its base branch.
+/// Maid reads one page of files, and GitHub leaves out the patch of a binary
+/// file, a pure rename, or a very large diff, so the list can be partial.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PullRequestDiff {
+    pub base_ref: String,
     pub files: Vec<ChangedFile>,
     /// How many files the pull request changes, listed or not.
     pub changed_files: u64,

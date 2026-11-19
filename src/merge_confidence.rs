@@ -9,7 +9,7 @@
 
 use crate::{
     agent::AgentLabel,
-    domain::{ChangedFile, CommitSha, PullRequestDiff},
+    domain::{CommitSha, PullRequestDiff},
     jev::{Answer, NoulCriteria, Question, Questions, SystemOne},
     review_tier::ReviewTier,
 };
@@ -91,13 +91,8 @@ pub struct MergeEvidence<'a> {
 impl<'a> MergeEvidence<'a> {
     pub fn coverage(&self) -> Coverage {
         let every_file_listed = self.diff.files.len() as u64 == self.diff.changed_files;
-        let every_change_shown = self
-            .diff
-            .files
-            .iter()
-            .zip(self.shown_patches())
-            .all(|(file, patch)| patch.is_some() || file.is_pure_rename());
-        if every_file_listed && every_change_shown {
+        let every_patch_shown = self.shown_patches().iter().all(Option::is_some);
+        if every_file_listed && every_patch_shown {
             Coverage::Complete
         } else {
             Coverage::Partial
@@ -145,14 +140,6 @@ impl<'a> MergeEvidence<'a> {
                 patch
             })
             .collect()
-    }
-}
-
-impl ChangedFile {
-    /// A pure rename has no patch to show. Binary changes have no patch and
-    /// no line counts either, so the status is what tells them apart.
-    fn is_pure_rename(&self) -> bool {
-        self.status == "renamed" && self.additions + self.deletions == 0
     }
 }
 
@@ -260,6 +247,9 @@ pub struct Judgment {
     /// The concrete model Jev resolved to.
     pub model: String,
     pub commit: CommitSha,
+    /// The branch the diff was taken against, since retargeting a pull
+    /// request changes its diff without a new commit.
+    pub base_ref: String,
     pub confidence: MergeConfidence,
     pub coverage: Coverage,
 }
@@ -271,8 +261,8 @@ impl Judgment {
         self.coverage == Coverage::Partial || self.confidence.score() < threshold
     }
 
-    /// The comment section. The verdict names its commit, since a later push
-    /// is code Jev never judged.
+    /// The comment section. It names the commit and base it judged, since a
+    /// later push or retarget is a diff Jev never saw.
     pub fn section(&self, threshold: Probability, questions: &Questions) -> String {
         let score = self.confidence.score();
         let verdict = if self.coverage == Coverage::Partial {
@@ -299,11 +289,12 @@ impl Judgment {
             .collect();
 
         format!(
-            "### jev · {}\nAt {}.\n\n{verdict}\n\n\
+            "### jev · {}\nAt {} against `{}`.\n\n{verdict}\n\n\
              - Most serious finding: {}\n\
              - A missed defect stays contained: {}\n\n{}",
             self.model,
             self.commit,
+            self.base_ref,
             tiers.join(" · "),
             self.confidence.contained,
             questions_details(questions)
@@ -331,6 +322,7 @@ fn questions_details(questions: &Questions) -> String {
 mod tests {
     use super::*;
     use crate::agent::AgentKind;
+    use crate::domain::ChangedFile;
 
     fn p(value: f64) -> Probability {
         Probability::new(value).unwrap()
@@ -388,6 +380,7 @@ mod tests {
 
     fn diff(files: Vec<ChangedFile>) -> PullRequestDiff {
         PullRequestDiff {
+            base_ref: "main".to_string(),
             changed_files: files.len() as u64,
             files,
         }
@@ -425,6 +418,7 @@ mod tests {
         Judgment {
             model: "jev-1.13.0".to_string(),
             commit: CommitSha::parse(&"a".repeat(40)).unwrap(),
+            base_ref: "main".to_string(),
             confidence,
             coverage,
         }
@@ -543,17 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn coverage_is_complete_only_when_jev_sees_every_changed_line() {
-        let rename = ChangedFile {
-            status: "renamed".to_string(),
-            additions: 0,
-            ..changed_file("src/new_name.rs", None)
-        };
-        let complete = diff(vec![changed_file("src/a.rs", Some("+a")), rename]);
-        let binary = diff(vec![ChangedFile {
-            additions: 0,
-            ..changed_file("logo.png", None)
-        }]);
+    fn coverage_is_complete_only_when_jev_sees_every_patch() {
+        let complete = diff(vec![
+            changed_file("src/a.rs", Some("+a")),
+            changed_file("src/b.rs", Some("+b")),
+        ]);
+        // GitHub omits the patch of a binary or a renamed file, whose
+        // contents may still have changed.
+        let binary = diff(vec![changed_file("logo.png", None)]);
         let over_budget = diff(vec![changed_file(
             "src/huge.rs",
             Some(&"+".repeat(PATCH_BUDGET + 1)),
@@ -582,7 +573,7 @@ mod tests {
 
         let sha = "a".repeat(40);
         assert!(green.starts_with(&format!(
-            "### jev · jev-1.13.0\nAt {sha}.\n\n🟢 **Merge confidence 0.81 / 1.00**, at or above \
+            "### jev · jev-1.13.0\nAt {sha} against `main`.\n\n🟢 **Merge confidence 0.81 / 1.00**, at or above \
              the 0.80 threshold: this commit can merge without another reviewer.\n\n\
              - Most serious finding: must 0.02 · should 0.08 · could 0.30 · none 0.60\n\
              - A missed defect stays contained: 0.90\n\n\

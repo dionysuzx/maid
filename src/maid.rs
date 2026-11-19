@@ -1023,6 +1023,7 @@ where
         Ok(Judgment {
             model: decision.model,
             commit: pr.head.clone(),
+            base_ref: diff.base_ref.clone(),
             confidence: MergeConfidence::from_answers(&decision.answers)?,
             coverage: evidence.coverage(),
         })
@@ -2345,6 +2346,7 @@ mod tests {
         let github = FakeGithub::default();
         *github.pull_requests.lock().unwrap() = vec![pr()];
         *github.diff.lock().unwrap() = PullRequestDiff {
+            base_ref: "main".to_string(),
             files: vec![ChangedFile {
                 path: "src/lib.rs".to_string(),
                 status: "modified".to_string(),
@@ -2371,7 +2373,7 @@ mod tests {
             .split_once(&format!("\n\n<details>{prompt}"))
             .unwrap();
         assert!(merge.starts_with(&format!(
-            "### jev · jev-1.13.0\nAt {}.\n\n🟢 **Merge confidence 0.81 / 1.00**",
+            "### jev · jev-1.13.0\nAt {} against `main`.\n\n🟢 **Merge confidence 0.81 / 1.00**",
             pr().head
         )));
         let states = jev.states.lock().unwrap();
