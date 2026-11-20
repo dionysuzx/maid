@@ -12,7 +12,7 @@ pub enum AgentReply<'a> {
 /// received. Each section names its commit, since the author may push again
 /// before the comment posts. GitHub links the bare SHA.
 pub fn agent_comment(
-    commit: Option<&CommitSha>,
+    commit: &CommitSha,
     replies: &[(&AgentLabel, AgentReply<'_>)],
     prompt: &str,
 ) -> String {
@@ -28,15 +28,12 @@ pub fn agent_comment(
     )
 }
 
-fn agent_section(label: &AgentLabel, commit: Option<&CommitSha>, reply: AgentReply<'_>) -> String {
-    let at = commit
-        .map(|commit| format!("\nAt {commit}."))
-        .unwrap_or_default();
+fn agent_section(label: &AgentLabel, commit: &CommitSha, reply: AgentReply<'_>) -> String {
     let body = match reply {
         AgentReply::Responded(response) => response,
         AgentReply::Failed => "Failed. The error is in Maid's logs.",
     };
-    format!("### {label}{at}\n\n{body}")
+    format!("### {label}\nAt {commit}.\n\n{body}")
 }
 
 /// Collapsed, and fenced longer than any backtick run inside the prompt, so a
@@ -73,7 +70,7 @@ mod tests {
         let claude = label(AgentKind::Claude, "claude-opus-5-5");
 
         let comment = agent_comment(
-            Some(&commit),
+            &commit,
             &[
                 (&codex, AgentReply::Responded("1. **[P1] Bug.**")),
                 (&claude, AgentReply::Failed),
@@ -93,20 +90,12 @@ mod tests {
     }
 
     #[test]
-    fn omits_the_commit_when_the_target_has_none() {
-        let codex = label(AgentKind::Codex, "gpt-5.5");
-
-        let comment = agent_comment(None, &[(&codex, AgentReply::Responded("done"))], "p");
-
-        assert!(comment.starts_with("### codex · gpt-5.5 · high\n\ndone\n\n<details>"));
-    }
-
-    #[test]
     fn fences_the_prompt_beyond_any_backtick_run_inside_it() {
         let codex = label(AgentKind::Codex, "gpt-5.5");
+        let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
 
         let comment = agent_comment(
-            None,
+            &commit,
             &[(&codex, AgentReply::Responded("done"))],
             "quoted:\n````rust\nfn main() {}\n````",
         );

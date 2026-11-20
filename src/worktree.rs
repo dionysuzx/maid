@@ -1,6 +1,6 @@
 use crate::{
     agent::AgentKind,
-    domain::{AgentTask, WorkTarget, validate_repo_name_part},
+    domain::{AgentTask, PullRequest, validate_repo_name_part},
     maid::{PreparedWorktree, Worktrees},
 };
 use anyhow::{Context, Result, anyhow};
@@ -30,31 +30,30 @@ impl GitWorktrees {
         }
     }
 
-    pub fn repo_dir(&self, target: &WorkTarget) -> Result<PathBuf> {
-        validate_repo_name_part(target.owner(), "repository owner")?;
-        validate_repo_name_part(target.repo(), "repository name")?;
+    pub fn repo_dir(&self, pr: &PullRequest) -> Result<PathBuf> {
+        validate_repo_name_part(&pr.owner, "repository owner")?;
+        validate_repo_name_part(&pr.repo, "repository name")?;
         Ok(self
             .root
             .join("repos")
-            .join(target.owner())
-            .join(format!("{}.git", target.repo())))
+            .join(&pr.owner)
+            .join(format!("{}.git", pr.repo)))
     }
 
     pub fn worktree_dir(
         &self,
-        target: &WorkTarget,
+        pr: &PullRequest,
         task: &AgentTask,
         agent: AgentKind,
     ) -> Result<PathBuf> {
-        validate_repo_name_part(target.owner(), "repository owner")?;
-        validate_repo_name_part(target.repo(), "repository name")?;
+        validate_repo_name_part(&pr.owner, "repository owner")?;
+        validate_repo_name_part(&pr.repo, "repository name")?;
         Ok(self
             .root
             .join("worktrees")
-            .join(target.owner())
-            .join(target.repo())
-            .join(target.kind())
-            .join(target.number().to_string())
+            .join(&pr.owner)
+            .join(&pr.repo)
+            .join(pr.number.to_string())
             .join(worktree_key(task, agent)))
     }
 
@@ -113,12 +112,12 @@ impl GitWorktrees {
 impl Worktrees for GitWorktrees {
     async fn prepare(
         &self,
-        target: &WorkTarget,
+        pr: &PullRequest,
         task: &AgentTask,
         agent: AgentKind,
     ) -> Result<PreparedWorktree> {
-        let repo = self.repo_dir(target)?;
-        let worktree = self.worktree_dir(target, task, agent)?;
+        let repo = self.repo_dir(pr)?;
+        let worktree = self.worktree_dir(pr, task, agent)?;
         let _lock = self.acquire_repo_lock(&repo).await?;
         tokio::fs::create_dir_all(
             repo.parent()
@@ -134,20 +133,18 @@ impl Worktrees for GitWorktrees {
 
         if !repo.join("HEAD").exists() {
             let repo_string = repo.to_string_lossy().to_string();
-            self.run_git(None, &["clone", "--bare", target.clone_url(), &repo_string])
+            self.run_git(None, &["clone", "--bare", &pr.clone_url, &repo_string])
                 .await
-                .with_context(|| format!("failed to clone bare repo {}", target.repo_key()))?;
+                .with_context(|| format!("failed to clone bare repo {}", pr.repo_key()))?;
         }
 
-        self.run_git(
-            Some(&repo),
-            &["remote", "set-url", "origin", target.clone_url()],
-        )
-        .await?;
-        let fetch_ref = target.fetch_ref();
-        self.run_git(Some(&repo), &["fetch", "--prune", "origin", &fetch_ref])
+        self.run_git(Some(&repo), &["remote", "set-url", "origin", &pr.clone_url])
+            .await?;
+        // The listed head, not pull/N/head, so a later push cannot change what is reviewed.
+        let head = pr.head.to_string();
+        self.run_git(Some(&repo), &["fetch", "--prune", "origin", &head])
             .await
-            .with_context(|| format!("failed to fetch {}", target.html_url()))?;
+            .with_context(|| format!("failed to fetch {}", pr.html_url))?;
 
         let worktree_string = worktree.to_string_lossy().to_string();
         if worktree.exists() {
@@ -240,7 +237,7 @@ fn stable_hash(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CommitSha, Issue, PullRequest};
+    use crate::domain::CommitSha;
     use std::process::Command as StdCommand;
 
     fn pr(owner: &str, repo: &str) -> PullRequest {
@@ -254,27 +251,6 @@ mod tests {
             clone_url: "https://github.com/o/r.git".to_string(),
             head: CommitSha::parse(&"a".repeat(40)).unwrap(),
         }
-    }
-
-    fn issue(owner: &str, repo: &str) -> Issue {
-        Issue {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number: 322,
-            author: "dionysuzx".to_string(),
-            api_url: "https://api.github.com/repos/o/r/issues/322".to_string(),
-            html_url: "https://github.com/o/r/issues/322".to_string(),
-            clone_url: "https://github.com/o/r.git".to_string(),
-            default_branch: "main".to_string(),
-        }
-    }
-
-    fn pr_target(owner: &str, repo: &str) -> WorkTarget {
-        WorkTarget::PullRequest(pr(owner, repo))
-    }
-
-    fn issue_target(owner: &str, repo: &str) -> WorkTarget {
-        WorkTarget::Issue(issue(owner, repo))
     }
 
     fn task(trigger: &str) -> AgentTask {
@@ -306,7 +282,7 @@ mod tests {
     #[test]
     fn maps_repositories_and_worktrees_into_git_dir() {
         let worktrees = GitWorktrees::new("/tmp/maid-git", "token");
-        let pr = pr_target("dionysuzx", "forkcast");
+        let pr = pr("dionysuzx", "forkcast");
         let task = task("https://github.com/o/r/pull/46#issuecomment-2");
 
         assert_eq!(
@@ -316,7 +292,7 @@ mod tests {
         let worktree = worktrees
             .worktree_dir(&pr, &task, AgentKind::Codex)
             .unwrap();
-        assert!(worktree.starts_with("/tmp/maid-git/worktrees/dionysuzx/forkcast/pulls/46"));
+        assert!(worktree.starts_with("/tmp/maid-git/worktrees/dionysuzx/forkcast/46"));
         assert_eq!(
             worktrees
                 .worktree_dir(&pr, &task, AgentKind::Codex)
@@ -331,7 +307,7 @@ mod tests {
     fn maps_relative_git_dir_from_the_process_directory() {
         let current_dir = std::env::current_dir().unwrap();
         let worktrees = GitWorktrees::new("target/maid-git", "token");
-        let pr = pr_target("dionysuzx", "forkcast");
+        let pr = pr("dionysuzx", "forkcast");
 
         assert_eq!(
             worktrees.repo_dir(&pr).unwrap(),
@@ -342,7 +318,7 @@ mod tests {
     #[test]
     fn uses_distinct_worktrees_for_distinct_triggers_on_the_same_pull_request() {
         let worktrees = GitWorktrees::new("/tmp/maid-git", "token");
-        let pr = pr_target("dionysuzx", "forkcast");
+        let pr = pr("dionysuzx", "forkcast");
 
         assert_ne!(
             worktrees
@@ -365,7 +341,7 @@ mod tests {
     #[test]
     fn uses_distinct_worktrees_for_agents_running_the_same_task() {
         let worktrees = GitWorktrees::new("/tmp/maid-git", "token");
-        let pr = pr_target("dionysuzx", "forkcast");
+        let pr = pr("dionysuzx", "forkcast");
         let task = task("https://github.com/o/r/pull/46#issuecomment-2");
 
         assert_ne!(
@@ -395,11 +371,11 @@ mod tests {
         run_git(&source, &["update-ref", "refs/pull/46/head", "HEAD"]);
 
         let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
-        let pr = WorkTarget::PullRequest(PullRequest {
+        let pr = PullRequest {
             clone_url: source.to_string_lossy().to_string(),
             head: listed_head,
             ..pr("o", "r")
-        });
+        };
 
         let first = worktrees
             .prepare(
@@ -438,77 +414,26 @@ mod tests {
         assert!(!second_path.exists());
     }
 
-    #[tokio::test]
-    async fn prepares_issue_worktree_from_default_branch() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        std::fs::create_dir(&source).unwrap();
-        run_git(&source, &["init"]);
-        run_git(&source, &["config", "user.name", "test"]);
-        run_git(&source, &["config", "user.email", "test@example.com"]);
-        std::fs::write(source.join("file.txt"), "hello\n").unwrap();
-        run_git(&source, &["add", "file.txt"]);
-        run_git(&source, &["commit", "-m", "initial"]);
-        run_git(&source, &["branch", "-M", "main"]);
-
-        let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
-        let issue = WorkTarget::Issue(Issue {
-            clone_url: source.to_string_lossy().to_string(),
-            ..issue("o", "r")
-        });
-
-        let prepared = worktrees
-            .prepare(
-                &issue,
-                &task("https://github.com/o/r/issues/322#issuecomment-2"),
-                AgentKind::Codex,
-            )
-            .await
-            .unwrap();
-
-        assert!(worktrees.repo_dir(&issue).unwrap().join("HEAD").exists());
-        assert_eq!(
-            std::fs::read_to_string(prepared.path().join("file.txt")).unwrap(),
-            "hello\n"
-        );
-
-        let path = prepared.path().to_path_buf();
-        worktrees.cleanup(prepared).await.unwrap();
-        assert!(!path.exists());
-    }
-
     #[test]
     fn rejects_repository_parts_that_could_escape_git_dir() {
         let worktrees = GitWorktrees::new("/tmp/maid-git", "token");
 
         let task = task("https://github.com/o/r/pull/46#issuecomment-2");
 
+        assert!(worktrees.repo_dir(&pr("../dionysuzx", "forkcast")).is_err());
         assert!(
             worktrees
-                .repo_dir(&pr_target("../dionysuzx", "forkcast"))
+                .repo_dir(&pr("dionysuzx", "forkcast/slash"))
                 .is_err()
         );
         assert!(
             worktrees
-                .repo_dir(&issue_target("dionysuzx", "forkcast/slash"))
+                .worktree_dir(&pr("../dionysuzx", "forkcast"), &task, AgentKind::Codex)
                 .is_err()
         );
         assert!(
             worktrees
-                .worktree_dir(
-                    &pr_target("../dionysuzx", "forkcast"),
-                    &task,
-                    AgentKind::Codex
-                )
-                .is_err()
-        );
-        assert!(
-            worktrees
-                .worktree_dir(
-                    &issue_target("dionysuzx", "forkcast/slash"),
-                    &task,
-                    AgentKind::Codex
-                )
+                .worktree_dir(&pr("dionysuzx", "forkcast/slash"), &task, AgentKind::Codex)
                 .is_err()
         );
     }

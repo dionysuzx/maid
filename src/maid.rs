@@ -6,7 +6,7 @@ use crate::auto_review::{
 };
 use crate::domain::{
     AgentTask, CommentMention, MentionRequest, Notification, OpenPullRequest, OpenPullRequestOrder,
-    PromptTemplates, PullRequest, RepoSlug, RequestedReviewer, ReviewState, TreeSha, WorkTarget,
+    PromptTemplates, PullRequest, RepoSlug, RequestedReviewer, ReviewState, TreeSha,
 };
 use crate::handled_marker::{
     MemoryPendingHandledMarkerStore, PendingHandledMarker, PendingHandledMarkerStore,
@@ -46,8 +46,7 @@ pub trait GithubClient: Send + Sync {
     async fn open_public_pull_requests_by_author(&self, author: &str) -> Result<Vec<PullRequest>>;
     /// The tree at the pull request's head commit.
     async fn head_tree(&self, pr: &PullRequest) -> Result<TreeSha>;
-    async fn post_comment(&self, target: &WorkTarget, body: &str) -> Result<()>;
-    async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
+    async fn post_comment(&self, pr: &PullRequest, body: &str) -> Result<()>;
     async fn mention_state(&self, mention: &CommentMention, bot_login: &str)
     -> Result<ReviewState>;
     async fn mark_mention_started(&self, mention: &CommentMention) -> Result<()>;
@@ -62,7 +61,7 @@ pub trait GithubClient: Send + Sync {
 pub trait Worktrees: Send + Sync {
     async fn prepare(
         &self,
-        target: &WorkTarget,
+        pr: &PullRequest,
         task: &AgentTask,
         agent: AgentKind,
     ) -> Result<PreparedWorktree>;
@@ -833,7 +832,7 @@ where
         self.github.mark_mention_started(&mention).await?;
         info!(
             notification_id = notification.id,
-            target = %mention.target.html_url(),
+            pr = %mention.pull_request.html_url,
             mention = %mention.html_url,
             task_kind = task.task_kind(),
             "started handling mention"
@@ -868,15 +867,17 @@ where
         mention: Box<CommentMention>,
         task: AgentTask,
     ) -> Result<()> {
-        let comment = self.run_agents(&mention.target, &task).await?;
+        let comment = self.run_agents(&mention.pull_request, &task).await?;
 
-        self.github.post_comment(&mention.target, &comment).await?;
+        self.github
+            .post_comment(&mention.pull_request, &comment)
+            .await?;
         let marker = PendingHandledMarker::for_mention(&mention);
         self.pending_handled_markers.record(&marker)?;
         if let Err(err) = self.github.mark_mention_handled(&mention).await {
             error!(
                 notification_id = notification.id,
-                target = %mention.target.html_url(),
+                pr = %mention.pull_request.html_url,
                 mention = %mention.html_url,
                 error = ?err,
                 "failed to mark mention handled after posting response"
@@ -884,7 +885,7 @@ where
         }
         info!(
             notification_id = notification.id,
-            target = %mention.target.html_url(),
+            pr = %mention.pull_request.html_url,
             mention = %mention.html_url,
             "responded to mention"
         );
@@ -923,11 +924,9 @@ where
         task: AgentTask,
         tree: TreeSha,
     ) -> Result<()> {
-        let comment = self
-            .run_agents(&WorkTarget::PullRequest(pr.clone()), &task)
-            .await?;
+        let comment = self.run_agents(&pr, &task).await?;
 
-        self.github.post_pr_comment(&pr, &comment).await?;
+        self.github.post_comment(&pr, &comment).await?;
         self.reviewed_heads.record(&pr, &tree)?;
         info!(
             pr = %pr.html_url,
@@ -940,13 +939,13 @@ where
 
     /// Runs the task on its agents in parallel and stitches their responses
     /// into one comment. The task fails only when every agent failed.
-    async fn run_agents(&self, target: &WorkTarget, task: &AgentTask) -> Result<String> {
+    async fn run_agents(&self, pr: &PullRequest, task: &AgentTask) -> Result<String> {
         let prompt = task.prompt(&self.prompts)?;
         let agents = self.agents.all();
         let runs = join_all(
             agents
                 .iter()
-                .map(|agent| self.run_agent(agent.as_ref(), target, task, &prompt)),
+                .map(|agent| self.run_agent(agent.as_ref(), pr, task, &prompt)),
         )
         .await;
         if runs.iter().all(Result::is_err) {
@@ -964,23 +963,23 @@ where
                 (agent.label(), reply)
             })
             .collect();
-        Ok(agent_comment(target.head(), &replies, &prompt))
+        Ok(agent_comment(&pr.head, &replies, &prompt))
     }
 
     async fn run_agent(
         &self,
         agent: &dyn Agent,
-        target: &WorkTarget,
+        pr: &PullRequest,
         task: &AgentTask,
         prompt: &str,
     ) -> Result<AgentRun> {
         let label = agent.label();
-        let worktree = self.worktrees.prepare(target, task, label.kind).await?;
+        let worktree = self.worktrees.prepare(pr, task, label.kind).await?;
         let run = agent.run(worktree.path(), prompt).await;
         let run = self.cleanup_worktree(worktree, run).await;
         match &run {
             Ok(run) => info!(
-                target = %target.html_url(),
+                pr = %pr.html_url,
                 trigger = %task.trigger_url(),
                 agent = %label,
                 resume = run
@@ -991,7 +990,7 @@ where
                 "agent responded"
             ),
             Err(err) => error!(
-                target = %target.html_url(),
+                pr = %pr.html_url,
                 trigger = %task.trigger_url(),
                 agent = %label,
                 error = ?err,
@@ -1316,7 +1315,7 @@ impl TaskIntent {
                 ..
             } => info!(
                 notification_id = notification.id,
-                target = %mention.target.html_url(),
+                pr = %mention.pull_request.html_url,
                 mention = %mention.html_url,
                 "skipping mention because the 24-hour task limit is reached"
             ),
@@ -1359,7 +1358,7 @@ impl StartedTask {
                 ..
             } => error!(
                 notification_id = notification.id,
-                target = %mention.target.html_url(),
+                pr = %mention.pull_request.html_url,
                 mention = %mention.html_url,
                 error = ?err,
                 "failed to handle notification task"
@@ -1434,7 +1433,7 @@ fn deduplicate_auto_review_candidates(
 mod tests {
     use super::*;
     use crate::agent::AgentLabel;
-    use crate::domain::{AgentTaskOrigin, CommitSha, Issue, TreeSha};
+    use crate::domain::{AgentTaskOrigin, CommitSha, TreeSha};
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use std::collections::HashMap;
@@ -1548,18 +1547,13 @@ mod tests {
                 .unwrap_or_else(|| TreeSha::parse(&pr.head.to_string()).unwrap()))
         }
 
-        async fn post_comment(&self, _target: &WorkTarget, body: &str) -> Result<()> {
+        async fn post_comment(&self, _pr: &PullRequest, body: &str) -> Result<()> {
             self.events.lock().unwrap().push("post".to_string());
             if let Some(message) = self.post_error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
             self.posts.lock().unwrap().push(body.to_string());
             Ok(())
-        }
-
-        async fn post_pr_comment(&self, pr: &PullRequest, body: &str) -> Result<()> {
-            self.post_comment(&WorkTarget::PullRequest(pr.clone()), body)
-                .await
         }
 
         async fn mark_pr_started(&self, _pr: &PullRequest) -> Result<()> {
@@ -1656,11 +1650,11 @@ mod tests {
     impl Worktrees for FakeWorktrees {
         async fn prepare(
             &self,
-            target: &WorkTarget,
+            pr: &PullRequest,
             _task: &AgentTask,
             _agent: AgentKind,
         ) -> Result<PreparedWorktree> {
-            self.calls.lock().unwrap().push(target.repo_key());
+            self.calls.lock().unwrap().push(pr.repo_key());
             if let Some(message) = self.error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
@@ -1799,20 +1793,6 @@ mod tests {
         }
     }
 
-    fn issue_notification(id: &str, comment_id: &str) -> Notification {
-        Notification {
-            id: id.to_string(),
-            reason: "mention".to_string(),
-            subject_kind: "Issue".to_string(),
-            subject_url: Some("https://api.github.com/repos/o/r/issues/322".to_string()),
-            latest_comment_url: Some(format!(
-                "https://api.github.com/repos/o/r/issues/comments/{comment_id}"
-            )),
-            unread: true,
-            updated_at: "2026-06-08T04:00:00Z".to_string(),
-        }
-    }
-
     fn read_notification(id: &str, updated_at: &str) -> Notification {
         Notification {
             unread: false,
@@ -1872,9 +1852,9 @@ mod tests {
         }
     }
 
-    fn reply_to(target: &WorkTarget, prompt: &str) -> String {
+    fn reply_to(pr: &PullRequest, prompt: &str) -> String {
         agent_comment(
-            target.head(),
+            &pr.head,
             &[(
                 &FakeAgent::default().label,
                 AgentReply::Responded("codex response"),
@@ -1885,16 +1865,13 @@ mod tests {
 
     fn mention_reply(cleaned_text: &str) -> String {
         reply_to(
-            &WorkTarget::PullRequest(pr()),
+            &pr(),
             &format!("mention https://github.com/o/r/pull/1#issuecomment-2: {cleaned_text}"),
         )
     }
 
     fn review_of(pr: &PullRequest) -> String {
-        reply_to(
-            &WorkTarget::PullRequest(pr.clone()),
-            &format!("review {} by {}", pr.html_url, pr.author),
-        )
+        reply_to(pr, &format!("review {} by {}", pr.html_url, pr.author))
     }
 
     fn templates() -> PromptTemplates {
@@ -1950,19 +1927,6 @@ mod tests {
         }
     }
 
-    fn issue() -> Issue {
-        Issue {
-            owner: "o".to_string(),
-            repo: "r".to_string(),
-            number: 322,
-            author: "external".to_string(),
-            api_url: "https://api.github.com/repos/o/r/issues/322".to_string(),
-            html_url: "https://github.com/o/r/issues/322".to_string(),
-            clone_url: "https://github.com/o/r.git".to_string(),
-            default_branch: "main".to_string(),
-        }
-    }
-
     fn mention(author: &str, body: &str) -> CommentMention {
         mention_with_comment(author, body, "2")
     }
@@ -1973,17 +1937,7 @@ mod tests {
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
             html_url: format!("https://github.com/o/r/pull/1#issuecomment-{comment_id}"),
-            target: WorkTarget::PullRequest(pr()),
-        }
-    }
-
-    fn issue_mention(author: &str, body: &str, comment_id: &str) -> CommentMention {
-        CommentMention {
-            author: author.to_string(),
-            body: body.to_string(),
-            api_url: format!("https://api.github.com/repos/o/r/issues/comments/{comment_id}"),
-            html_url: format!("https://github.com/o/r/issues/322#issuecomment-{comment_id}"),
-            target: WorkTarget::Issue(issue()),
+            pull_request: pr(),
         }
     }
 
@@ -1993,7 +1947,7 @@ mod tests {
             body: body.to_string(),
             api_url: format!("https://api.github.com/repos/o/r/pulls/comments/{comment_id}"),
             html_url: format!("https://github.com/o/r/pull/1#discussion_r{comment_id}"),
-            target: WorkTarget::PullRequest(pr()),
+            pull_request: pr(),
         }
     }
 
@@ -2052,7 +2006,7 @@ mod tests {
         let first = TaskIntent::Mention {
             notification: notification_with_comment("n1", "2"),
             task: AgentTask {
-                pr_url: first_mention.target.html_url().to_string(),
+                pr_url: first_mention.pull_request.html_url.clone(),
                 origin: AgentTaskOrigin::Mention {
                     mention_url: first_mention.html_url.clone(),
                     raw_body: first_mention.body.clone(),
@@ -2064,7 +2018,7 @@ mod tests {
         let second = TaskIntent::Mention {
             notification: notification_with_comment("n1", "3"),
             task: AgentTask {
-                pr_url: second_mention.target.html_url().to_string(),
+                pr_url: second_mention.pull_request.html_url.clone(),
                 origin: AgentTaskOrigin::Mention {
                     mention_url: second_mention.html_url.clone(),
                     raw_body: second_mention.body.clone(),
@@ -2125,49 +2079,6 @@ mod tests {
         assert_eq!(
             calls[0].1,
             "mention https://github.com/o/r/pull/1#issuecomment-2: please review this PR"
-        );
-    }
-
-    #[tokio::test]
-    async fn responds_to_issue_mention_on_issue_target() {
-        let worktree = PathBuf::from("/tmp/maid-test-worktree");
-        let github = FakeGithub::default();
-        *github.notifications.lock().unwrap() = vec![issue_notification("n1", "2")];
-        *github.mention.lock().unwrap() = Some(Ok(Some(issue_mention(
-            "dionysuzx",
-            "@maid-bot explain this issue",
-            "2",
-        ))));
-        let worktrees = FakeWorktrees {
-            worktree: worktree.clone(),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-            error: Arc::new(StdMutex::new(None)),
-        };
-        let codex = FakeAgent::default();
-
-        let report = maid(github.clone(), worktrees.clone(), codex.clone())
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(report.responded, 1);
-        assert_eq!(
-            *github.posts.lock().unwrap(),
-            vec![reply_to(
-                &WorkTarget::Issue(issue()),
-                "mention https://github.com/o/r/issues/322#issuecomment-2: explain this issue"
-            )]
-        );
-        assert_eq!(
-            *github.events.lock().unwrap(),
-            vec!["start", "post", "handled"]
-        );
-        assert_eq!(*worktrees.calls.lock().unwrap(), vec!["o/r"]);
-        let calls = codex.calls.lock().unwrap();
-        assert_eq!(calls[0].0, worktree);
-        assert_eq!(
-            calls[0].1,
-            "mention https://github.com/o/r/issues/322#issuecomment-2: explain this issue"
         );
     }
 
@@ -3722,7 +3633,7 @@ mod tests {
         assert_eq!(
             *github.posts.lock().unwrap(),
             vec![agent_comment(
-                Some(&pr().head),
+                &pr().head,
                 &[
                     (&codex.label, AgentReply::Responded("codex review")),
                     (&claude.label, AgentReply::Responded("claude review")),
@@ -3755,7 +3666,7 @@ mod tests {
         assert_eq!(
             *github.posts.lock().unwrap(),
             vec![agent_comment(
-                Some(&pr().head),
+                &pr().head,
                 &[
                     (&codex.label, AgentReply::Failed),
                     (&claude.label, AgentReply::Responded("claude review")),
