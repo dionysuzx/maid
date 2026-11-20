@@ -16,7 +16,7 @@ pub struct Notification {
 
 impl Notification {
     pub fn is_mention_candidate(&self) -> bool {
-        matches!(self.subject_kind.as_str(), "PullRequest" | "Issue") && self.subject_url.is_some()
+        self.subject_kind == "PullRequest" && self.subject_url.is_some()
     }
 
     pub fn is_read(&self) -> bool {
@@ -276,100 +276,12 @@ impl PullRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Issue {
-    pub owner: String,
-    pub repo: String,
-    pub number: u64,
-    pub author: String,
-    pub api_url: String,
-    pub html_url: String,
-    pub clone_url: String,
-    pub default_branch: String,
-}
-
-impl Issue {
-    pub fn repo_key(&self) -> String {
-        format!("{}/{}", self.owner, self.repo)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WorkTarget {
-    PullRequest(PullRequest),
-    Issue(Issue),
-}
-
-impl WorkTarget {
-    pub fn owner(&self) -> &str {
-        match self {
-            Self::PullRequest(pr) => &pr.owner,
-            Self::Issue(issue) => &issue.owner,
-        }
-    }
-
-    pub fn repo(&self) -> &str {
-        match self {
-            Self::PullRequest(pr) => &pr.repo,
-            Self::Issue(issue) => &issue.repo,
-        }
-    }
-
-    pub fn number(&self) -> u64 {
-        match self {
-            Self::PullRequest(pr) => pr.number,
-            Self::Issue(issue) => issue.number,
-        }
-    }
-
-    pub fn html_url(&self) -> &str {
-        match self {
-            Self::PullRequest(pr) => &pr.html_url,
-            Self::Issue(issue) => &issue.html_url,
-        }
-    }
-
-    pub fn clone_url(&self) -> &str {
-        match self {
-            Self::PullRequest(pr) => &pr.clone_url,
-            Self::Issue(issue) => &issue.clone_url,
-        }
-    }
-
-    pub fn repo_key(&self) -> String {
-        format!("{}/{}", self.owner(), self.repo())
-    }
-
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::PullRequest(_) => "pulls",
-            Self::Issue(_) => "issues",
-        }
-    }
-
-    /// The commit an agent sees, when the target has a fixed one.
-    pub fn head(&self) -> Option<&CommitSha> {
-        match self {
-            Self::PullRequest(pr) => Some(&pr.head),
-            Self::Issue(_) => None,
-        }
-    }
-
-    pub fn fetch_ref(&self) -> String {
-        match self {
-            // The listed head, not pull/N/head, so a later push cannot change what is reviewed.
-            Self::PullRequest(pr) => pr.head.to_string(),
-            Self::Issue(issue) => issue.default_branch.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommentMention {
     pub author: String,
     pub body: String,
     pub api_url: String,
     pub html_url: String,
-    pub target: WorkTarget,
+    pub pull_request: PullRequest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -464,7 +376,6 @@ impl AgentTask {
                 &[
                     ("mention_url", mention_url.as_str()),
                     ("pr_url", self.pr_url.as_str()),
-                    ("target_url", self.pr_url.as_str()),
                     ("raw_body", raw_body.as_str()),
                     ("cleaned_text", cleaned_text.as_str()),
                 ],
@@ -589,23 +500,19 @@ mod tests {
             }
             .is_mention_candidate()
         );
-        assert!(
+        for notification in [
             Notification {
                 subject_kind: "Issue".to_string(),
                 subject_url: Some("https://api.github.com/repos/o/r/issues/1".to_string()),
                 ..eligible.clone()
-            }
-            .is_mention_candidate()
-        );
-
-        for notification in [
+            },
             Notification {
                 subject_kind: "Discussion".to_string(),
                 ..eligible.clone()
             },
             Notification {
                 subject_url: None,
-                ..eligible.clone()
+                ..eligible
             },
         ] {
             assert!(!notification.is_mention_candidate());
@@ -662,7 +569,7 @@ mod tests {
 
         let prompt = task.prompt(&test_prompts()).unwrap();
         assert!(prompt.contains("Mention URL:\nhttps://github.com/o/r/pull/1#issuecomment-2"));
-        assert!(prompt.contains("Target URL:\nhttps://github.com/o/r/pull/1"));
+        assert!(prompt.contains("Pull request URL:\nhttps://github.com/o/r/pull/1"));
         assert!(prompt.contains("Raw mention body:\n@maid-bot review"));
         assert!(prompt.contains("Cleaned request text:\nreview"));
     }
@@ -693,13 +600,13 @@ mod tests {
             },
         };
         let templates = PromptTemplates {
-            mention: "TARGET={{ target_url }} REQUEST={{cleaned_text}}".to_string(),
+            mention: "PR={{ pr_url }} REQUEST={{cleaned_text}}".to_string(),
             pull_request_opened: String::new(),
         };
 
         assert_eq!(
             task.prompt(&templates).unwrap(),
-            "TARGET=https://github.com/o/r/pull/1 REQUEST=review"
+            "PR=https://github.com/o/r/pull/1 REQUEST=review"
         );
     }
 
@@ -826,8 +733,8 @@ mod tests {
 Mention URL:
 {{mention_url}}
 
-Target URL:
-{{target_url}}
+Pull request URL:
+{{pr_url}}
 
 Raw mention body:
 {{raw_body}}

@@ -46,7 +46,7 @@ metrics_bind_address = "127.0.0.1:9464"
 # Required. These templates are the full prompts Maid sends to every agent.
 # Each comment Maid posts ends with the rendered prompt in a collapsed section.
 # Supported mention placeholders:
-# {{mention_url}}, {{target_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
+# {{mention_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
 # Supported pull_request_opened placeholders:
 # {{pr_url}}, {{author}}
 [prompts]
@@ -59,8 +59,8 @@ Return only the GitHub comment body to post. Do not include tool logs or wrapper
 Mention URL:
 {{mention_url}}
 
-Target URL:
-{{target_url}}
+Pull request URL:
+{{pr_url}}
 
 Raw mention body:
 {{raw_body}}
