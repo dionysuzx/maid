@@ -41,7 +41,7 @@ impl AgentScratch {
             let path = root.join(scratch_name(
                 NEXT_SCRATCH_ID.fetch_add(1, Ordering::Relaxed),
             ));
-            match tokio::fs::create_dir(&path).await {
+            match create_private_dir(&path).await {
                 Ok(()) => break path,
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
@@ -92,6 +92,13 @@ pub async fn wipe_agent_scratch(root: &Path, git_dir: &Path) -> Result<()> {
 
 fn scratch_name(id: u64) -> String {
     format!("maid-{id:x}")
+}
+
+async fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = tokio::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path).await
 }
 
 fn wipe_scratch_sync(root: &Path, git_dir: &Path) {
@@ -179,10 +186,14 @@ fn remove_scratch_sync(path: &Path) -> std::io::Result<()> {
         return std::fs::remove_file(path);
     }
     make_dirs_writable(path);
-    match std::fs::remove_dir_all(path) {
+    let result = match std::fs::remove_dir_all(path) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         result => result,
+    };
+    if result.is_err() {
+        let _ = std::fs::File::create(path.join(SCRATCH_MARKER));
     }
+    result
 }
 
 fn make_dirs_writable(path: &Path) {
@@ -336,6 +347,14 @@ mod tests {
                 .unwrap();
             let scratch_path = scratch.path().to_path_buf();
             assert_eq!(scratch_path.parent(), Some(root.path()));
+            assert_eq!(
+                std::fs::symlink_metadata(&scratch_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
             let id = scratch_path.file_name().unwrap().to_str().unwrap();
             let hex = id.strip_prefix("maid-").expect(id);
             assert!(
