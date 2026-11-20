@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fmt,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -84,33 +85,53 @@ impl Drop for AgentScratch {
 pub async fn wipe_agent_scratch(root: &Path, git_dir: &Path) -> Result<()> {
     let root = root.to_path_buf();
     let git_dir = git_dir.to_path_buf();
-    let displayed = root.display().to_string();
     tokio::task::spawn_blocking(move || wipe_scratch_sync(&root, &git_dir))
         .await
-        .context("failed to wipe agent scratch")?
-        .with_context(|| format!("failed to wipe {displayed}"))
+        .context("failed to wipe agent scratch")
 }
 
 fn scratch_name(id: u64) -> String {
     format!("maid-{id:x}")
 }
 
-fn wipe_scratch_sync(root: &Path, git_dir: &Path) -> std::io::Result<()> {
+fn wipe_scratch_sync(root: &Path, git_dir: &Path) {
     let metadata = match std::fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            warn!(error = %err, path = %root.display(), "failed to read agent scratch");
+            return;
+        }
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Ok(());
+        return;
     }
-    for entry in std::fs::read_dir(root)? {
-        let path = entry?.path();
-        if is_our_scratch(&path) && !contains_git(&path, git_dir) {
-            remove_scratch_sync(&path)?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!(error = %err, path = %root.display(), "failed to read agent scratch");
+            return;
+        }
+    };
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(err) => {
+                warn!(error = %err, path = %root.display(), "failed to read agent scratch");
+                continue;
+            }
+        };
+        if is_our_scratch(&path)
+            && !contains_git(&path, git_dir)
+            && let Err(err) = remove_scratch_sync(&path)
+        {
+            warn!(
+                error = %err,
+                path = %path.display(),
+                "failed to remove agent scratch"
+            );
         }
     }
-    Ok(())
 }
 
 fn contains_git(dir: &Path, git_dir: &Path) -> bool {
@@ -172,7 +193,10 @@ fn make_dirs_writable(path: &Path) {
         return;
     }
     let mut permissions = metadata.permissions();
+    #[cfg(unix)]
     permissions.set_mode(permissions.mode() | 0o700);
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
     let _ = std::fs::set_permissions(path, permissions);
     let Ok(entries) = std::fs::read_dir(path) else {
         return;
