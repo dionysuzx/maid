@@ -1,6 +1,6 @@
 use anyhow::Result;
 use maid::{
-    agent::{Agent, AgentKind, AgentPanel},
+    agent::{Agent, AgentKind, AgentPanel, wipe_agent_scratch},
     claude::ClaudeCli,
     codex::CodexCli,
     config::{AgentConfig, Config},
@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let _daemon_lock = DaemonLock::acquire(config.daemon_pid_path.clone())?;
+    wipe_agent_scratch(&config.scratch_dir).await?;
     let polling_metrics = PollingMetrics::new();
     let metrics_endpoint =
         PollingMetricsEndpoint::bind(config.metrics_bind_address, polling_metrics.clone()).await?;
@@ -38,7 +39,13 @@ async fn main() -> Result<()> {
             config.github_notification_window,
         ),
         GitWorktrees::new(config.git_dir.clone(), config.github_token.clone()),
-        AgentPanel::new(config.agents.iter().map(agent).collect())?,
+        AgentPanel::new(
+            config
+                .agents
+                .iter()
+                .map(|agent_config| agent(agent_config, &config.scratch_dir))
+                .collect(),
+        )?,
         config.prompts.clone(),
         config.bot_login.clone(),
         config.master_accounts.clone(),
@@ -91,6 +98,7 @@ async fn main() -> Result<()> {
 
     info!(
         git_dir = %config.git_dir.display(),
+        scratch_dir = %config.scratch_dir.display(),
         daemon_pid = %config.daemon_pid_path.display(),
         task_start_ledger = %config.task_start_ledger_path.display(),
         pending_handled_marker_ledger = %config.pending_handled_marker_ledger_path.display(),
@@ -125,17 +133,19 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn agent(config: &AgentConfig) -> Arc<dyn Agent> {
+fn agent(config: &AgentConfig, scratch_dir: &std::path::Path) -> Arc<dyn Agent> {
     match config.kind {
         AgentKind::Codex => Arc::new(CodexCli::new(
             config.bin.clone(),
             config.model.clone(),
             config.effort.clone(),
+            scratch_dir,
         )),
         AgentKind::Claude => Arc::new(ClaudeCli::new(
             config.bin.clone(),
             config.model.clone(),
             config.effort.clone(),
+            scratch_dir,
         )),
     }
 }

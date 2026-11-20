@@ -1,8 +1,11 @@
-use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun, set_agent_temp_dir};
+use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun, AgentScratch};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{path::Path, process::Stdio};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 /// Runs Claude Code in print mode without permission checks, matching Codex's
@@ -11,6 +14,7 @@ use tokio::{io::AsyncWriteExt, process::Command};
 pub struct ClaudeCli {
     bin: String,
     label: AgentLabel,
+    scratch_root: PathBuf,
 }
 
 impl ClaudeCli {
@@ -18,6 +22,7 @@ impl ClaudeCli {
         bin: impl Into<String>,
         model: impl Into<String>,
         effort: impl Into<String>,
+        scratch_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             bin: bin.into(),
@@ -26,6 +31,7 @@ impl ClaudeCli {
                 model: model.into(),
                 effort: effort.into(),
             },
+            scratch_root: scratch_root.into(),
         }
     }
 }
@@ -38,7 +44,7 @@ impl Agent for ClaudeCli {
 
     async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun> {
         let mut command = Command::new(&self.bin);
-        set_agent_temp_dir(&mut command, worktree).await?;
+        let _scratch = AgentScratch::create(&self.scratch_root, &mut command).await?;
         let mut child = command
             .arg("--print")
             .arg("--output-format")
@@ -124,10 +130,8 @@ printf '%s' '{"type":"result","subtype":"success","is_error":false,"result":"  r
 "#,
         );
 
-        let worktree = temp.path().join("worktree");
-        fs::create_dir(&worktree).unwrap();
-        let run = ClaudeCli::new(bin, "claude-opus-5-5", "high")
-            .run(&worktree, "please review")
+        let run = ClaudeCli::new(bin, "claude-opus-5-5", "high", temp.path())
+            .run(temp.path(), "please review")
             .await
             .unwrap();
 
@@ -139,11 +143,11 @@ printf '%s' '{"type":"result","subtype":"success","is_error":false,"result":"  r
             }
         );
         assert_eq!(
-            fs::read_to_string(worktree.join("args")).unwrap(),
+            fs::read_to_string(temp.path().join("args")).unwrap(),
             "--print --output-format json --dangerously-skip-permissions --model claude-opus-5-5 --effort high\n"
         );
         assert_eq!(
-            fs::read_to_string(worktree.join("prompt")).unwrap(),
+            fs::read_to_string(temp.path().join("prompt")).unwrap(),
             "please review"
         );
     }
@@ -160,10 +164,8 @@ exit 1
 "#,
         );
 
-        let worktree = temp.path().join("worktree");
-        fs::create_dir(&worktree).unwrap();
-        let err = ClaudeCli::new(bin, "opus", "high")
-            .run(&worktree, "p")
+        let err = ClaudeCli::new(bin, "opus", "high", temp.path())
+            .run(temp.path(), "p")
             .await
             .unwrap_err();
 

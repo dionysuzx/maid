@@ -2,12 +2,18 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::{
-    ffi::OsStr,
     fmt,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::process::Command;
+use tracing::warn;
+
+static NEXT_SCRATCH_ID: AtomicU64 = AtomicU64::new(0);
 
 #[async_trait]
 pub trait Agent: Send + Sync {
@@ -15,27 +21,80 @@ pub trait Agent: Send + Sync {
     async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun>;
 }
 
-/// Per-run scratch directory beside `worktree`, removed with that worktree.
-pub(crate) fn agent_temp_dir(worktree: &Path) -> PathBuf {
-    let mut name = worktree
-        .file_name()
-        .unwrap_or(OsStr::new("agent"))
-        .to_os_string();
-    name.push(".tmp");
-    worktree.with_file_name(name)
+/// One run's scratch directory under the Maid scratch root (`~/.maid/tmp/<id>`).
+///
+/// Drop removes it, including read-only directories tools like the Go module
+/// cache leave behind. A removal failure is logged; the startup wipe is the
+/// backstop, so cleanup never fails the review.
+pub(crate) struct AgentScratch {
+    path: PathBuf,
 }
 
-/// Creates [`agent_temp_dir`] and points the agent process at it.
-pub(crate) async fn set_agent_temp_dir(command: &mut Command, worktree: &Path) -> Result<PathBuf> {
-    let temp = agent_temp_dir(worktree);
-    tokio::fs::create_dir_all(&temp)
+impl AgentScratch {
+    pub(crate) async fn create(root: &Path, command: &mut Command) -> Result<Self> {
+        let path = root.join(format!(
+            "{:x}",
+            NEXT_SCRATCH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        tokio::fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        command
+            .env("TMPDIR", &path)
+            .env("TMP", &path)
+            .env("TEMP", &path);
+        Ok(Self { path })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for AgentScratch {
+    fn drop(&mut self) {
+        if let Err(err) = remove_scratch_sync(&self.path) {
+            warn!(
+                error = %err,
+                path = %self.path.display(),
+                "failed to remove agent scratch"
+            );
+        }
+    }
+}
+
+/// Deletes `root` and anything left under it. Called at daemon startup, before tasks run.
+pub async fn wipe_agent_scratch(root: &Path) -> Result<()> {
+    let root = root.to_path_buf();
+    let displayed = root.display().to_string();
+    tokio::task::spawn_blocking(move || remove_scratch_sync(&root))
         .await
-        .with_context(|| format!("failed to create agent temp dir {}", temp.display()))?;
-    command
-        .env("TMPDIR", &temp)
-        .env("TMP", &temp)
-        .env("TEMP", &temp);
-    Ok(temp)
+        .context("failed to wipe agent scratch")?
+        .with_context(|| format!("failed to wipe {displayed}"))
+}
+
+fn remove_scratch_sync(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    }
+    make_dirs_writable(path)?;
+    std::fs::remove_dir_all(path)
+}
+
+fn make_dirs_writable(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(permissions.mode() | 0o700);
+    std::fs::set_permissions(path, permissions)?;
+    for entry in std::fs::read_dir(path)? {
+        make_dirs_writable(&entry?.path())?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -156,5 +215,65 @@ mod tests {
                 .to_string(),
             "agents must have unique kinds; codex is listed twice"
         );
+    }
+
+    #[tokio::test]
+    async fn scratch_is_a_short_directory_and_cleanup_removes_read_only_trees() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        let scratch_path = {
+            let scratch = AgentScratch::create(root.path(), &mut command)
+                .await
+                .unwrap();
+            let scratch_path = scratch.path().to_path_buf();
+            assert_eq!(scratch_path.parent(), Some(root.path()));
+            let id = scratch_path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                !id.is_empty() && id.len() <= 16 && id.chars().all(|char| char.is_ascii_hexdigit()),
+                "{id}"
+            );
+
+            let output = command
+                .arg("-c")
+                .arg("printf '%s\\n%s\\n%s' \"$TMPDIR\" \"$TMP\" \"$TEMP\"")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let scratch_text = scratch_path.to_str().unwrap();
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("{scratch_text}\n{scratch_text}\n{scratch_text}")
+            );
+            lock_directory(&scratch_path.join("pkg"));
+            scratch_path
+        };
+        assert!(!scratch_path.exists());
+
+        let leftover = {
+            let scratch = AgentScratch::create(root.path(), &mut Command::new("true"))
+                .await
+                .unwrap();
+            let leftover = scratch.path().to_path_buf();
+            lock_directory(&leftover.join("pkg"));
+            std::mem::forget(scratch);
+            leftover
+        };
+        assert!(leftover.exists());
+        wipe_agent_scratch(root.path()).await.unwrap();
+        assert!(!leftover.exists());
+        assert!(!root.path().exists());
+    }
+
+    fn lock_directory(path: &std::path::Path) {
+        std::fs::create_dir(path).unwrap();
+        std::fs::write(path.join("file"), "module").unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(path, permissions).unwrap();
     }
 }
