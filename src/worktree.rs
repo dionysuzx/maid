@@ -1,5 +1,5 @@
 use crate::{
-    agent::AgentKind,
+    agent::{AgentKind, agent_temp_dir},
     domain::{AgentTask, WorkTarget, validate_repo_name_part},
     maid::{PreparedWorktree, Worktrees},
 };
@@ -163,6 +163,7 @@ impl Worktrees for GitWorktrees {
                     .with_context(|| format!("failed to remove {}", worktree.display()))?;
             }
         }
+        remove_agent_temp(&worktree).await?;
 
         self.run_git(Some(&repo), &["worktree", "prune"]).await?;
         self.run_git(
@@ -198,6 +199,7 @@ impl Worktrees for GitWorktrees {
                 .await
                 .with_context(|| format!("failed to remove {}", worktree.path().display()))?;
         }
+        remove_agent_temp(worktree.path()).await?;
         self.run_git(Some(&repo), &["worktree", "prune"]).await?;
         if worktree.path().exists() {
             return remove_result;
@@ -208,6 +210,16 @@ impl Worktrees for GitWorktrees {
 
 struct RepoLock {
     _file: File,
+}
+
+async fn remove_agent_temp(worktree: &Path) -> Result<()> {
+    let temp = agent_temp_dir(worktree);
+    if temp.exists() {
+        tokio::fs::remove_dir_all(&temp)
+            .await
+            .with_context(|| format!("failed to remove {}", temp.display()))?;
+    }
+    Ok(())
 }
 
 fn absolute_root(root: PathBuf) -> PathBuf {
@@ -240,7 +252,10 @@ fn stable_hash(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{Agent, agent_temp_dir};
+    use crate::codex::CodexCli;
     use crate::domain::{CommitSha, Issue, PullRequest};
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command as StdCommand;
 
     fn pr(owner: &str, repo: &str) -> PullRequest {
@@ -475,6 +490,105 @@ mod tests {
         let path = prepared.path().to_path_buf();
         worktrees.cleanup(prepared).await.unwrap();
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn agent_scratch_stays_beside_the_worktree_until_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        run_git(&source, &["init"]);
+        run_git(&source, &["config", "user.name", "test"]);
+        run_git(&source, &["config", "user.email", "test@example.com"]);
+        std::fs::write(source.join("file.txt"), "hello\n").unwrap();
+        run_git(&source, &["add", "file.txt"]);
+        run_git(&source, &["commit", "-m", "initial"]);
+        run_git(&source, &["branch", "-M", "main"]);
+
+        let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
+        let issue = WorkTarget::Issue(Issue {
+            clone_url: source.to_string_lossy().to_string(),
+            ..issue("o", "r")
+        });
+        let task = task("https://github.com/o/r/issues/322#issuecomment-9");
+        let scratch = agent_temp_dir(
+            &worktrees
+                .worktree_dir(&issue, &task, AgentKind::Codex)
+                .unwrap(),
+        );
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("old"), "leftover").unwrap();
+
+        let prepared = worktrees
+            .prepare(&issue, &task, AgentKind::Codex)
+            .await
+            .unwrap();
+
+        assert_eq!(scratch.parent(), prepared.path().parent());
+        assert!(!scratch.starts_with(prepared.path()));
+        assert!(!scratch.join("old").exists());
+
+        let bin = temp.path().join("fake-codex");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+output_path=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--output-last-message" ]; then
+    output_path="$argument"
+  fi
+  previous="$argument"
+done
+cat >/dev/null
+printf '%s' "$TMPDIR" > seen-tmpdir
+printf '%s' "$TMP" > seen-tmp
+printf '%s' "$TEMP" > seen-temp
+printf '%s' "$output_path" > seen-output
+printf '%s\n' scratch > "$TMPDIR/scratch"
+printf '%s\n' '{"type":"thread.started","thread_id":"session-1"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"json final"}}'
+printf '%s\n' 'file final' > "$output_path"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bin, permissions).unwrap();
+
+        let run = CodexCli::new(bin.display().to_string(), "test-model", "low")
+            .run(prepared.path(), "review")
+            .await
+            .unwrap();
+        assert_eq!(run.response, "file final");
+
+        let scratch_text = scratch.to_str().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(prepared.path().join("seen-tmpdir")).unwrap(),
+            scratch_text
+        );
+        assert_eq!(
+            std::fs::read_to_string(prepared.path().join("seen-tmp")).unwrap(),
+            scratch_text
+        );
+        assert_eq!(
+            std::fs::read_to_string(prepared.path().join("seen-temp")).unwrap(),
+            scratch_text
+        );
+        let output = std::fs::read_to_string(prepared.path().join("seen-output")).unwrap();
+        assert!(
+            std::path::Path::new(&output).starts_with(&scratch),
+            "{output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("scratch")).unwrap(),
+            "scratch\n"
+        );
+
+        let path = prepared.path().to_path_buf();
+        worktrees.cleanup(prepared).await.unwrap();
+        assert!(!path.exists());
+        assert!(!scratch.exists());
     }
 
     #[test]

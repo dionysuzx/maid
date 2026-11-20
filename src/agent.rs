@@ -1,12 +1,41 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{fmt, path::Path, sync::Arc};
+use std::{
+    ffi::OsStr,
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::process::Command;
 
 #[async_trait]
 pub trait Agent: Send + Sync {
     fn label(&self) -> &AgentLabel;
     async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun>;
+}
+
+/// Per-run scratch directory beside `worktree`, removed with that worktree.
+pub(crate) fn agent_temp_dir(worktree: &Path) -> PathBuf {
+    let mut name = worktree
+        .file_name()
+        .unwrap_or(OsStr::new("agent"))
+        .to_os_string();
+    name.push(".tmp");
+    worktree.with_file_name(name)
+}
+
+/// Creates [`agent_temp_dir`] and points the agent process at it.
+pub(crate) async fn set_agent_temp_dir(command: &mut Command, worktree: &Path) -> Result<PathBuf> {
+    let temp = agent_temp_dir(worktree);
+    tokio::fs::create_dir_all(&temp)
+        .await
+        .with_context(|| format!("failed to create agent temp dir {}", temp.display()))?;
+    command
+        .env("TMPDIR", &temp)
+        .env("TMP", &temp)
+        .env("TEMP", &temp);
+    Ok(temp)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

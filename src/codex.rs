@@ -1,4 +1,4 @@
-use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun};
+use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun, set_agent_temp_dir};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -51,10 +51,12 @@ impl Agent for CodexCli {
     }
 
     async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun> {
-        let output_file = NamedTempFile::new().context("failed to create Codex output file")?;
+        let mut command = Command::new(&self.bin);
+        let temp = set_agent_temp_dir(&mut command, worktree).await?;
+        let output_file =
+            NamedTempFile::new_in(&temp).context("failed to create Codex output file")?;
         let output_path = output_file.path().to_path_buf();
 
-        let mut command = Command::new(&self.bin);
         command.arg("--ask-for-approval").arg("never");
         command.arg("--model").arg(&self.label.model);
         command.arg("--config").arg(codex_config_string(
@@ -288,7 +290,14 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use tokio::time::timeout;
+
+    fn worktree_at(root: &Path) -> PathBuf {
+        let worktree = root.join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        worktree
+    }
 
     #[test]
     fn parses_codex_session_id_and_last_agent_message_from_json_events() {
@@ -363,8 +372,9 @@ exit 0
         fs::set_permissions(&bin, permissions).unwrap();
 
         let codex = CodexCli::new(bin.display().to_string(), "test-model", "low");
+        let worktree = worktree_at(temp.path());
 
-        let run = timeout(Duration::from_secs(3), codex.run(temp.path(), "test"))
+        let run = timeout(Duration::from_secs(3), codex.run(&worktree, "test"))
             .await
             .expect("Codex run should not wait for inherited stdout forever")
             .unwrap();
@@ -401,8 +411,9 @@ sleep 5
 
         let codex = CodexCli::new(bin.display().to_string(), "test-model", "low")
             .with_exit_after_completion_timeout(Duration::from_millis(100));
+        let worktree = worktree_at(temp.path());
 
-        let run = timeout(Duration::from_secs(6), codex.run(temp.path(), "test"))
+        let run = timeout(Duration::from_secs(6), codex.run(&worktree, "test"))
             .await
             .expect("Codex run should not wait forever after task completion")
             .unwrap();
@@ -438,8 +449,9 @@ python3 -c 'import sys, time; output_path = sys.argv[1]; print("{\"type\":\"thre
 
         let codex = CodexCli::new(bin.display().to_string(), "test-model", "low")
             .with_exit_after_completion_timeout(Duration::from_secs(2));
+        let worktree = worktree_at(temp.path());
 
-        let run = timeout(Duration::from_secs(3), codex.run(temp.path(), "test"))
+        let run = timeout(Duration::from_secs(3), codex.run(&worktree, "test"))
             .await
             .expect("Codex run should wait for ordinary graceful exit after completion")
             .unwrap();
