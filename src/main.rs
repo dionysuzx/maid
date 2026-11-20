@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let _daemon_lock = DaemonLock::acquire(config.daemon_pid_path.clone())?;
-    wipe_agent_scratch(&config.scratch_dir).await?;
+    wipe_agent_scratch(&config.scratch_dir, &config.git_dir).await?;
     let polling_metrics = PollingMetrics::new();
     let metrics_endpoint =
         PollingMetricsEndpoint::bind(config.metrics_bind_address, polling_metrics.clone()).await?;

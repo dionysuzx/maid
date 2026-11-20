@@ -63,14 +63,46 @@ impl Drop for AgentScratch {
     }
 }
 
-/// Deletes `root` and anything left under it. Called at daemon startup, before tasks run.
-pub async fn wipe_agent_scratch(root: &Path) -> Result<()> {
+/// Deletes leftover scratch under `root`. A `git_dir` inside `root` is left in place.
+/// Called at daemon startup, before tasks run.
+pub async fn wipe_agent_scratch(root: &Path, git_dir: &Path) -> Result<()> {
     let root = root.to_path_buf();
+    let git_dir = git_dir.to_path_buf();
     let displayed = root.display().to_string();
-    tokio::task::spawn_blocking(move || remove_scratch_sync(&root))
+    tokio::task::spawn_blocking(move || wipe_scratch_sync(&root, &git_dir))
         .await
         .context("failed to wipe agent scratch")?
         .with_context(|| format!("failed to wipe {displayed}"))
+}
+
+fn wipe_scratch_sync(root: &Path, git_dir: &Path) -> std::io::Result<()> {
+    if overlaps(root, git_dir) {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if overlaps(&path, git_dir) || !is_scratch_id(path.file_name()) {
+                continue;
+            }
+            remove_scratch_sync(&path)?;
+        }
+        return Ok(());
+    }
+    remove_scratch_sync(root)
+}
+
+fn overlaps(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn is_scratch_id(name: Option<&std::ffi::OsStr>) -> bool {
+    let Some(name) = name.and_then(|name| name.to_str()) else {
+        return false;
+    };
+    !name.is_empty() && name.chars().all(|char| char.is_ascii_hexdigit())
 }
 
 fn remove_scratch_sync(path: &Path) -> std::io::Result<()> {
@@ -79,22 +111,29 @@ fn remove_scratch_sync(path: &Path) -> std::io::Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     }
-    make_dirs_writable(path)?;
-    std::fs::remove_dir_all(path)
+    make_dirs_writable(path);
+    match std::fs::remove_dir_all(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
-fn make_dirs_writable(path: &Path) -> std::io::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
+fn make_dirs_writable(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
     if !metadata.is_dir() {
-        return Ok(());
+        return;
     }
     let mut permissions = metadata.permissions();
     permissions.set_mode(permissions.mode() | 0o700);
-    std::fs::set_permissions(path, permissions)?;
-    for entry in std::fs::read_dir(path)? {
-        make_dirs_writable(&entry?.path())?;
+    let _ = std::fs::set_permissions(path, permissions);
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        make_dirs_writable(&entry.path());
     }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -264,9 +303,37 @@ mod tests {
             leftover
         };
         assert!(leftover.exists());
-        wipe_agent_scratch(root.path()).await.unwrap();
+        wipe_agent_scratch(root.path(), std::path::Path::new("/outside-git"))
+            .await
+            .unwrap();
         assert!(!leftover.exists());
         assert!(!root.path().exists());
+    }
+
+    #[tokio::test]
+    async fn wipe_keeps_a_git_dir_that_lives_under_the_scratch_root() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("tmp");
+        let git_dir = scratch.join("git");
+        let repo = git_dir.join("repo.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let leftover = scratch.join("a1");
+        std::fs::create_dir_all(&leftover).unwrap();
+        lock_directory(&leftover.join("pkg"));
+        std::fs::write(scratch.join("notes"), "keep\n").unwrap();
+
+        wipe_agent_scratch(&scratch, &git_dir).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("HEAD")).unwrap(),
+            "ref: refs/heads/main\n"
+        );
+        assert!(!leftover.exists());
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("notes")).unwrap(),
+            "keep\n"
+        );
     }
 
     fn lock_directory(path: &std::path::Path) {
