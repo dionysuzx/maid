@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
     .with_reviewed_head_store(FileReviewedHeadStore::new(
         config.reviewed_head_ledger_path.clone(),
     ))
+    .with_polling_metrics(polling_metrics.clone())
     .into_concurrent(config.max_concurrent_requests);
 
     let task_limit_per_24h = config

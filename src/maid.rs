@@ -16,6 +16,7 @@ use crate::mention_thread::{
     MentionThreadPlan, MentionThreadRead, choose_mention_thread_read, plan_mention_thread,
 };
 use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNotificationStore};
+use crate::polling_metrics::{PollingMetrics, ReviewKind};
 use crate::reviewed_head::{MemoryReviewedHeadStore, ReviewedHeadStore};
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
 use anyhow::{Result, bail};
@@ -116,6 +117,7 @@ pub struct Maid<G, R> {
     pending_handled_markers: Arc<dyn PendingHandledMarkerStore>,
     observed_notifications: Arc<dyn ObservedNotificationStore>,
     reviewed_heads: Arc<dyn ReviewedHeadStore>,
+    metrics: PollingMetrics,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,6 +213,7 @@ where
             pending_handled_markers: Arc::new(MemoryPendingHandledMarkerStore::default()),
             observed_notifications: Arc::new(MemoryObservedNotificationStore::default()),
             reviewed_heads: Arc::new(MemoryReviewedHeadStore::default()),
+            metrics: PollingMetrics::new(),
         }
     }
 
@@ -282,6 +285,11 @@ where
         reviewed_heads: impl ReviewedHeadStore + 'static,
     ) -> Self {
         self.reviewed_heads = Arc::new(reviewed_heads);
+        self
+    }
+
+    pub fn with_polling_metrics(mut self, metrics: PollingMetrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -839,7 +847,8 @@ where
     }
 
     async fn finish_task(&self, task: Box<StartedTask>) -> Result<()> {
-        match *task {
+        let kind = task.review_kind();
+        let result = match *task {
             StartedTask::Mention {
                 notification,
                 mention,
@@ -848,7 +857,9 @@ where
             StartedTask::AutoReviewPullRequest { pr, task, tree } => {
                 self.finish_auto_review_task(pr, task, tree).await
             }
-        }
+        };
+        self.metrics.record_review(kind, result.is_ok());
+        result
     }
 
     async fn finish_mention_task(
@@ -1333,6 +1344,13 @@ enum StartedTask {
 }
 
 impl StartedTask {
+    fn review_kind(&self) -> ReviewKind {
+        match self {
+            Self::Mention { .. } => ReviewKind::Mention,
+            Self::AutoReviewPullRequest { .. } => ReviewKind::PullRequestOpened,
+        }
+    }
+
     fn log_failure(&self, err: &anyhow::Error) {
         match self {
             Self::Mention {

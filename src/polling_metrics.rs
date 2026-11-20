@@ -13,10 +13,46 @@ use tokio::{
 };
 
 const METRIC_NAME: &str = "maid_last_successful_poll_timestamp_seconds";
+const REVIEWS_METRIC: &str = "maid_reviews_total";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewKind {
+    Mention,
+    PullRequestOpened,
+}
+
+impl ReviewKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::PullRequestOpened => "pull_request_opened",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReviewCounts {
+    mention_succeeded: AtomicU64,
+    mention_failed: AtomicU64,
+    pull_request_opened_succeeded: AtomicU64,
+    pull_request_opened_failed: AtomicU64,
+}
+
+impl ReviewCounts {
+    fn counter(&self, kind: ReviewKind, succeeded: bool) -> &AtomicU64 {
+        match (kind, succeeded) {
+            (ReviewKind::Mention, true) => &self.mention_succeeded,
+            (ReviewKind::Mention, false) => &self.mention_failed,
+            (ReviewKind::PullRequestOpened, true) => &self.pull_request_opened_succeeded,
+            (ReviewKind::PullRequestOpened, false) => &self.pull_request_opened_failed,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct PollingMetrics {
     last_successful_poll: Arc<AtomicU64>,
+    reviews: Arc<ReviewCounts>,
 }
 
 impl PollingMetrics {
@@ -33,6 +69,12 @@ impl PollingMetrics {
             .store(timestamp, Ordering::Relaxed);
     }
 
+    pub fn record_review(&self, kind: ReviewKind, succeeded: bool) {
+        self.reviews
+            .counter(kind, succeeded)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn render(&self) -> String {
         let timestamp = self.last_successful_poll.load(Ordering::Relaxed);
         let mut body = format!(
@@ -41,6 +83,23 @@ impl PollingMetrics {
         );
         if timestamp != 0 {
             body.push_str(&format!("{METRIC_NAME} {timestamp}\n"));
+        }
+        body.push_str(&format!(
+            "# HELP {REVIEWS_METRIC} Reviews Maid has finished.\n\
+             # TYPE {REVIEWS_METRIC} counter\n"
+        ));
+        for kind in [ReviewKind::Mention, ReviewKind::PullRequestOpened] {
+            for succeeded in [true, false] {
+                let outcome = if succeeded { "succeeded" } else { "failed" };
+                let count = self
+                    .reviews
+                    .counter(kind, succeeded)
+                    .load(Ordering::Relaxed);
+                body.push_str(&format!(
+                    "{REVIEWS_METRIC}{{outcome=\"{outcome}\",kind=\"{}\"}} {count}\n",
+                    kind.as_str()
+                ));
+            }
         }
         body
     }
@@ -114,5 +173,29 @@ mod tests {
         metrics.last_successful_poll.store(42, Ordering::Relaxed);
 
         assert!(metrics.render().contains(&format!("{METRIC_NAME} 42\n")));
+    }
+
+    #[test]
+    fn renders_finished_review_counts() {
+        let metrics = PollingMetrics::new();
+        metrics.record_review(ReviewKind::Mention, true);
+        metrics.record_review(ReviewKind::Mention, true);
+        metrics.record_review(ReviewKind::PullRequestOpened, false);
+
+        let rendered = metrics.render();
+
+        assert!(rendered.contains("# TYPE maid_reviews_total counter\n"));
+        assert!(
+            rendered.contains("maid_reviews_total{outcome=\"succeeded\",kind=\"mention\"} 2\n")
+        );
+        assert!(rendered.contains("maid_reviews_total{outcome=\"failed\",kind=\"mention\"} 0\n"));
+        assert!(rendered.contains(
+            "maid_reviews_total{outcome=\"succeeded\",kind=\"pull_request_opened\"} 0\n"
+        ));
+        assert!(
+            rendered.contains(
+                "maid_reviews_total{outcome=\"failed\",kind=\"pull_request_opened\"} 1\n"
+            )
+        );
     }
 }
