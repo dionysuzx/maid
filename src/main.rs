@@ -15,7 +15,7 @@ use maid::{
     worktree::GitWorktrees,
 };
 use std::{sync::Arc, time::Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -26,6 +26,10 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let _daemon_lock = DaemonLock::acquire(config.daemon_pid_path.clone())?;
+    let worktrees = GitWorktrees::new(config.git_dir.clone(), config.github_token.clone());
+    if let Err(err) = worktrees.remove_leftover_workspaces().await {
+        warn!(error = ?err, "failed to remove leftover workspaces");
+    }
     let polling_metrics = PollingMetrics::new();
     let metrics_endpoint =
         PollingMetricsEndpoint::bind(config.metrics_bind_address, polling_metrics.clone()).await?;
@@ -37,7 +41,7 @@ async fn main() -> Result<()> {
             config.github_api_requests_per_hour,
             config.github_notification_window,
         ),
-        GitWorktrees::new(config.git_dir.clone(), config.github_token.clone()),
+        worktrees,
         AgentPanel::new(config.agents.iter().map(agent).collect())?,
         config.prompts.clone(),
         config.bot_login.clone(),

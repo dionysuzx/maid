@@ -1,11 +1,12 @@
-use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun};
+use crate::{
+    agent::{Agent, AgentKind, AgentLabel, AgentRun},
+    workspace::Workspace,
+};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
-use tempfile::NamedTempFile;
+use std::{process::Stdio, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -50,11 +51,10 @@ impl Agent for CodexCli {
         &self.label
     }
 
-    async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun> {
-        let output_file = NamedTempFile::new().context("failed to create Codex output file")?;
-        let output_path = output_file.path().to_path_buf();
+    async fn run(&self, workspace: &Workspace, prompt: &str) -> Result<AgentRun> {
+        let output_path = workspace.tmp().join("codex-last-message.md");
 
-        let mut command = Command::new(&self.bin);
+        let mut command = workspace.command(&self.bin);
         command.arg("--ask-for-approval").arg("never");
         command.arg("--model").arg(&self.label.model);
         command.arg("--config").arg(codex_config_string(
@@ -72,7 +72,6 @@ impl Agent for CodexCli {
             .arg("--output-last-message")
             .arg(&output_path)
             .arg("-")
-            .current_dir(worktree)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -109,7 +108,7 @@ impl Agent for CodexCli {
             stdout,
             events.clone(),
             completed_tx,
-            worktree.display().to_string(),
+            workspace.checkout().display().to_string(),
         ));
         let status = tokio::select! {
             status = child.wait() => Some(status.context("Codex failed to run")?),
@@ -364,10 +363,13 @@ exit 0
 
         let codex = CodexCli::new(bin.display().to_string(), "test-model", "low");
 
-        let run = timeout(Duration::from_secs(3), codex.run(temp.path(), "test"))
-            .await
-            .expect("Codex run should not wait for inherited stdout forever")
-            .unwrap();
+        let run = timeout(
+            Duration::from_secs(3),
+            codex.run(&Workspace::create_in(temp.path()).unwrap(), "test"),
+        )
+        .await
+        .expect("Codex run should not wait for inherited stdout forever")
+        .unwrap();
 
         assert_eq!(run.response, "file final");
         assert_eq!(run.session_id.as_deref(), Some("session-1"));
@@ -402,10 +404,13 @@ sleep 5
         let codex = CodexCli::new(bin.display().to_string(), "test-model", "low")
             .with_exit_after_completion_timeout(Duration::from_millis(100));
 
-        let run = timeout(Duration::from_secs(6), codex.run(temp.path(), "test"))
-            .await
-            .expect("Codex run should not wait forever after task completion")
-            .unwrap();
+        let run = timeout(
+            Duration::from_secs(6),
+            codex.run(&Workspace::create_in(temp.path()).unwrap(), "test"),
+        )
+        .await
+        .expect("Codex run should not wait forever after task completion")
+        .unwrap();
 
         assert_eq!(run.response, "file final");
         assert_eq!(run.session_id.as_deref(), Some("session-1"));
@@ -439,10 +444,13 @@ python3 -c 'import sys, time; output_path = sys.argv[1]; print("{\"type\":\"thre
         let codex = CodexCli::new(bin.display().to_string(), "test-model", "low")
             .with_exit_after_completion_timeout(Duration::from_secs(2));
 
-        let run = timeout(Duration::from_secs(3), codex.run(temp.path(), "test"))
-            .await
-            .expect("Codex run should wait for ordinary graceful exit after completion")
-            .unwrap();
+        let run = timeout(
+            Duration::from_secs(3),
+            codex.run(&Workspace::create_in(temp.path()).unwrap(), "test"),
+        )
+        .await
+        .expect("Codex run should wait for ordinary graceful exit after completion")
+        .unwrap();
 
         assert_eq!(run.response, "file final after graceful exit");
         assert_eq!(run.session_id.as_deref(), Some("session-1"));

@@ -1,9 +1,12 @@
-use crate::agent::{Agent, AgentKind, AgentLabel, AgentRun};
+use crate::{
+    agent::{Agent, AgentKind, AgentLabel, AgentRun},
+    workspace::Workspace,
+};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{path::Path, process::Stdio};
-use tokio::{io::AsyncWriteExt, process::Command};
+use std::process::Stdio;
+use tokio::io::AsyncWriteExt;
 
 /// Runs Claude Code in print mode without permission checks, matching Codex's
 /// full-access sandbox.
@@ -36,8 +39,9 @@ impl Agent for ClaudeCli {
         &self.label
     }
 
-    async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun> {
-        let mut child = Command::new(&self.bin)
+    async fn run(&self, workspace: &Workspace, prompt: &str) -> Result<AgentRun> {
+        let mut child = workspace
+            .command(&self.bin)
             .arg("--print")
             .arg("--output-format")
             .arg("json")
@@ -46,7 +50,6 @@ impl Agent for ClaudeCli {
             .arg(&self.label.model)
             .arg("--effort")
             .arg(&self.label.effort)
-            .current_dir(worktree)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -98,8 +101,8 @@ struct ClaudeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::{fs, path::Path};
 
     fn fake_claude(dir: &Path, script: &str) -> String {
         let bin = dir.join("fake-claude");
@@ -122,8 +125,10 @@ printf '%s' '{"type":"result","subtype":"success","is_error":false,"result":"  r
 "#,
         );
 
+        let workspace = Workspace::create_in(temp.path()).unwrap();
+
         let run = ClaudeCli::new(bin, "claude-opus-5-5", "high")
-            .run(temp.path(), "please review")
+            .run(&workspace, "please review")
             .await
             .unwrap();
 
@@ -135,11 +140,11 @@ printf '%s' '{"type":"result","subtype":"success","is_error":false,"result":"  r
             }
         );
         assert_eq!(
-            fs::read_to_string(temp.path().join("args")).unwrap(),
+            fs::read_to_string(workspace.checkout().join("args")).unwrap(),
             "--print --output-format json --dangerously-skip-permissions --model claude-opus-5-5 --effort high\n"
         );
         assert_eq!(
-            fs::read_to_string(temp.path().join("prompt")).unwrap(),
+            fs::read_to_string(workspace.checkout().join("prompt")).unwrap(),
             "please review"
         );
     }
@@ -157,7 +162,7 @@ exit 1
         );
 
         let err = ClaudeCli::new(bin, "opus", "high")
-            .run(temp.path(), "p")
+            .run(&Workspace::create_in(temp.path()).unwrap(), "p")
             .await
             .unwrap_err();
 
