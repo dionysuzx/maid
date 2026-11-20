@@ -15,4 +15,5 @@ pub mod observed_notification;
 pub mod polling_metrics;
 pub mod reviewed_head;
 pub mod task_limit;
+pub mod workspace;
 pub mod worktree;
