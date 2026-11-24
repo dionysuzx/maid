@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -137,21 +137,36 @@ pub async fn remove_leftovers_in(parent: PathBuf) -> io::Result<()> {
     .await?
 }
 
+/// A leftover is a directory laid out exactly like a workspace whose lock
+/// nobody holds.
 fn remove_if_leftover(root: &Path) -> io::Result<()> {
-    if !fs::symlink_metadata(root)?.is_dir() {
+    if !fs::symlink_metadata(root)?.is_dir() || !has_workspace_layout(root)? {
         return Ok(());
     }
-    let lock_path = root.join(LOCK_FILE);
-    match fs::symlink_metadata(&lock_path) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Ok(metadata) if !metadata.is_file() => return Ok(()),
-        metadata => metadata?,
-    };
-    let lock = File::open(lock_path)?;
-    if lock.try_lock().is_err() {
-        return Ok(());
+    // Opened for writing because NFS refuses an exclusive lock otherwise.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join(LOCK_FILE))?;
+    match lock.try_lock() {
+        Ok(()) => remove_workspace(root),
+        Err(TryLockError::WouldBlock) => Ok(()),
+        Err(TryLockError::Error(err)) => Err(err),
     }
-    remove_workspace(root)
+}
+
+/// Holds a regular lock file and nothing besides `checkout` and `tmp`.
+fn has_workspace_layout(root: &Path) -> io::Result<bool> {
+    let mut has_lock = false;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        match entry.file_name().to_str() {
+            Some(LOCK_FILE) => has_lock = entry.file_type()?.is_file(),
+            Some("checkout" | "tmp") => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(has_lock)
 }
 
 /// Removes the workspace's contents before its lock file, so a failed
@@ -272,6 +287,10 @@ pub(crate) mod tests {
         fs::write(parent.path().join("file"), "").unwrap();
         let not_a_lock = parent.path().join("not-a-lock");
         fs::create_dir_all(not_a_lock.join(LOCK_FILE)).unwrap();
+        let not_a_workspace = parent.path().join("not-a-workspace");
+        fs::create_dir(&not_a_workspace).unwrap();
+        fs::write(not_a_workspace.join(LOCK_FILE), "").unwrap();
+        fs::write(not_a_workspace.join("data"), "").unwrap();
 
         remove_leftovers_in(parent.path().to_path_buf())
             .await
@@ -282,6 +301,7 @@ pub(crate) mod tests {
         assert!(other.join("config.toml").is_file());
         assert!(parent.path().join("file").is_file());
         assert!(not_a_lock.join(LOCK_FILE).is_dir());
+        assert!(not_a_workspace.join("data").is_file());
     }
 
     #[tokio::test]
