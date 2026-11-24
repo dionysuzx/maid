@@ -338,13 +338,11 @@ mod tests {
             ..issue("o", "r")
         });
         let live = worktrees.prepare(&issue).await.unwrap();
-        let leftover = worktrees.prepare(&issue).await.unwrap();
-        let leftover_root = leftover.workspace().root().to_path_buf();
-        drop(leftover);
+        let leftover = crate::workspace::tests::leftover_in(&worktrees.workspaces_dir());
 
         worktrees.remove_leftover_workspaces().await.unwrap();
 
-        assert!(!leftover_root.exists());
+        assert!(!leftover.exists());
         assert_eq!(read_checkout_file(&live), "hello\n");
         worktrees.cleanup(live).await.unwrap();
         let repo = worktrees.repo_dir(&issue).unwrap();

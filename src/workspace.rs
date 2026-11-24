@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
 use std::{
     fs::{self, File, OpenOptions},
     io,
@@ -9,8 +9,9 @@ use std::{
 use tokio::process::Command;
 use tracing::warn;
 
-/// Held locked by the run that owns the workspace, so startup can tell
-/// leftovers from live runs and from directories Maid did not create.
+/// Held locked by the run that owns the workspace and by the agent process it
+/// starts, so startup can tell leftovers from live runs, including an agent
+/// that outlived a killed Maid, and from directories Maid did not create.
 const LOCK_FILE: &str = "workspace.lock";
 
 /// Where one agent run works: `<root>/checkout` holds the code and
@@ -84,13 +85,28 @@ impl Workspace {
     }
 
     /// A command for `program` that runs in the checkout and keeps its temp
-    /// files in this workspace.
+    /// files in this workspace. The process inherits the workspace lock, so
+    /// the workspace stays live while it runs, even if Maid is killed.
     pub fn command(&self, program: &str) -> Command {
         let tmp = self.tmp();
         let mut command = Command::new(program);
         command.current_dir(self.checkout());
         for var in ["TMPDIR", "TMP", "TEMP"] {
             command.env(var, &tmp);
+        }
+        #[cfg(unix)]
+        if let Some(lock) = &self._lock {
+            let fd = lock.as_raw_fd();
+            // SAFETY: the closure only calls `fcntl`, which is
+            // async-signal-safe, on a descriptor this workspace keeps open.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
         command
     }
@@ -125,10 +141,13 @@ fn remove_if_leftover(root: &Path) -> io::Result<()> {
     if !fs::symlink_metadata(root)?.is_dir() {
         return Ok(());
     }
-    let lock = match File::open(root.join(LOCK_FILE)) {
+    let lock_path = root.join(LOCK_FILE);
+    match fs::symlink_metadata(&lock_path) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        lock => lock?,
+        Ok(metadata) if !metadata.is_file() => return Ok(()),
+        metadata => metadata?,
     };
+    let lock = File::open(lock_path)?;
     if lock.try_lock().is_err() {
         return Ok(());
     }
@@ -178,8 +197,19 @@ fn make_dirs_writable(path: &Path) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Lays out a workspace a killed run left, by hand, so no open lock file
+    /// can leak into processes other tests start in parallel.
+    pub(crate) fn leftover_in(parent: &Path) -> PathBuf {
+        let root = parent.join("leftover");
+        fs::create_dir_all(root.join("checkout")).unwrap();
+        fs::create_dir(root.join("tmp")).unwrap();
+        fs::write(root.join(LOCK_FILE), "").unwrap();
+        fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o555)).unwrap();
+        root
+    }
 
     #[tokio::test]
     async fn command_runs_in_the_checkout_with_the_workspace_temp_dir() {
@@ -235,23 +265,38 @@ mod tests {
     async fn removes_unlocked_workspaces_and_keeps_live_ones_and_other_data() {
         let parent = tempfile::tempdir().unwrap();
         let live = Workspace::create_in(parent.path()).unwrap();
-        let leftover = Workspace::create_in(parent.path()).unwrap();
-        let leftover_root = leftover.root().to_path_buf();
-        fs::set_permissions(leftover.tmp(), fs::Permissions::from_mode(0o555)).unwrap();
-        drop(leftover);
+        let leftover = leftover_in(parent.path());
         let other = parent.path().join("other");
         fs::create_dir(&other).unwrap();
         fs::write(other.join("config.toml"), "").unwrap();
         fs::write(parent.path().join("file"), "").unwrap();
+        let not_a_lock = parent.path().join("not-a-lock");
+        fs::create_dir_all(not_a_lock.join(LOCK_FILE)).unwrap();
 
         remove_leftovers_in(parent.path().to_path_buf())
             .await
             .unwrap();
 
-        assert!(!leftover_root.exists());
+        assert!(!leftover.exists());
         assert!(live.checkout().is_dir());
         assert!(other.join("config.toml").is_file());
         assert!(parent.path().join("file").is_file());
+        assert!(not_a_lock.join(LOCK_FILE).is_dir());
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_outlives_its_workspace_handle_keeps_it_live() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = Workspace::create_in(parent.path()).unwrap();
+        let root = workspace.root().to_path_buf();
+        let mut agent = workspace.command("sleep").arg("30").spawn().unwrap();
+        drop(workspace);
+
+        remove_leftovers_in(parent.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(root.join("checkout").is_dir());
+        agent.kill().await.unwrap();
     }
 
     #[tokio::test]
