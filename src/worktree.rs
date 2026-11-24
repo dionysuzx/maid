@@ -40,19 +40,20 @@ impl GitWorktrees {
             .join(format!("{}.git", target.repo())))
     }
 
-    /// Holds every run's workspace and nothing else, so it is safe to delete
-    /// whole. Kept short so socket paths under a workspace's `tmp` fit.
+    /// Holds every run's workspace. Kept short so socket paths under a
+    /// workspace's `tmp` fit.
     fn workspaces_dir(&self) -> PathBuf {
         self.root.join("runs")
     }
 
-    /// Deletes workspaces a killed run left behind. Call at startup, before
-    /// any run starts; `cleanup` later prunes their git worktree records.
+    /// Deletes workspaces a killed run left behind, keeping live ones even
+    /// when another Maid shares this git dir. Call at startup; `cleanup`
+    /// later prunes their git worktree records.
     pub async fn remove_leftover_workspaces(&self) -> Result<()> {
         let dir = self.workspaces_dir();
-        workspace::remove_dir(dir.clone())
+        workspace::remove_leftovers_in(dir.clone())
             .await
-            .with_context(|| format!("failed to remove {}", dir.display()))
+            .with_context(|| format!("failed to read {}", dir.display()))
     }
 
     async fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<()> {
@@ -328,7 +329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removes_workspaces_a_killed_run_left_and_keeps_repositories() {
+    async fn removes_workspaces_a_killed_run_left_and_keeps_live_ones() {
         let temp = tempfile::tempdir().unwrap();
         let source = source_repo(temp.path());
         let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
@@ -336,14 +337,16 @@ mod tests {
             clone_url: source.to_string_lossy().to_string(),
             ..issue("o", "r")
         });
+        let live = worktrees.prepare(&issue).await.unwrap();
         let leftover = worktrees.prepare(&issue).await.unwrap();
+        let leftover_root = leftover.workspace().root().to_path_buf();
+        drop(leftover);
 
         worktrees.remove_leftover_workspaces().await.unwrap();
 
-        assert!(!leftover.workspace().root().exists());
-        let next = worktrees.prepare(&issue).await.unwrap();
-        assert_eq!(read_checkout_file(&next), "hello\n");
-        worktrees.cleanup(next).await.unwrap();
+        assert!(!leftover_root.exists());
+        assert_eq!(read_checkout_file(&live), "hello\n");
+        worktrees.cleanup(live).await.unwrap();
         let repo = worktrees.repo_dir(&issue).unwrap();
         assert_eq!(run_git(&repo, &["worktree", "list"]).lines().count(), 1);
     }

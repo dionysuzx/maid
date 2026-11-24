@@ -1,40 +1,74 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    fs, io,
+    fs::{self, File, OpenOptions},
+    io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::process::Command;
+use tracing::warn;
+
+/// Held locked by the run that owns the workspace, so startup can tell
+/// leftovers from live runs and from directories Maid did not create.
+const LOCK_FILE: &str = "workspace.lock";
 
 /// Where one agent run works: `<root>/checkout` holds the code and
 /// `<root>/tmp` is the run's temp directory, so venvs and caches the agent
 /// creates stay out of the checkout and out of the shared `/tmp`.
 ///
-/// Workspaces are created under one parent directory that holds nothing else,
-/// so removing that parent at startup clears runs a crash left behind.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A workspace made by `create_in` stays locked until it and its clones are
+/// dropped, so `remove_leftovers_in` skips it.
+#[derive(Clone, Debug)]
 pub struct Workspace {
     root: PathBuf,
+    _lock: Option<Arc<File>>,
 }
 
+impl PartialEq for Workspace {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for Workspace {}
+
 impl Workspace {
+    /// A workspace at an existing path, without a lock.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            _lock: None,
+        }
     }
 
-    /// Creates an empty workspace with a short random name under `parent`,
-    /// readable only by Maid's user. The short path keeps Unix socket paths
-    /// under `tmp` within OS limits.
+    /// Creates an empty, locked workspace with a short random name under
+    /// `parent`, readable only by Maid's user. The short path keeps Unix
+    /// socket paths under `tmp` within OS limits.
     pub fn create_in(parent: &Path) -> io::Result<Self> {
         fs::create_dir_all(parent)?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("");
         #[cfg(unix)]
         builder.permissions(fs::Permissions::from_mode(0o700));
-        let workspace = Self::new(builder.tempdir_in(parent)?.keep());
-        fs::create_dir(workspace.checkout())?;
-        fs::create_dir(workspace.tmp())?;
-        Ok(workspace)
+        // Deletes the directory if any step below fails.
+        let dir = builder.tempdir_in(parent)?;
+        // Lock under a temporary name and rename, so a startup sweep never
+        // sees an unlocked lock file in a workspace that is being created.
+        let pending = dir.path().join("workspace.lock.new");
+        let lock = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&pending)?;
+        lock.lock()?;
+        fs::rename(&pending, dir.path().join(LOCK_FILE))?;
+        let unlocked = Self::new(dir.path());
+        fs::create_dir(unlocked.checkout())?;
+        fs::create_dir(unlocked.tmp())?;
+        Ok(Self {
+            root: dir.keep(),
+            _lock: Some(Arc::new(lock)),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -62,21 +96,62 @@ impl Workspace {
     }
 
     pub async fn remove(&self) -> io::Result<()> {
-        remove_dir(self.root.clone()).await
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || remove_workspace(&root)).await?
     }
 }
 
-/// Removes `path` and everything under it, including read-only directories
-/// such as a Go module cache. A missing path counts as removed.
-pub async fn remove_dir(path: PathBuf) -> io::Result<()> {
+/// Removes workspaces under `parent` that a killed run left behind: those
+/// whose lock file is not held. Live workspaces, including another Maid's,
+/// and anything without a lock file are left alone. Failures are logged.
+pub async fn remove_leftovers_in(parent: PathBuf) -> io::Result<()> {
     tokio::task::spawn_blocking(move || {
-        make_dirs_writable(&path);
-        match fs::remove_dir_all(&path) {
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            result => result,
+        let entries = match fs::read_dir(&parent) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            entries => entries?,
+        };
+        for entry in entries {
+            let root = entry?.path();
+            if let Err(err) = remove_if_leftover(&root) {
+                warn!(path = %root.display(), error = ?err, "failed to remove leftover workspace");
+            }
         }
+        Ok(())
     })
     .await?
+}
+
+fn remove_if_leftover(root: &Path) -> io::Result<()> {
+    if !fs::symlink_metadata(root)?.is_dir() {
+        return Ok(());
+    }
+    let lock = match File::open(root.join(LOCK_FILE)) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        lock => lock?,
+    };
+    if lock.try_lock().is_err() {
+        return Ok(());
+    }
+    remove_workspace(root)
+}
+
+/// Removes the workspace's contents before its lock file, so a failed
+/// removal leaves a workspace the next startup still recognizes. Read-only
+/// directories, such as a Go module cache, are made writable first. A
+/// missing workspace counts as removed.
+fn remove_workspace(root: &Path) -> io::Result<()> {
+    make_dirs_writable(root);
+    let workspace = Workspace::new(root);
+    for dir in [workspace.checkout(), workspace.tmp()] {
+        match fs::remove_dir_all(dir) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+            _ => {}
+        }
+    }
+    match fs::remove_dir_all(root) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 /// Best effort: anything left read-only surfaces as the `remove_dir_all` error.
@@ -157,9 +232,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_a_missing_directory_succeeds() {
+    async fn removes_unlocked_workspaces_and_keeps_live_ones_and_other_data() {
+        let parent = tempfile::tempdir().unwrap();
+        let live = Workspace::create_in(parent.path()).unwrap();
+        let leftover = Workspace::create_in(parent.path()).unwrap();
+        let leftover_root = leftover.root().to_path_buf();
+        fs::set_permissions(leftover.tmp(), fs::Permissions::from_mode(0o555)).unwrap();
+        drop(leftover);
+        let other = parent.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("config.toml"), "").unwrap();
+        fs::write(parent.path().join("file"), "").unwrap();
+
+        remove_leftovers_in(parent.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert!(!leftover_root.exists());
+        assert!(live.checkout().is_dir());
+        assert!(other.join("config.toml").is_file());
+        assert!(parent.path().join("file").is_file());
+    }
+
+    #[tokio::test]
+    async fn removing_leftovers_from_a_missing_directory_succeeds() {
         let parent = tempfile::tempdir().unwrap();
 
-        remove_dir(parent.path().join("missing")).await.unwrap();
+        remove_leftovers_in(parent.path().join("missing"))
+            .await
+            .unwrap();
     }
 }
