@@ -1,3 +1,5 @@
+![Keruvim banner](assets/keruvim-banner.jpg)
+
 Keruvim is a GitHub bot that reviews pull requests and answers mentions with local
 coding agents (Codex and Claude Code), posting every agent's reply in one comment.
 
