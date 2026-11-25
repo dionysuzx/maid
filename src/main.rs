@@ -1,5 +1,6 @@
 use anyhow::Result;
-use maid::{
+use std::{sync::Arc, time::Duration};
+use thoth::{
     agent::{Agent, AgentKind, AgentPanel},
     claude::ClaudeCli,
     codex::CodexCli,
@@ -7,14 +8,13 @@ use maid::{
     daemon_lock::DaemonLock,
     github::GitHubRestClient,
     handled_marker::FilePendingHandledMarkerStore,
-    maid::Maid,
     observed_notification::FileObservedNotificationStore,
     polling_metrics::{PollingMetrics, PollingMetricsEndpoint},
     reviewed_head::FileReviewedHeadStore,
     task_limit::FileTaskStartRecorder,
+    thoth::Thoth,
     worktree::GitWorktrees,
 };
-use std::{sync::Arc, time::Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
     let metrics_endpoint =
         PollingMetricsEndpoint::bind(config.metrics_bind_address, polling_metrics.clone()).await?;
     let metrics_server = tokio::spawn(metrics_endpoint.serve());
-    let maid = Maid::new(
+    let thoth = Thoth::new(
         GitHubRestClient::with_options(
             config.github_token.clone(),
             config.github_api_ip,
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     let poller_metrics = polling_metrics.clone();
     let poller = tokio::spawn(async move {
         loop {
-            match maid.run_once().await {
+            match thoth.run_once().await {
                 Ok(report) => {
                     poller_metrics.record_success();
                     info!(
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
         auto_review_requested_reviewers = config.auto_review_requested_reviewers.len(),
         review_cadence = ?config.review_cadence,
         metrics_bind_address = %config.metrics_bind_address,
-        "maid started"
+        "thoth started"
     );
 
     shutdown_signal().await;

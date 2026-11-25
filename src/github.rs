@@ -3,7 +3,7 @@ use crate::{
         CommentMention, CommitSha, Issue, Notification, OpenPullRequest, OpenPullRequestOrder,
         PullRequest, RepoSlug, RequestedReviewer, ReviewState, TeamSlug, TreeSha, WorkTarget,
     },
-    maid::GithubClient,
+    thoth::GithubClient,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -28,7 +28,7 @@ const MAX_RATE_LIMIT_RETRIES: usize = 5;
 /// How a request treats GitHub rate limiting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RateLimitPolicy {
-    /// Wait out backoffs and retry, for requests Maid needs.
+    /// Wait out backoffs and retry, for requests Thoth needs.
     Wait,
     /// Fail instead of waiting, for cosmetic requests. Backoffs are still recorded.
     Skip,
@@ -208,7 +208,7 @@ impl GitHubRestClient {
                 .bearer_auth(&self.token)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
-                .header("User-Agent", "maid");
+                .header("User-Agent", "thoth");
             for (name, value) in headers.iter() {
                 request = request.header(name, value);
             }
@@ -802,16 +802,16 @@ mod tests {
     fn lists_one_page_of_open_pull_requests_for_each_order() {
         let repo = RepoSlug {
             owner: "some-org".to_string(),
-            repo: "maid".to_string(),
+            repo: "thoth".to_string(),
         };
 
         assert_eq!(
             open_pull_requests_url(&repo, OpenPullRequestOrder::NewestCreated),
-            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=created&direction=desc&per_page=50"
+            "https://api.github.com/repos/some-org/thoth/pulls?state=open&sort=created&direction=desc&per_page=50"
         );
         assert_eq!(
             open_pull_requests_url(&repo, OpenPullRequestOrder::RecentlyUpdated),
-            "https://api.github.com/repos/some-org/maid/pulls?state=open&sort=updated&direction=desc&per_page=50"
+            "https://api.github.com/repos/some-org/thoth/pulls?state=open&sort=updated&direction=desc&per_page=50"
         );
     }
 
@@ -827,7 +827,7 @@ mod tests {
         assert_eq!(
             open.requested_reviewers,
             vec![
-                RequestedReviewer::parse("maid-bot").unwrap(),
+                RequestedReviewer::parse("thoth-bot").unwrap(),
                 RequestedReviewer::parse("some-org/eng-infra").unwrap()
             ]
         );
@@ -936,7 +936,7 @@ mod tests {
             }
         });
 
-        let pr_url = format!("http://{address}/repos/dionysuzx/maid/pulls/52");
+        let pr_url = format!("http://{address}/repos/dionysuzx/thoth/pulls/52");
         let notification = Notification {
             id: "1".to_string(),
             reason: "comment".to_string(),
@@ -990,7 +990,7 @@ mod tests {
     fn api_comment(url: &str, html_url: &str, created_at: &str) -> ApiComment {
         ApiComment {
             url: url.to_string(),
-            body: "@maid-bot review".to_string(),
+            body: "@thoth-bot review".to_string(),
             html_url: html_url.to_string(),
             created_at: created_at.to_string(),
             user: ApiUser {
@@ -1018,15 +1018,15 @@ mod tests {
 
     const PULL_REQUEST_WITH_REVIEWERS_FIXTURE: &str = r#"
 {
-  "url": "https://api.github.com/repos/some-org/maid/pulls/7",
-  "html_url": "https://github.com/some-org/maid/pull/7",
+  "url": "https://api.github.com/repos/some-org/thoth/pulls/7",
+  "html_url": "https://github.com/some-org/thoth/pull/7",
   "number": 7,
   "user": { "login": "octocat" },
   "created_at": "2026-10-01T00:00:00Z",
   "updated_at": "2026-10-21T18:00:00Z",
   "requested_reviewers": [
-    { "login": "Maid-Bot" },
-    { "login": "maid-bot" }
+    { "login": "Thoth-Bot" },
+    { "login": "thoth-bot" }
   ],
   "requested_teams": [
     {
@@ -1043,8 +1043,8 @@ mod tests {
   "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "base": {
     "repo": {
-      "name": "maid",
-      "clone_url": "https://github.com/some-org/maid.git",
+      "name": "thoth",
+      "clone_url": "https://github.com/some-org/thoth.git",
       "owner": { "login": "some-org" }
     }
   }
@@ -1053,8 +1053,8 @@ mod tests {
 
     const PULL_REQUEST_WITHOUT_REVIEWERS_FIXTURE: &str = r#"
 {
-  "url": "https://api.github.com/repos/some-org/maid/pulls/7",
-  "html_url": "https://github.com/some-org/maid/pull/7",
+  "url": "https://api.github.com/repos/some-org/thoth/pulls/7",
+  "html_url": "https://github.com/some-org/thoth/pull/7",
   "number": 7,
   "user": { "login": "octocat" },
   "created_at": "2026-10-21T18:00:00Z",
@@ -1062,8 +1062,8 @@ mod tests {
   "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "base": {
     "repo": {
-      "name": "maid",
-      "clone_url": "https://github.com/some-org/maid.git",
+      "name": "thoth",
+      "clone_url": "https://github.com/some-org/thoth.git",
       "owner": { "login": "some-org" }
     }
   }
@@ -1072,8 +1072,8 @@ mod tests {
 
     const PULL_REQUEST_WITH_NULL_REVIEWERS_FIXTURE: &str = r#"
 {
-  "url": "https://api.github.com/repos/some-org/maid/pulls/7",
-  "html_url": "https://github.com/some-org/maid/pull/7",
+  "url": "https://api.github.com/repos/some-org/thoth/pulls/7",
+  "html_url": "https://github.com/some-org/thoth/pull/7",
   "number": 7,
   "user": { "login": "octocat" },
   "created_at": "2026-10-21T18:00:00Z",
@@ -1083,8 +1083,8 @@ mod tests {
   "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "base": {
     "repo": {
-      "name": "maid",
-      "clone_url": "https://github.com/some-org/maid.git",
+      "name": "thoth",
+      "clone_url": "https://github.com/some-org/thoth.git",
       "owner": { "login": "some-org" }
     }
   }
@@ -1093,8 +1093,8 @@ mod tests {
 
     const PULL_REQUEST_WITH_UNUSABLE_TEAM_FIXTURE: &str = r#"
 {
-  "url": "https://api.github.com/repos/some-org/maid/pulls/7",
-  "html_url": "https://github.com/some-org/maid/pull/7",
+  "url": "https://api.github.com/repos/some-org/thoth/pulls/7",
+  "html_url": "https://github.com/some-org/thoth/pull/7",
   "number": 7,
   "user": { "login": "octocat" },
   "created_at": "2026-10-01T00:00:00Z",
@@ -1112,8 +1112,8 @@ mod tests {
   "head": { "sha": "0123456789abcdef0123456789abcdef01234567" },
   "base": {
     "repo": {
-      "name": "maid",
-      "clone_url": "https://github.com/some-org/maid.git",
+      "name": "thoth",
+      "clone_url": "https://github.com/some-org/thoth.git",
       "owner": { "login": "some-org" }
     }
   }

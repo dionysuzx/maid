@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// The last head Maid posted an automatic review for, per pull request.
+/// The last head Thoth posted an automatic review for, per pull request.
 pub trait ReviewedHeadStore: Send + Sync {
     fn last_reviewed(&self, pr: &PullRequest) -> Result<Option<ReviewedHead>>;
     /// Records the pull request's head, whose code is `tree`, as reviewed.

@@ -12,8 +12,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-const METRIC_NAME: &str = "maid_last_successful_poll_timestamp_seconds";
-const REVIEWS_METRIC: &str = "maid_reviews_total";
+const METRIC_NAME: &str = "thoth_last_successful_poll_timestamp_seconds";
+const REVIEWS_METRIC: &str = "thoth_reviews_total";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReviewKind {
@@ -78,14 +78,14 @@ impl PollingMetrics {
     fn render(&self) -> String {
         let timestamp = self.last_successful_poll.load(Ordering::Relaxed);
         let mut body = format!(
-            "# HELP {METRIC_NAME} Unix timestamp of Maid's last successful GitHub poll.\n\
+            "# HELP {METRIC_NAME} Unix timestamp of Thoth's last successful GitHub poll.\n\
              # TYPE {METRIC_NAME} gauge\n"
         );
         if timestamp != 0 {
             body.push_str(&format!("{METRIC_NAME} {timestamp}\n"));
         }
         body.push_str(&format!(
-            "# HELP {REVIEWS_METRIC} Reviews Maid has finished.\n\
+            "# HELP {REVIEWS_METRIC} Reviews Thoth has finished.\n\
              # TYPE {REVIEWS_METRIC} counter\n"
         ));
         for kind in [ReviewKind::Mention, ReviewKind::PullRequestOpened] {
@@ -184,17 +184,17 @@ mod tests {
 
         let rendered = metrics.render();
 
-        assert!(rendered.contains("# TYPE maid_reviews_total counter\n"));
+        assert!(rendered.contains("# TYPE thoth_reviews_total counter\n"));
         assert!(
-            rendered.contains("maid_reviews_total{outcome=\"succeeded\",kind=\"mention\"} 2\n")
+            rendered.contains("thoth_reviews_total{outcome=\"succeeded\",kind=\"mention\"} 2\n")
         );
-        assert!(rendered.contains("maid_reviews_total{outcome=\"failed\",kind=\"mention\"} 0\n"));
+        assert!(rendered.contains("thoth_reviews_total{outcome=\"failed\",kind=\"mention\"} 0\n"));
         assert!(rendered.contains(
-            "maid_reviews_total{outcome=\"succeeded\",kind=\"pull_request_opened\"} 0\n"
+            "thoth_reviews_total{outcome=\"succeeded\",kind=\"pull_request_opened\"} 0\n"
         ));
         assert!(
             rendered.contains(
-                "maid_reviews_total{outcome=\"failed\",kind=\"pull_request_opened\"} 1\n"
+                "thoth_reviews_total{outcome=\"failed\",kind=\"pull_request_opened\"} 1\n"
             )
         );
     }

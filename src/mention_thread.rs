@@ -163,8 +163,8 @@ mod tests {
 
     #[test]
     fn handled_latest_trusted_request_does_not_scan_old_comments() {
-        let latest = mention("dionysuzx", "@maid-bot done", "4");
-        let request = MentionRequest::parse(&latest.body, "maid-bot")
+        let latest = mention("dionysuzx", "@thoth-bot done", "4");
+        let request = MentionRequest::parse(&latest.body, "thoth-bot")
             .unwrap()
             .unwrap();
 
@@ -173,7 +173,7 @@ mod tests {
                 &latest,
                 Some(&request),
                 Some(ReviewState::Handled),
-                "maid-bot"
+                "thoth-bot"
             ),
             MentionThreadRead::LatestOnly
         );
@@ -181,18 +181,18 @@ mod tests {
 
     #[test]
     fn latest_bot_comment_scans_recent_comments() {
-        let latest = mention("maid-bot", "codex response", "4");
+        let latest = mention("thoth-bot", "codex response", "4");
 
         assert_eq!(
-            choose_mention_thread_read(&latest, None, None, "maid-bot"),
+            choose_mention_thread_read(&latest, None, None, "thoth-bot"),
             MentionThreadRead::RecentComments
         );
     }
 
     #[test]
     fn pending_marker_is_marked_without_starting_task() {
-        let mention = mention("dionysuzx", "@maid-bot review", "2");
-        let request = MentionRequest::parse(&mention.body, "maid-bot")
+        let mention = mention("dionysuzx", "@thoth-bot review", "2");
+        let request = MentionRequest::parse(&mention.body, "thoth-bot")
             .unwrap()
             .unwrap();
 
@@ -212,8 +212,8 @@ mod tests {
 
     #[test]
     fn pending_request_starts_task_and_leaves_notification_unread() {
-        let mention = mention("dionysuzx", "@maid-bot review", "2");
-        let request = MentionRequest::parse(&mention.body, "maid-bot")
+        let mention = mention("dionysuzx", "@thoth-bot review", "2");
+        let request = MentionRequest::parse(&mention.body, "thoth-bot")
             .unwrap()
             .unwrap();
 
@@ -230,12 +230,12 @@ mod tests {
 
     #[test]
     fn pending_requests_each_start_tasks() {
-        let older = mention("dionysuzx", "@maid-bot review old head", "2");
-        let newer = mention("dionysuzx", "@maid-bot review latest head", "3");
-        let older_request = MentionRequest::parse(&older.body, "maid-bot")
+        let older = mention("dionysuzx", "@thoth-bot review old head", "2");
+        let newer = mention("dionysuzx", "@thoth-bot review latest head", "3");
+        let older_request = MentionRequest::parse(&older.body, "thoth-bot")
             .unwrap()
             .unwrap();
-        let newer_request = MentionRequest::parse(&newer.body, "maid-bot")
+        let newer_request = MentionRequest::parse(&newer.body, "thoth-bot")
             .unwrap()
             .unwrap();
 

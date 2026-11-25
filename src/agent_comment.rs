@@ -3,7 +3,7 @@ use crate::{agent::AgentLabel, domain::CommitSha};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentReply<'a> {
     Responded(&'a str),
-    /// Maid logs the error rather than posting it, since stderr can hold
+    /// Thoth logs the error rather than posting it, since stderr can hold
     /// details that do not belong in a public comment.
     Failed,
 }
@@ -34,7 +34,7 @@ fn agent_section(label: &AgentLabel, commit: Option<&CommitSha>, reply: AgentRep
         .unwrap_or_default();
     let body = match reply {
         AgentReply::Responded(response) => response,
-        AgentReply::Failed => "Failed. The error is in Maid's logs.",
+        AgentReply::Failed => "Failed. The error is in Thoth's logs.",
     };
     format!("### {label}{at}\n\n{body}")
 }
@@ -86,7 +86,7 @@ mod tests {
             comment,
             format!(
                 "### codex · gpt-5.5 · high\nAt {sha}.\n\n1. **[P1] Bug.**\n\n---\n\n\
-                 ### claude · claude-opus-5-5 · high\nAt {sha}.\n\nFailed. The error is in Maid's logs.\n\n\
+                 ### claude · claude-opus-5-5 · high\nAt {sha}.\n\nFailed. The error is in Thoth's logs.\n\n\
                  <details>\n<summary>Input prompt</summary>\n\n```text\nplease review\n```\n\n</details>"
             )
         );
