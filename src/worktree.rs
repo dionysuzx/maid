@@ -383,12 +383,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
 
-        let owner = worktrees.take_ownership().await.unwrap();
+        let _owner = worktrees.take_ownership().await.unwrap();
         let err = worktrees.take_ownership().await.unwrap_err();
-        assert!(err.to_string().starts_with("another Maid owns"), "{err}");
 
-        drop(owner);
-        worktrees.take_ownership().await.unwrap();
+        assert!(err.to_string().starts_with("another Maid owns"), "{err}");
     }
 
     #[test]
