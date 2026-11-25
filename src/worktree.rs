@@ -3,16 +3,17 @@ use crate::{
     maid::{PreparedWorktree, Worktrees},
     workspace::{self, Workspace},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
 use std::{
     env,
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
     process::Stdio,
 };
 use tokio::process::Command;
+use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub struct GitWorktrees {
@@ -40,20 +41,42 @@ impl GitWorktrees {
             .join(format!("{}.git", target.repo())))
     }
 
-    /// Holds every run's workspace. Kept short so socket paths under a
-    /// workspace's `tmp` fit.
+    /// Holds every run's workspace and nothing else, so its owner can delete
+    /// it whole. Kept short so socket paths under a workspace's `tmp` fit.
     fn workspaces_dir(&self) -> PathBuf {
         self.root.join("runs")
     }
 
-    /// Deletes workspaces a killed run left behind, keeping live ones even
-    /// when another Maid shares this git dir. Safe to call while runs are in
-    /// flight; `cleanup` later prunes the git worktree records.
-    pub async fn remove_leftover_workspaces(&self) -> Result<()> {
-        let dir = self.workspaces_dir();
-        workspace::remove_leftovers_in(dir.clone())
+    /// Makes this process the only owner of the git dir for as long as the
+    /// returned guard lives, then deletes the workspaces a previous owner
+    /// left behind; `cleanup` later prunes their git worktree records. Call
+    /// at startup, before any run starts. Fails if another Maid owns it.
+    pub async fn take_ownership(&self) -> Result<GitDirOwner> {
+        tokio::fs::create_dir_all(&self.root)
             .await
-            .with_context(|| format!("failed to read {}", dir.display()))
+            .with_context(|| format!("failed to create {}", self.root.display()))?;
+        let lock_path = self.root.join("maid.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open {}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                bail!("another Maid owns {}", self.root.display())
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
+        }
+
+        let runs = self.workspaces_dir();
+        if let Err(err) = workspace::remove_dir(runs.clone()).await {
+            warn!(path = %runs.display(), error = ?err, "failed to remove leftover workspaces");
+        }
+        Ok(GitDirOwner { _lock: lock })
     }
 
     async fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<()> {
@@ -168,6 +191,12 @@ impl Worktrees for GitWorktrees {
 
 struct RepoLock {
     _file: File,
+}
+
+/// Keeps a process the only owner of a git dir until dropped.
+#[derive(Debug)]
+pub struct GitDirOwner {
+    _lock: File,
 }
 
 fn absolute_root(root: PathBuf) -> PathBuf {
@@ -329,7 +358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removes_workspaces_a_killed_run_left_and_keeps_live_ones() {
+    async fn taking_ownership_removes_workspaces_a_killed_run_left_and_keeps_repositories() {
         let temp = tempfile::tempdir().unwrap();
         let source = source_repo(temp.path());
         let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
@@ -337,16 +366,29 @@ mod tests {
             clone_url: source.to_string_lossy().to_string(),
             ..issue("o", "r")
         });
-        let live = worktrees.prepare(&issue).await.unwrap();
-        let leftover = crate::workspace::tests::leftover_in(&worktrees.workspaces_dir());
+        let leftover = worktrees.prepare(&issue).await.unwrap();
 
-        worktrees.remove_leftover_workspaces().await.unwrap();
+        let _owner = worktrees.take_ownership().await.unwrap();
 
-        assert!(!leftover.exists());
-        assert_eq!(read_checkout_file(&live), "hello\n");
-        worktrees.cleanup(live).await.unwrap();
+        assert!(!leftover.workspace().root().exists());
+        let next = worktrees.prepare(&issue).await.unwrap();
+        assert_eq!(read_checkout_file(&next), "hello\n");
+        worktrees.cleanup(next).await.unwrap();
         let repo = worktrees.repo_dir(&issue).unwrap();
         assert_eq!(run_git(&repo, &["worktree", "list"]).lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_one_process_owns_a_git_dir_at_a_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
+
+        let owner = worktrees.take_ownership().await.unwrap();
+        let err = worktrees.take_ownership().await.unwrap_err();
+        assert!(err.to_string().starts_with("another Maid owns"), "{err}");
+
+        drop(owner);
+        worktrees.take_ownership().await.unwrap();
     }
 
     #[test]

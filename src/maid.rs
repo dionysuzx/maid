@@ -974,7 +974,7 @@ where
         let worktree = self.worktrees.prepare(target).await?;
         let run = agent.run(worktree.workspace(), prompt).await;
         if let Err(err) = self.worktrees.cleanup(worktree).await {
-            warn!(error = ?err, "failed to clean up worktree; the hourly sweep removes leftovers");
+            warn!(error = ?err, "failed to clean up worktree; startup removes leftovers");
         }
         match &run {
             Ok(run) => info!(

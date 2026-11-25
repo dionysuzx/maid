@@ -75,6 +75,7 @@ impl Agent for CodexCli {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to start {}", self.bin))?;
 
