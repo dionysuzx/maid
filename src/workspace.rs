@@ -12,7 +12,7 @@ use tracing::warn;
 /// Held locked by the run that owns the workspace and by the agent process it
 /// starts, so startup can tell leftovers from live runs, including an agent
 /// that outlived a killed Maid, and from directories Maid did not create.
-const LOCK_FILE: &str = "workspace.lock";
+const LOCK_FILE: &str = "maid-workspace.lock";
 
 /// Where one agent run works: `<root>/checkout` holds the code and
 /// `<root>/tmp` is the run's temp directory, so venvs and caches the agent
@@ -57,7 +57,7 @@ impl Workspace {
         let dir = builder.tempdir_in(parent)?;
         // Lock under a temporary name and rename, so a startup sweep never
         // sees an unlocked lock file in a workspace that is being created.
-        let pending = dir.path().join("workspace.lock.new");
+        let pending = dir.path().join("maid-workspace.lock.new");
         let lock = OpenOptions::new()
             .create_new(true)
             .write(true)
