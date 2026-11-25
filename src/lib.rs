@@ -15,5 +15,7 @@ pub mod observed_notification;
 pub mod polling_metrics;
 pub mod reviewed_head;
 pub mod task_limit;
+#[cfg(test)]
+mod test_support;
 pub mod workspace;
 pub mod worktree;
