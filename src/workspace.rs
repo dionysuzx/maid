@@ -10,7 +10,7 @@ use tokio::process::Command;
 use tracing::warn;
 
 /// Held locked by the run that owns the workspace and by the agent process it
-/// starts, so startup can tell leftovers from live runs, including an agent
+/// starts, so the sweep can tell leftovers from live runs, including an agent
 /// that outlived a killed Maid, and from directories Maid did not create.
 const LOCK_FILE: &str = "maid-workspace.lock";
 
@@ -55,7 +55,7 @@ impl Workspace {
         builder.permissions(fs::Permissions::from_mode(0o700));
         // Deletes the directory if any step below fails.
         let dir = builder.tempdir_in(parent)?;
-        // Lock under a temporary name and rename, so a startup sweep never
+        // Lock under a temporary name and rename, so the sweep never
         // sees an unlocked lock file in a workspace that is being created.
         let pending = dir.path().join("maid-workspace.lock.new");
         let lock = OpenOptions::new()
@@ -161,7 +161,7 @@ fn remove_if_leftover(root: &Path) -> io::Result<()> {
 }
 
 /// Workspaces live directly in a real directory. A symlink is refused, so
-/// the startup sweep is never led into another directory's contents.
+/// the sweep is never led into another directory's contents.
 fn check_real_dir(parent: &Path) -> io::Result<()> {
     if fs::symlink_metadata(parent)?.is_dir() {
         return Ok(());
@@ -173,7 +173,7 @@ fn check_real_dir(parent: &Path) -> io::Result<()> {
 }
 
 /// Removes everything in the workspace before its lock file, so a failed
-/// removal leaves a workspace the next startup still recognizes. Read-only
+/// removal leaves a workspace the next sweep still recognizes. Read-only
 /// directories, such as a Go module cache, are made writable first. A
 /// missing workspace counts as removed, and a root an agent replaced with a
 /// symlink is unlinked without touching its target.

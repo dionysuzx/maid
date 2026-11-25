@@ -47,8 +47,8 @@ impl GitWorktrees {
     }
 
     /// Deletes workspaces a killed run left behind, keeping live ones even
-    /// when another Maid shares this git dir. Call at startup; `cleanup`
-    /// later prunes their git worktree records.
+    /// when another Maid shares this git dir. Safe to call while runs are in
+    /// flight; `cleanup` later prunes the git worktree records.
     pub async fn remove_leftover_workspaces(&self) -> Result<()> {
         let dir = self.workspaces_dir();
         workspace::remove_leftovers_in(dir.clone())

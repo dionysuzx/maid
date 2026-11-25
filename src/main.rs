@@ -27,9 +27,16 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let _daemon_lock = DaemonLock::acquire(config.daemon_pid_path.clone())?;
     let worktrees = GitWorktrees::new(config.git_dir.clone(), config.github_token.clone());
-    if let Err(err) = worktrees.remove_leftover_workspaces().await {
-        warn!(error = ?err, "failed to remove leftover workspaces");
-    }
+    let sweeper_worktrees = worktrees.clone();
+    let sweeper = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            if let Err(err) = sweeper_worktrees.remove_leftover_workspaces().await {
+                warn!(error = ?err, "failed to remove leftover workspaces");
+            }
+        }
+    });
     let polling_metrics = PollingMetrics::new();
     let metrics_endpoint =
         PollingMetricsEndpoint::bind(config.metrics_bind_address, polling_metrics.clone()).await?;
@@ -125,6 +132,8 @@ async fn main() -> Result<()> {
     let _ = poller.await;
     metrics_server.abort();
     let _ = metrics_server.await;
+    sweeper.abort();
+    let _ = sweeper.await;
 
     Ok(())
 }
