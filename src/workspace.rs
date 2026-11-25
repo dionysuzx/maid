@@ -175,14 +175,16 @@ fn check_real_dir(parent: &Path) -> io::Result<()> {
 /// Removes everything in the workspace before its lock file, so a failed
 /// removal leaves a workspace the next startup still recognizes. Read-only
 /// directories, such as a Go module cache, are made writable first. A
-/// missing workspace counts as removed.
+/// missing workspace counts as removed, and a root an agent replaced with a
+/// symlink is unlinked without touching its target.
 fn remove_workspace(root: &Path) -> io::Result<()> {
-    make_dirs_writable(root);
-    let entries = match fs::read_dir(root) {
+    match fs::symlink_metadata(root) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        entries => entries?,
+        Ok(metadata) if !metadata.is_dir() => return fs::remove_file(root),
+        metadata => metadata?,
     };
-    for entry in entries {
+    make_dirs_writable(root);
+    for entry in fs::read_dir(root)? {
         let entry = entry?;
         if entry.file_name() == LOCK_FILE {
             continue;
@@ -282,6 +284,22 @@ pub(crate) mod tests {
         workspace.remove().await.unwrap();
 
         assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_unlinks_a_root_replaced_by_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::create_in(&temp.path().join("runs")).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("data"), "").unwrap();
+        fs::remove_dir_all(workspace.root()).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.root()).unwrap();
+
+        workspace.remove().await.unwrap();
+
+        assert!(fs::symlink_metadata(workspace.root()).is_err());
+        assert!(outside.join("data").is_file());
     }
 
     #[tokio::test]
