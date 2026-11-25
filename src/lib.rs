@@ -9,7 +9,7 @@ pub mod domain;
 pub mod github;
 pub mod handled_marker;
 pub mod json_file;
-pub mod maid;
+pub mod keruvim;
 pub mod mention_thread;
 pub mod observed_notification;
 pub mod polling_metrics;

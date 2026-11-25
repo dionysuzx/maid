@@ -614,37 +614,38 @@ mod tests {
 
     #[test]
     fn parses_mentions_and_cleans_request_text() {
-        let request = MentionRequest::parse("@maid-bot please review this PR", "maid-bot")
+        let request = MentionRequest::parse("@keruvim-bot please review this PR", "keruvim-bot")
             .unwrap()
             .unwrap();
 
-        assert_eq!(request.raw_body, "@maid-bot please review this PR");
+        assert_eq!(request.raw_body, "@keruvim-bot please review this PR");
         assert_eq!(request.cleaned_text, "please review this PR");
 
         assert!(
-            MentionRequest::parse("@maid-botx not you", "maid-bot")
+            MentionRequest::parse("@keruvim-botx not you", "keruvim-bot")
                 .unwrap()
                 .is_none()
         );
         assert!(
-            MentionRequest::parse("@maid-bot-test not you", "maid-bot")
+            MentionRequest::parse("@keruvim-bot-test not you", "keruvim-bot")
                 .unwrap()
                 .is_none()
         );
         assert!(
-            MentionRequest::parse("mail@maid-bot.example is not a mention", "maid-bot")
+            MentionRequest::parse("mail@keruvim-bot.example is not a mention", "keruvim-bot")
                 .unwrap()
                 .is_none()
         );
         assert!(
-            MentionRequest::parse("@MAID-BOT check this", "maid-bot")
+            MentionRequest::parse("@KERUVIM-BOT check this", "keruvim-bot")
                 .unwrap()
                 .is_some()
         );
 
-        let repeated = MentionRequest::parse("cc @maid-bot, @MAID-BOT please review", "maid-bot")
-            .unwrap()
-            .unwrap();
+        let repeated =
+            MentionRequest::parse("cc @keruvim-bot, @KERUVIM-BOT please review", "keruvim-bot")
+                .unwrap()
+                .unwrap();
 
         assert_eq!(repeated.cleaned_text, "cc ,  please review");
     }
@@ -655,7 +656,7 @@ mod tests {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
             origin: AgentTaskOrigin::Mention {
                 mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
-                raw_body: "@maid-bot review".to_string(),
+                raw_body: "@keruvim-bot review".to_string(),
                 cleaned_text: "review".to_string(),
             },
         };
@@ -663,7 +664,7 @@ mod tests {
         let prompt = task.prompt(&test_prompts()).unwrap();
         assert!(prompt.contains("Mention URL:\nhttps://github.com/o/r/pull/1#issuecomment-2"));
         assert!(prompt.contains("Target URL:\nhttps://github.com/o/r/pull/1"));
-        assert!(prompt.contains("Raw mention body:\n@maid-bot review"));
+        assert!(prompt.contains("Raw mention body:\n@keruvim-bot review"));
         assert!(prompt.contains("Cleaned request text:\nreview"));
     }
 
@@ -688,7 +689,7 @@ mod tests {
             pr_url: "https://github.com/o/r/pull/1".to_string(),
             origin: AgentTaskOrigin::Mention {
                 mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
-                raw_body: "@maid-bot review".to_string(),
+                raw_body: "@keruvim-bot review".to_string(),
                 cleaned_text: "review".to_string(),
             },
         };
@@ -724,7 +725,7 @@ mod tests {
         assert_eq!(
             AgentTaskOrigin::Mention {
                 mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
-                raw_body: "@maid-bot review".to_string(),
+                raw_body: "@keruvim-bot review".to_string(),
                 cleaned_text: "review".to_string(),
             }
             .task_kind(),
@@ -742,16 +743,16 @@ mod tests {
     #[test]
     fn parses_repository_slugs() {
         assert_eq!(
-            RepoSlug::parse(" Dionysuzx/Maid ").unwrap(),
+            RepoSlug::parse(" Dionysuzx/Keruvim ").unwrap(),
             RepoSlug {
                 owner: "dionysuzx".to_string(),
-                repo: "maid".to_string(),
+                repo: "keruvim".to_string(),
             }
         );
 
         assert!(RepoSlug::parse("dionysuzx").is_err());
-        assert!(RepoSlug::parse("dionysuzx/maid/extra").is_err());
-        assert!(RepoSlug::parse("../maid").is_err());
+        assert!(RepoSlug::parse("dionysuzx/keruvim/extra").is_err());
+        assert!(RepoSlug::parse("../keruvim").is_err());
     }
 
     #[test]
@@ -779,17 +780,17 @@ mod tests {
             RequestedReviewer::Team(TeamSlug::parse("some-org/eng-infra").unwrap())
         );
         assert_eq!(
-            RequestedReviewer::parse(" Maid-Bot ").unwrap(),
-            RequestedReviewer::Account("maid-bot".to_string())
+            RequestedReviewer::parse(" Keruvim-Bot ").unwrap(),
+            RequestedReviewer::Account("keruvim-bot".to_string())
         );
         assert_eq!(
-            RequestedReviewer::parse("Maid-Bot").unwrap().to_string(),
-            "maid-bot"
+            RequestedReviewer::parse("Keruvim-Bot").unwrap().to_string(),
+            "keruvim-bot"
         );
 
         assert!(RequestedReviewer::parse("").is_err());
         assert!(RequestedReviewer::parse("some-org/").is_err());
-        assert!(RequestedReviewer::parse("maid bot").is_err());
+        assert!(RequestedReviewer::parse("keruvim bot").is_err());
     }
 
     #[test]

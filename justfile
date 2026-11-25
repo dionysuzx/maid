@@ -1,10 +1,10 @@
 set dotenv-load
 
-maid_home := env_var_or_default("MAID_HOME", env_var("HOME") + "/.maid")
-config_file := maid_home + "/config.toml"
-pid_file := maid_home + "/maid.pid"
-log_file := maid_home + "/maid.log"
-maid_bin := justfile_directory() + "/target/debug/maid"
+keruvim_home := env_var_or_default("KERUVIM_HOME", env_var("HOME") + "/.keruvim")
+config_file := keruvim_home + "/config.toml"
+pid_file := keruvim_home + "/keruvim.pid"
+log_file := keruvim_home + "/keruvim.log"
+keruvim_bin := justfile_directory() + "/target/debug/keruvim"
 
 default:
     just --list
@@ -24,7 +24,7 @@ init:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    mkdir -p "{{maid_home}}"
+    mkdir -p "{{keruvim_home}}"
 
     if [[ -e "{{config_file}}" ]]; then
         echo "{{config_file}} already exists"
@@ -32,7 +32,7 @@ init:
     fi
 
     cp "{{ justfile_directory() }}/config.example.toml" "{{config_file}}"
-    perl -0pi -e 's/^bot_login = "maid-bot"/bot_login = ""/m; s/your-name/dionysuzx/g' "{{config_file}}"
+    perl -0pi -e 's/^bot_login = "keruvim-bot"/bot_login = ""/m; s/your-name/dionysuzx/g' "{{config_file}}"
 
     echo "created {{config_file}}"
     echo "edit bot_login and master_accounts, then run: just start"
@@ -54,16 +54,16 @@ start:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    mkdir -p "{{maid_home}}"
+    mkdir -p "{{keruvim_home}}"
     cargo build
 
-    RUST_LOG="${RUST_LOG:-maid=info}" nohup setsid "{{maid_bin}}" </dev/null >>"{{log_file}}" 2>&1 &
+    RUST_LOG="${RUST_LOG:-keruvim=info}" nohup setsid "{{keruvim_bin}}" </dev/null >>"{{log_file}}" 2>&1 &
     launcher_pid="$!"
 
     for _ in {1..10}; do
         if just status >/dev/null 2>&1; then
             pid="$(<"{{pid_file}}")"
-            echo "maid is running with pid $pid"
+            echo "keruvim is running with pid $pid"
             echo "logs: just logs"
             exit 0
         fi
@@ -74,11 +74,11 @@ start:
         kill "$launcher_pid" 2>/dev/null || true
     fi
 
-    echo "maid failed to start; see {{log_file}}"
+    echo "keruvim failed to start; see {{log_file}}"
     exit 1
 
 dev:
-    RUST_LOG="${RUST_LOG:-maid=info}" cargo run
+    RUST_LOG="${RUST_LOG:-keruvim=info}" cargo run
 
 update:
     just stop
@@ -92,7 +92,7 @@ logs:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    mkdir -p "{{maid_home}}"
+    mkdir -p "{{keruvim_home}}"
     touch "{{log_file}}"
     tail -n "${LINES:-80}" -f "{{log_file}}"
 
@@ -100,64 +100,64 @@ status:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    is_maid_pid() {
+    is_keruvim_pid() {
         [[ "$1" =~ ^[0-9]+$ ]] || return 1
         local target cmdline
         target="$(readlink "/proc/$1/exe" 2>/dev/null || true)"
         cmdline="$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 1 || true)"
-        [[ "$target" == "{{maid_bin}}" || "$cmdline" == "{{maid_bin}}" ]]
+        [[ "$target" == "{{keruvim_bin}}" || "$cmdline" == "{{keruvim_bin}}" ]]
     }
 
     if [[ ! -f "{{pid_file}}" ]]; then
-        echo "maid is not running"
+        echo "keruvim is not running"
         exit 1
     fi
 
     pid="$(<"{{pid_file}}")"
-    if is_maid_pid "$pid"; then
-        echo "maid is running with pid $pid"
+    if is_keruvim_pid "$pid"; then
+        echo "keruvim is running with pid $pid"
         exit 0
     fi
 
     rm -f "{{pid_file}}"
-    echo "maid is not running"
+    echo "keruvim is not running"
     exit 1
 
 stop:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    is_maid_pid() {
+    is_keruvim_pid() {
         [[ "$1" =~ ^[0-9]+$ ]] || return 1
         local target cmdline
         target="$(readlink "/proc/$1/exe" 2>/dev/null || true)"
         cmdline="$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 1 || true)"
-        [[ "$target" == "{{maid_bin}}" || "$cmdline" == "{{maid_bin}}" ]]
+        [[ "$target" == "{{keruvim_bin}}" || "$cmdline" == "{{keruvim_bin}}" ]]
     }
 
     wait_for_stop() {
         for _ in {1..20}; do
             if ! kill -0 "$pid" 2>/dev/null; then
                 rm -f "{{pid_file}}"
-                echo "maid stopped"
+                echo "keruvim stopped"
                 exit 0
             fi
             sleep 0.25
         done
 
-        echo "maid did not stop after 5 seconds; pid still running: $pid"
+        echo "keruvim did not stop after 5 seconds; pid still running: $pid"
         exit 1
     }
 
     if [[ ! -f "{{pid_file}}" ]]; then
-        echo "maid is not running"
+        echo "keruvim is not running"
         exit 0
     fi
 
     pid="$(<"{{pid_file}}")"
-    if ! is_maid_pid "$pid"; then
+    if ! is_keruvim_pid "$pid"; then
         rm -f "{{pid_file}}"
-        echo "maid is not running"
+        echo "keruvim is not running"
         exit 0
     fi
 

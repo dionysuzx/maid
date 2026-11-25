@@ -18,7 +18,7 @@ pub fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
 
     let mut file = tempfile::Builder::new()
-        .prefix(".maid-ledger.")
+        .prefix(".keruvim-ledger.")
         .tempfile_in(parent)
         .with_context(|| format!("failed to create temp ledger in {}", parent.display()))?;
 

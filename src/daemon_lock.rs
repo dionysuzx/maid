@@ -31,7 +31,7 @@ impl DaemonLock {
         if let Some(existing_pid) = read_pid(&path)
             && pid_is_this_process_or_current_executable(existing_pid)
         {
-            bail!("maid is already running with pid {existing_pid}");
+            bail!("keruvim is already running with pid {existing_pid}");
         }
 
         write_pid_file(&path, pid)?;
@@ -75,10 +75,10 @@ fn lock_daemon_file(file: &fs::File, pid_path: &Path) -> Result<()> {
             if let Some(existing_pid) = read_pid(pid_path)
                 && pid_is_this_process_or_current_executable(existing_pid)
             {
-                bail!("maid is already running with pid {existing_pid}");
+                bail!("keruvim is already running with pid {existing_pid}");
             }
 
-            bail!("maid is already starting or running");
+            bail!("keruvim is already starting or running");
         }
         Err(TryLockError::Error(err)) => Err(err)
             .with_context(|| format!("failed to lock {}", lock_path_for(pid_path).display())),
@@ -94,7 +94,7 @@ fn read_pid(path: &Path) -> Option<u32> {
 fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut file = tempfile::Builder::new()
-        .prefix(".maid.pid.")
+        .prefix(".keruvim.pid.")
         .tempfile_in(parent)
         .with_context(|| format!("failed to create temp pid file in {}", parent.display()))?;
 
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn publishes_complete_pid_file() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("maid.pid");
+        let path = temp.path().join("keruvim.pid");
 
         write_pid_file(&path, 12345).unwrap();
 
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn replaces_existing_pid_file_when_publishing() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("maid.pid");
+        let path = temp.path().join("keruvim.pid");
         fs::write(&path, "existing").unwrap();
 
         write_pid_file(&path, 12345).unwrap();
@@ -174,12 +174,12 @@ mod tests {
     #[test]
     fn prevents_two_instances_with_the_same_pid_file() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("maid.pid");
+        let path = temp.path().join("keruvim.pid");
 
         let lock = DaemonLock::acquire(&path).unwrap();
         let err = DaemonLock::acquire(&path).unwrap_err();
 
-        assert!(err.to_string().contains("maid is already running"));
+        assert!(err.to_string().contains("keruvim is already running"));
         drop(lock);
         assert!(!path.exists());
     }
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn replaces_stale_pid_file() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("maid.pid");
+        let path = temp.path().join("keruvim.pid");
         fs::write(&path, "999999999").unwrap();
 
         let _lock = DaemonLock::acquire(&path).unwrap();
@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn replaces_live_pid_that_is_not_this_executable() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("maid.pid");
+        let path = temp.path().join("keruvim.pid");
         fs::write(&path, "1").unwrap();
 
         let _lock = DaemonLock::acquire(&path).unwrap();
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn does_not_remove_another_process_pid_file() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("maid.pid");
+        let path = temp.path().join("keruvim.pid");
 
         let lock = DaemonLock::acquire(&path).unwrap();
         fs::write(&path, "999999999").unwrap();

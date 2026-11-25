@@ -52,8 +52,8 @@ pub struct AgentConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let maid_home = maid_home()?;
-        let config_path = maid_home.join("config.toml");
+        let keruvim_home = keruvim_home()?;
+        let config_path = keruvim_home.join("config.toml");
         let file = ConfigFile::read(&config_path)?;
         let bot_login = non_empty(file.bot_login).with_context(|| {
             format!(
@@ -93,7 +93,7 @@ impl Config {
             .transpose()?
             .map(absolute_path)
             .transpose()?
-            .unwrap_or_else(|| maid_home.join("git"));
+            .unwrap_or_else(|| keruvim_home.join("git"));
         let task_limit_per_24h = file.task_limit_per_24h;
         let max_concurrent_requests = file.max_concurrent_requests.unwrap_or(1);
         if max_concurrent_requests == 0 {
@@ -133,11 +133,11 @@ impl Config {
             auto_review_requested_reviewers,
             review_cadence,
             git_dir,
-            daemon_pid_path: maid_home.join("maid.pid"),
-            task_start_ledger_path: maid_home.join("task-starts.json"),
-            pending_handled_marker_ledger_path: maid_home.join("pending-handled-markers.json"),
-            observed_notification_ledger_path: maid_home.join("observed-notifications.json"),
-            reviewed_head_ledger_path: maid_home.join("reviewed-heads.json"),
+            daemon_pid_path: keruvim_home.join("keruvim.pid"),
+            task_start_ledger_path: keruvim_home.join("task-starts.json"),
+            pending_handled_marker_ledger_path: keruvim_home.join("pending-handled-markers.json"),
+            observed_notification_ledger_path: keruvim_home.join("observed-notifications.json"),
+            reviewed_head_ledger_path: keruvim_home.join("reviewed-heads.json"),
             task_limit_per_24h,
             max_concurrent_requests,
             github_api_requests_per_hour,
@@ -195,8 +195,8 @@ impl ConfigFile {
     }
 }
 
-fn maid_home() -> Result<PathBuf> {
-    if let Ok(value) = env::var("MAID_HOME")
+fn keruvim_home() -> Result<PathBuf> {
+    if let Ok(value) = env::var("KERUVIM_HOME")
         && !value.trim().is_empty()
     {
         return absolute_path(expand_home(&value)?);
@@ -205,7 +205,7 @@ fn maid_home() -> Result<PathBuf> {
     absolute_path(
         dirs::home_dir()
             .ok_or_else(|| anyhow!("could not determine the home directory"))?
-            .join(".maid"),
+            .join(".keruvim"),
     )
 }
 
@@ -410,14 +410,14 @@ mod tests {
         write!(
             file,
             r#"
-bot_login = "maid-bot"
+bot_login = "keruvim-bot"
 master_accounts = ["dionysuzx"]
 auto_review_accounts = ["dionysuzx"]
 auto_review_public_accounts = ["dionysuzx"]
-auto_review_repos = ["dionysuzx/maid"]
-auto_review_requested_reviewers = ["Some-Org/eng-infra", "maid-bot"]
+auto_review_repos = ["dionysuzx/keruvim"]
+auto_review_requested_reviewers = ["Some-Org/eng-infra", "keruvim-bot"]
 continuous_review = true
-git_dir = "~/.maid/git"
+git_dir = "~/.keruvim/git"
 task_limit_per_24h = 5
 max_concurrent_requests = 3
 github_api_requests_per_hour = 1200
@@ -445,7 +445,7 @@ pull_request_opened = "review {{{{pr_url}}}}"
 
         let config = ConfigFile::read(file.path()).unwrap();
 
-        assert_eq!(config.bot_login.as_deref(), Some("maid-bot"));
+        assert_eq!(config.bot_login.as_deref(), Some("keruvim-bot"));
         assert_eq!(config.master_accounts, Some(vec!["dionysuzx".to_string()]));
         assert_eq!(
             config.auto_review_accounts,
@@ -457,17 +457,17 @@ pull_request_opened = "review {{{{pr_url}}}}"
         );
         assert_eq!(
             config.auto_review_repos,
-            Some(vec!["dionysuzx/maid".to_string()])
+            Some(vec!["dionysuzx/keruvim".to_string()])
         );
         assert_eq!(
             config.auto_review_requested_reviewers,
             Some(vec![
                 "Some-Org/eng-infra".to_string(),
-                "maid-bot".to_string()
+                "keruvim-bot".to_string()
             ])
         );
         assert_eq!(config.continuous_review, Some(true));
-        assert_eq!(config.git_dir.as_deref(), Some("~/.maid/git"));
+        assert_eq!(config.git_dir.as_deref(), Some("~/.keruvim/git"));
         assert_eq!(config.task_limit_per_24h, Some(5));
         assert_eq!(config.max_concurrent_requests, Some(3));
         assert_eq!(config.github_api_requests_per_hour, Some(1200));
@@ -518,7 +518,8 @@ pull_request_opened = "review {{{{pr_url}}}}"
 
     #[test]
     fn missing_config_file_is_empty_config() {
-        let config = ConfigFile::read(Path::new("/tmp/maid-missing-config-for-test.toml")).unwrap();
+        let config =
+            ConfigFile::read(Path::new("/tmp/keruvim-missing-config-for-test.toml")).unwrap();
 
         assert_eq!(config.bot_login, None);
         assert_eq!(config.master_accounts, None);
@@ -594,8 +595,8 @@ pull_request_opened = "review {{{{pr_url}}}}"
     #[test]
     fn trims_empty_strings_to_none() {
         assert_eq!(
-            non_empty(Some("  maid-bot  ".to_string())).as_deref(),
-            Some("maid-bot")
+            non_empty(Some("  keruvim-bot  ".to_string())).as_deref(),
+            Some("keruvim-bot")
         );
         assert_eq!(non_empty(Some("  ".to_string())), None);
     }
@@ -653,15 +654,15 @@ pull_request_opened = "review {{{{pr_url}}}}"
         assert_eq!(
             optional_repos(
                 Some(vec![
-                    "  Dionysuzx/Maid  ".to_string(),
-                    "dionysuzx/maid".to_string()
+                    "  Dionysuzx/Keruvim  ".to_string(),
+                    "dionysuzx/keruvim".to_string()
                 ]),
                 "auto_review_repos"
             )
             .unwrap(),
             vec![RepoSlug {
                 owner: "dionysuzx".to_string(),
-                repo: "maid".to_string(),
+                repo: "keruvim".to_string(),
             }]
         );
         assert_eq!(
@@ -683,15 +684,15 @@ pull_request_opened = "review {{{{pr_url}}}}"
                 Some(vec![
                     "  Some-Org/Eng-Infra  ".to_string(),
                     "some-org/eng-infra".to_string(),
-                    "Maid-Bot".to_string(),
-                    "maid-bot".to_string()
+                    "Keruvim-Bot".to_string(),
+                    "keruvim-bot".to_string()
                 ]),
                 key
             )
             .unwrap(),
             vec![
                 RequestedReviewer::parse("some-org/eng-infra").unwrap(),
-                RequestedReviewer::parse("maid-bot").unwrap()
+                RequestedReviewer::parse("keruvim-bot").unwrap()
             ]
         );
         assert_eq!(
@@ -737,8 +738,8 @@ pull_request_opened = "review {{{{pr_url}}}}"
         assert_eq!(expand_home("~").unwrap(), home);
         assert_eq!(expand_home("~/git").unwrap(), home.join("git"));
         assert_eq!(
-            expand_home("/tmp/maid").unwrap(),
-            PathBuf::from("/tmp/maid")
+            expand_home("/tmp/keruvim").unwrap(),
+            PathBuf::from("/tmp/keruvim")
         );
     }
 
@@ -751,8 +752,8 @@ pull_request_opened = "review {{{{pr_url}}}}"
             current_dir.join("relative/git")
         );
         assert_eq!(
-            absolute_path(PathBuf::from("/tmp/maid")).unwrap(),
-            PathBuf::from("/tmp/maid")
+            absolute_path(PathBuf::from("/tmp/keruvim")).unwrap(),
+            PathBuf::from("/tmp/keruvim")
         );
     }
 
