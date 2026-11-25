@@ -119,13 +119,20 @@ impl Workspace {
 
 /// Removes workspaces under `parent` that a killed run left behind: those
 /// whose lock file is not held. Live workspaces, including another Maid's,
-/// and anything without a lock file are left alone. Failures are logged.
+/// and anything without a lock file are left alone. A symlinked `parent` is
+/// not followed. Failures for single workspaces are logged.
 pub async fn remove_leftovers_in(parent: PathBuf) -> io::Result<()> {
     tokio::task::spawn_blocking(move || {
-        let entries = match fs::read_dir(&parent) {
+        match fs::symlink_metadata(&parent) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            entries => entries?,
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(io::Error::other(
+                    "not a directory, or a symlink, which is not followed",
+                ));
+            }
+            metadata => metadata?,
         };
+        let entries = fs::read_dir(&parent)?;
         for entry in entries {
             let root = entry?.path();
             if let Err(err) = remove_if_leftover(&root) {
@@ -137,36 +144,24 @@ pub async fn remove_leftovers_in(parent: PathBuf) -> io::Result<()> {
     .await?
 }
 
-/// A leftover is a directory laid out exactly like a workspace whose lock
-/// nobody holds.
+/// A leftover is a directory with a regular lock file nobody holds.
 fn remove_if_leftover(root: &Path) -> io::Result<()> {
-    if !fs::symlink_metadata(root)?.is_dir() || !has_workspace_layout(root)? {
+    if !fs::symlink_metadata(root)?.is_dir() {
         return Ok(());
     }
+    let lock_path = root.join(LOCK_FILE);
+    match fs::symlink_metadata(&lock_path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) if !metadata.is_file() => return Ok(()),
+        metadata => metadata?,
+    };
     // Opened for writing because NFS refuses an exclusive lock otherwise.
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(root.join(LOCK_FILE))?;
+    let lock = OpenOptions::new().read(true).write(true).open(lock_path)?;
     match lock.try_lock() {
         Ok(()) => remove_workspace(root),
         Err(TryLockError::WouldBlock) => Ok(()),
         Err(TryLockError::Error(err)) => Err(err),
     }
-}
-
-/// Holds a regular lock file and nothing besides `checkout` and `tmp`.
-fn has_workspace_layout(root: &Path) -> io::Result<bool> {
-    let mut has_lock = false;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        match entry.file_name().to_str() {
-            Some(LOCK_FILE) => has_lock = entry.file_type()?.is_file(),
-            Some("checkout" | "tmp") => {}
-            _ => return Ok(false),
-        }
-    }
-    Ok(has_lock)
 }
 
 /// Removes the workspace's contents before its lock file, so a failed
@@ -287,10 +282,7 @@ pub(crate) mod tests {
         fs::write(parent.path().join("file"), "").unwrap();
         let not_a_lock = parent.path().join("not-a-lock");
         fs::create_dir_all(not_a_lock.join(LOCK_FILE)).unwrap();
-        let not_a_workspace = parent.path().join("not-a-workspace");
-        fs::create_dir(&not_a_workspace).unwrap();
-        fs::write(not_a_workspace.join(LOCK_FILE), "").unwrap();
-        fs::write(not_a_workspace.join("data"), "").unwrap();
+        fs::create_dir(leftover.join("target")).unwrap();
 
         remove_leftovers_in(parent.path().to_path_buf())
             .await
@@ -301,7 +293,6 @@ pub(crate) mod tests {
         assert!(other.join("config.toml").is_file());
         assert!(parent.path().join("file").is_file());
         assert!(not_a_lock.join(LOCK_FILE).is_dir());
-        assert!(not_a_workspace.join("data").is_file());
     }
 
     #[tokio::test]
@@ -317,6 +308,18 @@ pub(crate) mod tests {
             .unwrap();
         assert!(root.join("checkout").is_dir());
         agent.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn does_not_follow_a_symlinked_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let leftover = leftover_in(&target);
+        let link = temp.path().join("runs");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(remove_leftovers_in(link).await.is_err());
+        assert!(leftover.join("checkout").is_dir());
     }
 
     #[tokio::test]
