@@ -48,6 +48,7 @@ impl Workspace {
     /// socket paths under `tmp` within OS limits.
     pub fn create_in(parent: &Path) -> io::Result<Self> {
         fs::create_dir_all(parent)?;
+        check_real_dir(parent)?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("");
         #[cfg(unix)]
@@ -119,19 +120,14 @@ impl Workspace {
 
 /// Removes workspaces under `parent` that a killed run left behind: those
 /// whose lock file is not held. Live workspaces, including another Maid's,
-/// and anything without a lock file are left alone. A symlinked `parent` is
-/// not followed. Failures for single workspaces are logged.
+/// and anything without a lock file are left alone. Failures for single
+/// workspaces are logged.
 pub async fn remove_leftovers_in(parent: PathBuf) -> io::Result<()> {
     tokio::task::spawn_blocking(move || {
-        match fs::symlink_metadata(&parent) {
+        match check_real_dir(&parent) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(io::Error::other(
-                    "not a directory, or a symlink, which is not followed",
-                ));
-            }
-            metadata => metadata?,
-        };
+            result => result?,
+        }
         let entries = fs::read_dir(&parent)?;
         for entry in entries {
             let root = entry?.path();
@@ -164,23 +160,40 @@ fn remove_if_leftover(root: &Path) -> io::Result<()> {
     }
 }
 
-/// Removes the workspace's contents before its lock file, so a failed
+/// Workspaces live directly in a real directory. A symlink is refused, so
+/// the startup sweep is never led into another directory's contents.
+fn check_real_dir(parent: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(parent)?.is_dir() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "{} is a symlink or not a directory",
+        parent.display()
+    )))
+}
+
+/// Removes everything in the workspace before its lock file, so a failed
 /// removal leaves a workspace the next startup still recognizes. Read-only
 /// directories, such as a Go module cache, are made writable first. A
 /// missing workspace counts as removed.
 fn remove_workspace(root: &Path) -> io::Result<()> {
     make_dirs_writable(root);
-    let workspace = Workspace::new(root);
-    for dir in [workspace.checkout(), workspace.tmp()] {
-        match fs::remove_dir_all(dir) {
-            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
-            _ => {}
+    let entries = match fs::read_dir(root) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        entries => entries?,
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name() == LOCK_FILE {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
         }
     }
-    match fs::remove_dir_all(root) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
+    fs::remove_dir_all(root)
 }
 
 /// Best effort: anything left read-only surfaces as the `remove_dir_all` error.
@@ -311,15 +324,16 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_follow_a_symlinked_parent() {
+    async fn refuses_a_symlinked_parent() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target");
         let leftover = leftover_in(&target);
         let link = temp.path().join("runs");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        assert!(remove_leftovers_in(link).await.is_err());
+        assert!(remove_leftovers_in(link.clone()).await.is_err());
         assert!(leftover.join("checkout").is_dir());
+        assert!(Workspace::create_in(&link).is_err());
     }
 
     #[tokio::test]
