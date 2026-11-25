@@ -1,6 +1,6 @@
 use crate::{
     domain::{WorkTarget, validate_repo_name_part},
-    thoth::{PreparedWorktree, Worktrees},
+    keruvim::{PreparedWorktree, Worktrees},
     workspace::{self, Workspace},
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -50,12 +50,12 @@ impl GitWorktrees {
     /// Makes this process the only owner of the git dir for as long as the
     /// returned guard lives, then deletes the workspaces a previous owner
     /// left behind; `cleanup` later prunes their git worktree records. Call
-    /// at startup, before any run starts. Fails if another Thoth owns it.
+    /// at startup, before any run starts. Fails if another Keruvim owns it.
     pub async fn take_ownership(&self) -> Result<GitDirOwner> {
         tokio::fs::create_dir_all(&self.root)
             .await
             .with_context(|| format!("failed to create {}", self.root.display()))?;
-        let lock_path = self.root.join("thoth.lock");
+        let lock_path = self.root.join("keruvim.lock");
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -65,7 +65,7 @@ impl GitWorktrees {
         match lock.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                bail!("another Thoth owns {}", self.root.display())
+                bail!("another Keruvim owns {}", self.root.display())
             }
             Err(TryLockError::Error(err)) => {
                 return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
@@ -283,25 +283,25 @@ mod tests {
 
     #[test]
     fn maps_repositories_into_git_dir() {
-        let worktrees = GitWorktrees::new("/tmp/thoth-git", "token");
+        let worktrees = GitWorktrees::new("/tmp/keruvim-git", "token");
 
         assert_eq!(
             worktrees
                 .repo_dir(&pr_target("dionysuzx", "forkcast"))
                 .unwrap(),
-            PathBuf::from("/tmp/thoth-git/repos/dionysuzx/forkcast.git")
+            PathBuf::from("/tmp/keruvim-git/repos/dionysuzx/forkcast.git")
         );
     }
 
     #[test]
     fn maps_relative_git_dir_from_the_process_directory() {
         let current_dir = std::env::current_dir().unwrap();
-        let worktrees = GitWorktrees::new("target/thoth-git", "token");
+        let worktrees = GitWorktrees::new("target/keruvim-git", "token");
         let pr = pr_target("dionysuzx", "forkcast");
 
         assert_eq!(
             worktrees.repo_dir(&pr).unwrap(),
-            current_dir.join("target/thoth-git/repos/dionysuzx/forkcast.git")
+            current_dir.join("target/keruvim-git/repos/dionysuzx/forkcast.git")
         );
     }
 
@@ -386,12 +386,12 @@ mod tests {
         let _owner = worktrees.take_ownership().await.unwrap();
         let err = worktrees.take_ownership().await.unwrap_err();
 
-        assert!(err.to_string().starts_with("another Thoth owns"), "{err}");
+        assert!(err.to_string().starts_with("another Keruvim owns"), "{err}");
     }
 
     #[test]
     fn rejects_repository_parts_that_could_escape_git_dir() {
-        let worktrees = GitWorktrees::new("/tmp/thoth-git", "token");
+        let worktrees = GitWorktrees::new("/tmp/keruvim-git", "token");
 
         assert!(
             worktrees

@@ -23,7 +23,7 @@ impl Workspace {
     }
 
     /// Creates an empty workspace with a short random name under `parent`,
-    /// readable only by Thoth's user. The short path keeps Unix socket paths
+    /// readable only by Keruvim's user. The short path keeps Unix socket paths
     /// under `tmp` within OS limits.
     pub fn create_in(parent: &Path) -> io::Result<Self> {
         fs::create_dir_all(parent)?;

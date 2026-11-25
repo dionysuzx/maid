@@ -1,12 +1,12 @@
 # Required.
-bot_login = "thoth-bot"
+bot_login = "keruvim-bot"
 master_accounts = ["your-name"]
 
 # Optional. Defaults to master_accounts when omitted.
 auto_review_accounts = ["your-name"]
 
 # Optional. Empty or omitted disables automatic PR-open reviews.
-auto_review_repos = ["your-name/thoth"]
+auto_review_repos = ["your-name/keruvim"]
 
 # Optional. Reviews every open PR authored by these accounts when its base
 # repository is public, regardless of repository. Accounts must also appear in
@@ -17,18 +17,18 @@ auto_review_public_accounts = ["your-name"]
 # these teams (org/team-slug) or accounts (login) as a reviewer. A comment or
 # push inside github_notification_window_hours can still qualify a pull request
 # that still requests the reviewer.
-auto_review_requested_reviewers = ["Some-Org/eng-infra", "thoth-bot"]
+auto_review_requested_reviewers = ["Some-Org/eng-infra", "keruvim-bot"]
 
-# Optional. When true, Thoth reviews every new head commit of a pull request in
+# Optional. When true, Keruvim reviews every new head commit of a pull request in
 # its auto-review scope instead of reviewing each pull request once.
 continuous_review = false
 
 # Optional. Defaults shown below.
-git_dir = "~/.thoth/git"
+git_dir = "~/.keruvim/git"
 max_concurrent_requests = 1
 
 # Optional. This is the one global GitHub REST request-rate knob. Every GitHub
-# API call Thoth makes is paced through this budget, including concurrent tasks.
+# API call Keruvim makes is paced through this budget, including concurrent tasks.
 github_api_requests_per_hour = 1200
 
 # Optional. How far back each notification poll searches. Defaults to 24 hours.
@@ -43,8 +43,8 @@ metrics_bind_address = "127.0.0.1:9464"
 # Optional. Leave omitted unless you need to pin api.github.com.
 # github_api_ip = "127.0.0.1"
 
-# Required. These templates are the full prompts Thoth sends to every agent.
-# Each comment Thoth posts ends with the rendered prompt in a collapsed section.
+# Required. These templates are the full prompts Keruvim sends to every agent.
+# Each comment Keruvim posts ends with the rendered prompt in a collapsed section.
 # Supported mention placeholders:
 # {{mention_url}}, {{target_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
 # Supported pull_request_opened placeholders:
@@ -84,9 +84,9 @@ Review request:
 please review
 """
 
-# Required. The coding agents Thoth runs, one entry per kind ("codex" or
+# Required. The coding agents Keruvim runs, one entry per kind ("codex" or
 # "claude"). Reviews and mentions run every agent in parallel, each in its own
-# worktree, and Thoth posts one comment with a section per agent in this order.
+# worktree, and Keruvim posts one comment with a section per agent in this order.
 # Each section names the agent's kind, model, and effort. `bin` defaults to the
 # kind. Codex receives `effort` as model_reasoning_effort.
 [[agents]]

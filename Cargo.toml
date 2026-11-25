@@ -1,11 +1,11 @@
 [package]
-name = "thoth"
+name = "keruvim"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A GitHub bot that reviews pull requests with local coding agents."
 license = "MIT"
-repository = "https://github.com/dionysuzx/thoth"
+repository = "https://github.com/dionysuzx/keruvim"
 
 [dependencies]
 anyhow = "1.0.99"

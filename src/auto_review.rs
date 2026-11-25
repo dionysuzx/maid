@@ -42,7 +42,7 @@ pub fn authorizing_reviewer<'a>(
         .find(|reviewer| requested_reviewers.contains(*reviewer))
 }
 
-/// How often Thoth reviews a pull request that is in its auto-review scope.
+/// How often Keruvim reviews a pull request that is in its auto-review scope.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReviewCadence {
     /// Review each pull request once.
@@ -105,7 +105,7 @@ mod tests {
         let configured = [
             reviewer("some-org/docs"),
             reviewer("Some-Org/eng-infra"),
-            reviewer("Thoth-Bot"),
+            reviewer("Keruvim-Bot"),
         ];
         let requested = [reviewer("some-org/eng-infra"), reviewer("some-org/docs")];
 
@@ -117,7 +117,7 @@ mod tests {
         );
         assert_eq!(
             authorizing_reviewer(
-                &[reviewer("octocat"), reviewer("thoth-bot")],
+                &[reviewer("octocat"), reviewer("keruvim-bot")],
                 &configured,
                 Some(now),
                 now,
@@ -125,7 +125,7 @@ mod tests {
             )
             .map(ToString::to_string)
             .as_deref(),
-            Some("thoth-bot")
+            Some("keruvim-bot")
         );
         assert!(
             authorizing_reviewer(
