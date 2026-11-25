@@ -1,12 +1,13 @@
+use crate::workspace::Workspace;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{fmt, path::Path, sync::Arc};
+use std::{fmt, sync::Arc};
 
 #[async_trait]
 pub trait Agent: Send + Sync {
     fn label(&self) -> &AgentLabel;
-    async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun>;
+    async fn run(&self, workspace: &Workspace, prompt: &str) -> Result<AgentRun>;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -103,7 +104,7 @@ mod tests {
             &self.0
         }
 
-        async fn run(&self, _worktree: &Path, _prompt: &str) -> Result<AgentRun> {
+        async fn run(&self, _workspace: &Workspace, _prompt: &str) -> Result<AgentRun> {
             unreachable!("panel tests do not run agents")
         }
     }

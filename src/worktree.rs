@@ -1,18 +1,19 @@
 use crate::{
-    agent::AgentKind,
-    domain::{AgentTask, WorkTarget, validate_repo_name_part},
+    domain::{WorkTarget, validate_repo_name_part},
     maid::{PreparedWorktree, Worktrees},
+    workspace::{self, Workspace},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
 use std::{
     env,
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
     process::Stdio,
 };
 use tokio::process::Command;
+use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub struct GitWorktrees {
@@ -40,22 +41,42 @@ impl GitWorktrees {
             .join(format!("{}.git", target.repo())))
     }
 
-    pub fn worktree_dir(
-        &self,
-        target: &WorkTarget,
-        task: &AgentTask,
-        agent: AgentKind,
-    ) -> Result<PathBuf> {
-        validate_repo_name_part(target.owner(), "repository owner")?;
-        validate_repo_name_part(target.repo(), "repository name")?;
-        Ok(self
-            .root
-            .join("worktrees")
-            .join(target.owner())
-            .join(target.repo())
-            .join(target.kind())
-            .join(target.number().to_string())
-            .join(worktree_key(task, agent)))
+    /// Holds every run's workspace and nothing else, so its owner can delete
+    /// it whole. Kept short so socket paths under a workspace's `tmp` fit.
+    fn workspaces_dir(&self) -> PathBuf {
+        self.root.join("runs")
+    }
+
+    /// Makes this process the only owner of the git dir for as long as the
+    /// returned guard lives, then deletes the workspaces a previous owner
+    /// left behind; `cleanup` later prunes their git worktree records. Call
+    /// at startup, before any run starts. Fails if another Maid owns it.
+    pub async fn take_ownership(&self) -> Result<GitDirOwner> {
+        tokio::fs::create_dir_all(&self.root)
+            .await
+            .with_context(|| format!("failed to create {}", self.root.display()))?;
+        let lock_path = self.root.join("maid.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open {}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                bail!("another Maid owns {}", self.root.display())
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
+        }
+
+        let runs = self.workspaces_dir();
+        if let Err(err) = workspace::remove_dir(runs.clone()).await {
+            warn!(path = %runs.display(), error = ?err, "failed to remove leftover workspaces");
+        }
+        Ok(GitDirOwner { _lock: lock })
     }
 
     async fn run_git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<()> {
@@ -111,24 +132,12 @@ impl GitWorktrees {
 
 #[async_trait]
 impl Worktrees for GitWorktrees {
-    async fn prepare(
-        &self,
-        target: &WorkTarget,
-        task: &AgentTask,
-        agent: AgentKind,
-    ) -> Result<PreparedWorktree> {
+    async fn prepare(&self, target: &WorkTarget) -> Result<PreparedWorktree> {
         let repo = self.repo_dir(target)?;
-        let worktree = self.worktree_dir(target, task, agent)?;
         let _lock = self.acquire_repo_lock(&repo).await?;
         tokio::fs::create_dir_all(
             repo.parent()
                 .ok_or_else(|| anyhow!("repository path has no parent"))?,
-        )
-        .await?;
-        tokio::fs::create_dir_all(
-            worktree
-                .parent()
-                .ok_or_else(|| anyhow!("worktree path has no parent"))?,
         )
         .await?;
 
@@ -149,65 +158,45 @@ impl Worktrees for GitWorktrees {
             .await
             .with_context(|| format!("failed to fetch {}", target.html_url()))?;
 
-        let worktree_string = worktree.to_string_lossy().to_string();
-        if worktree.exists() {
-            let _ = self
-                .run_git(
-                    Some(&repo),
-                    &["worktree", "remove", "--force", &worktree_string],
-                )
-                .await;
-            if worktree.exists() {
-                tokio::fs::remove_dir_all(&worktree)
-                    .await
-                    .with_context(|| format!("failed to remove {}", worktree.display()))?;
-            }
+        let workspace =
+            Workspace::create_in(&self.workspaces_dir()).context("failed to create workspace")?;
+        let checkout = workspace.checkout().to_string_lossy().to_string();
+        let added = self
+            .run_git(
+                Some(&repo),
+                &["worktree", "add", "--detach", &checkout, "FETCH_HEAD"],
+            )
+            .await;
+        if let Err(err) = added {
+            let _ = workspace.remove().await;
+            return Err(err);
         }
 
-        self.run_git(Some(&repo), &["worktree", "prune"]).await?;
-        self.run_git(
-            Some(&repo),
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                &worktree_string,
-                "FETCH_HEAD",
-            ],
-        )
-        .await?;
-
-        Ok(PreparedWorktree::git_worktree(repo, worktree))
+        Ok(PreparedWorktree::git_worktree(repo, workspace))
     }
 
     async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()> {
         let repo = worktree
             .repo()
-            .ok_or_else(|| anyhow!("worktree has no git repository path"))?
-            .to_path_buf();
-        let _lock = self.acquire_repo_lock(&repo).await?;
-        let worktree_string = worktree.path().to_string_lossy().to_string();
-        let remove_result = self
-            .run_git(
-                Some(&repo),
-                &["worktree", "remove", "--force", &worktree_string],
-            )
-            .await;
-        if worktree.path().exists() {
-            tokio::fs::remove_dir_all(worktree.path())
-                .await
-                .with_context(|| format!("failed to remove {}", worktree.path().display()))?;
-        }
-        self.run_git(Some(&repo), &["worktree", "prune"]).await?;
-        if worktree.path().exists() {
-            return remove_result;
-        }
-        Ok(())
+            .ok_or_else(|| anyhow!("worktree has no git repository path"))?;
+        let workspace = worktree.workspace();
+        workspace
+            .remove()
+            .await
+            .with_context(|| format!("failed to remove {}", workspace.root().display()))?;
+        let _lock = self.acquire_repo_lock(repo).await?;
+        self.run_git(Some(repo), &["worktree", "prune"]).await
     }
 }
 
 struct RepoLock {
     _file: File,
+}
+
+/// Keeps a process the only owner of a git dir until dropped.
+#[derive(Debug)]
+pub struct GitDirOwner {
+    _lock: File,
 }
 
 fn absolute_root(root: PathBuf) -> PathBuf {
@@ -218,23 +207,6 @@ fn absolute_root(root: PathBuf) -> PathBuf {
     env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(root)
-}
-
-fn worktree_key(task: &AgentTask, agent: AgentKind) -> String {
-    format!(
-        "{}-{:016x}-{agent}",
-        task.task_kind(),
-        stable_hash(task.trigger_url())
-    )
-}
-
-fn stable_hash(value: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 #[cfg(test)]
@@ -277,17 +249,6 @@ mod tests {
         WorkTarget::Issue(issue(owner, repo))
     }
 
-    fn task(trigger: &str) -> AgentTask {
-        AgentTask {
-            pr_url: "https://github.com/o/r/pull/46".to_string(),
-            origin: crate::domain::AgentTaskOrigin::Mention {
-                mention_url: trigger.to_string(),
-                raw_body: "@maid-bot review".to_string(),
-                cleaned_text: "review".to_string(),
-            },
-        }
-    }
-
     fn run_git(cwd: &Path, args: &[&str]) -> String {
         let output = StdCommand::new("git")
             .current_dir(cwd)
@@ -303,27 +264,32 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    fn source_repo(dir: &Path) -> PathBuf {
+        let source = dir.join("source");
+        std::fs::create_dir(&source).unwrap();
+        run_git(&source, &["init"]);
+        run_git(&source, &["config", "user.name", "test"]);
+        run_git(&source, &["config", "user.email", "test@example.com"]);
+        std::fs::write(source.join("file.txt"), "hello\n").unwrap();
+        run_git(&source, &["add", "file.txt"]);
+        run_git(&source, &["commit", "-m", "initial"]);
+        run_git(&source, &["branch", "-M", "main"]);
+        source
+    }
+
+    fn read_checkout_file(worktree: &PreparedWorktree) -> String {
+        std::fs::read_to_string(worktree.workspace().checkout().join("file.txt")).unwrap()
+    }
+
     #[test]
-    fn maps_repositories_and_worktrees_into_git_dir() {
+    fn maps_repositories_into_git_dir() {
         let worktrees = GitWorktrees::new("/tmp/maid-git", "token");
-        let pr = pr_target("dionysuzx", "forkcast");
-        let task = task("https://github.com/o/r/pull/46#issuecomment-2");
 
         assert_eq!(
-            worktrees.repo_dir(&pr).unwrap(),
-            PathBuf::from("/tmp/maid-git/repos/dionysuzx/forkcast.git")
-        );
-        let worktree = worktrees
-            .worktree_dir(&pr, &task, AgentKind::Codex)
-            .unwrap();
-        assert!(worktree.starts_with("/tmp/maid-git/worktrees/dionysuzx/forkcast/pulls/46"));
-        assert_eq!(
             worktrees
-                .worktree_dir(&pr, &task, AgentKind::Codex)
+                .repo_dir(&pr_target("dionysuzx", "forkcast"))
                 .unwrap(),
-            worktrees
-                .worktree_dir(&pr, &task, AgentKind::Codex)
-                .unwrap()
+            PathBuf::from("/tmp/maid-git/repos/dionysuzx/forkcast.git")
         );
     }
 
@@ -339,56 +305,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn uses_distinct_worktrees_for_distinct_triggers_on_the_same_pull_request() {
-        let worktrees = GitWorktrees::new("/tmp/maid-git", "token");
-        let pr = pr_target("dionysuzx", "forkcast");
-
-        assert_ne!(
-            worktrees
-                .worktree_dir(
-                    &pr,
-                    &task("https://github.com/o/r/pull/46#issuecomment-2"),
-                    AgentKind::Codex
-                )
-                .unwrap(),
-            worktrees
-                .worktree_dir(
-                    &pr,
-                    &task("https://github.com/o/r/pull/46#issuecomment-3"),
-                    AgentKind::Codex
-                )
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn uses_distinct_worktrees_for_agents_running_the_same_task() {
-        let worktrees = GitWorktrees::new("/tmp/maid-git", "token");
-        let pr = pr_target("dionysuzx", "forkcast");
-        let task = task("https://github.com/o/r/pull/46#issuecomment-2");
-
-        assert_ne!(
-            worktrees
-                .worktree_dir(&pr, &task, AgentKind::Codex)
-                .unwrap(),
-            worktrees
-                .worktree_dir(&pr, &task, AgentKind::Claude)
-                .unwrap()
-        );
-    }
-
     #[tokio::test]
-    async fn prepares_and_cleans_up_distinct_git_worktrees_at_the_listed_head() {
+    async fn prepares_and_cleans_up_distinct_workspaces_at_the_listed_head() {
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        std::fs::create_dir(&source).unwrap();
-        run_git(&source, &["init"]);
-        run_git(&source, &["config", "user.name", "test"]);
-        run_git(&source, &["config", "user.email", "test@example.com"]);
-        std::fs::write(source.join("file.txt"), "hello\n").unwrap();
-        run_git(&source, &["add", "file.txt"]);
-        run_git(&source, &["commit", "-m", "initial"]);
+        let source = source_repo(temp.path());
         let listed_head = CommitSha::parse(&run_git(&source, &["rev-parse", "HEAD"])).unwrap();
         std::fs::write(source.join("file.txt"), "pushed after listing\n").unwrap();
         run_git(&source, &["commit", "-am", "pushed after listing"]);
@@ -401,55 +321,29 @@ mod tests {
             ..pr("o", "r")
         });
 
-        let first = worktrees
-            .prepare(
-                &pr,
-                &task("https://github.com/o/r/pull/46#issuecomment-2"),
-                AgentKind::Codex,
-            )
-            .await
-            .unwrap();
-        let second = worktrees
-            .prepare(
-                &pr,
-                &task("https://github.com/o/r/pull/46#issuecomment-3"),
-                AgentKind::Codex,
-            )
-            .await
-            .unwrap();
+        let first = worktrees.prepare(&pr).await.unwrap();
+        let second = worktrees.prepare(&pr).await.unwrap();
 
-        assert_ne!(first.path(), second.path());
-        assert!(worktrees.repo_dir(&pr).unwrap().join("HEAD").exists());
-        assert_eq!(
-            std::fs::read_to_string(first.path().join("file.txt")).unwrap(),
-            "hello\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(second.path().join("file.txt")).unwrap(),
-            "hello\n"
-        );
+        assert_ne!(first.workspace(), second.workspace());
+        assert!(first.workspace().tmp().is_dir());
+        assert_eq!(read_checkout_file(&first), "hello\n");
+        assert_eq!(read_checkout_file(&second), "hello\n");
 
-        let first_path = first.path().to_path_buf();
-        let second_path = second.path().to_path_buf();
+        let first_root = first.workspace().root().to_path_buf();
+        let second_root = second.workspace().root().to_path_buf();
         worktrees.cleanup(first).await.unwrap();
         worktrees.cleanup(second).await.unwrap();
 
-        assert!(!first_path.exists());
-        assert!(!second_path.exists());
+        assert!(!first_root.exists());
+        assert!(!second_root.exists());
+        let repo = worktrees.repo_dir(&pr).unwrap();
+        assert_eq!(run_git(&repo, &["worktree", "list"]).lines().count(), 1);
     }
 
     #[tokio::test]
-    async fn prepares_issue_worktree_from_default_branch() {
+    async fn prepares_issue_workspace_from_default_branch() {
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        std::fs::create_dir(&source).unwrap();
-        run_git(&source, &["init"]);
-        run_git(&source, &["config", "user.name", "test"]);
-        run_git(&source, &["config", "user.email", "test@example.com"]);
-        std::fs::write(source.join("file.txt"), "hello\n").unwrap();
-        run_git(&source, &["add", "file.txt"]);
-        run_git(&source, &["commit", "-m", "initial"]);
-        run_git(&source, &["branch", "-M", "main"]);
+        let source = source_repo(temp.path());
 
         let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
         let issue = WorkTarget::Issue(Issue {
@@ -457,31 +351,47 @@ mod tests {
             ..issue("o", "r")
         });
 
-        let prepared = worktrees
-            .prepare(
-                &issue,
-                &task("https://github.com/o/r/issues/322#issuecomment-2"),
-                AgentKind::Codex,
-            )
-            .await
-            .unwrap();
+        let prepared = worktrees.prepare(&issue).await.unwrap();
 
-        assert!(worktrees.repo_dir(&issue).unwrap().join("HEAD").exists());
-        assert_eq!(
-            std::fs::read_to_string(prepared.path().join("file.txt")).unwrap(),
-            "hello\n"
-        );
-
-        let path = prepared.path().to_path_buf();
+        assert_eq!(read_checkout_file(&prepared), "hello\n");
         worktrees.cleanup(prepared).await.unwrap();
-        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn taking_ownership_removes_workspaces_a_killed_run_left_and_keeps_repositories() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = source_repo(temp.path());
+        let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
+        let issue = WorkTarget::Issue(Issue {
+            clone_url: source.to_string_lossy().to_string(),
+            ..issue("o", "r")
+        });
+        let leftover = worktrees.prepare(&issue).await.unwrap();
+
+        let _owner = worktrees.take_ownership().await.unwrap();
+
+        assert!(!leftover.workspace().root().exists());
+        let next = worktrees.prepare(&issue).await.unwrap();
+        assert_eq!(read_checkout_file(&next), "hello\n");
+        worktrees.cleanup(next).await.unwrap();
+        let repo = worktrees.repo_dir(&issue).unwrap();
+        assert_eq!(run_git(&repo, &["worktree", "list"]).lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_one_process_owns_a_git_dir_at_a_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktrees = GitWorktrees::new(temp.path().join("git"), "token");
+
+        let _owner = worktrees.take_ownership().await.unwrap();
+        let err = worktrees.take_ownership().await.unwrap_err();
+
+        assert!(err.to_string().starts_with("another Maid owns"), "{err}");
     }
 
     #[test]
     fn rejects_repository_parts_that_could_escape_git_dir() {
         let worktrees = GitWorktrees::new("/tmp/maid-git", "token");
-
-        let task = task("https://github.com/o/r/pull/46#issuecomment-2");
 
         assert!(
             worktrees
@@ -491,24 +401,6 @@ mod tests {
         assert!(
             worktrees
                 .repo_dir(&issue_target("dionysuzx", "forkcast/slash"))
-                .is_err()
-        );
-        assert!(
-            worktrees
-                .worktree_dir(
-                    &pr_target("../dionysuzx", "forkcast"),
-                    &task,
-                    AgentKind::Codex
-                )
-                .is_err()
-        );
-        assert!(
-            worktrees
-                .worktree_dir(
-                    &issue_target("dionysuzx", "forkcast/slash"),
-                    &task,
-                    AgentKind::Codex
-                )
                 .is_err()
         );
     }

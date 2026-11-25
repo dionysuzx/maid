@@ -1,4 +1,4 @@
-use crate::agent::{Agent, AgentKind, AgentPanel, AgentRun};
+use crate::agent::{Agent, AgentPanel, AgentRun};
 use crate::agent_comment::{AgentReply, agent_comment};
 use crate::auto_review::{
     AutoReviewAuthor, ReviewCadence, authorizing_reviewer, auto_review_task,
@@ -19,6 +19,7 @@ use crate::observed_notification::{MemoryObservedNotificationStore, ObservedNoti
 use crate::polling_metrics::{PollingMetrics, ReviewKind};
 use crate::reviewed_head::{MemoryReviewedHeadStore, ReviewedHeadStore};
 use crate::task_limit::{NoTaskLimit, TaskStartDecision, TaskStartRecorder};
+use crate::workspace::Workspace;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -60,38 +61,33 @@ pub trait GithubClient: Send + Sync {
 
 #[async_trait]
 pub trait Worktrees: Send + Sync {
-    async fn prepare(
-        &self,
-        target: &WorkTarget,
-        task: &AgentTask,
-        agent: AgentKind,
-    ) -> Result<PreparedWorktree>;
+    async fn prepare(&self, target: &WorkTarget) -> Result<PreparedWorktree>;
     async fn cleanup(&self, worktree: PreparedWorktree) -> Result<()>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedWorktree {
-    path: PathBuf,
+    workspace: Workspace,
     repo: Option<PathBuf>,
 }
 
 impl PreparedWorktree {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    pub fn new(workspace: Workspace) -> Self {
         Self {
-            path: path.into(),
+            workspace,
             repo: None,
         }
     }
 
-    pub fn git_worktree(repo: impl Into<PathBuf>, path: impl Into<PathBuf>) -> Self {
+    pub fn git_worktree(repo: impl Into<PathBuf>, workspace: Workspace) -> Self {
         Self {
-            path: path.into(),
+            workspace,
             repo: Some(repo.into()),
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
     }
 
     pub fn repo(&self) -> Option<&Path> {
@@ -975,9 +971,11 @@ where
         prompt: &str,
     ) -> Result<AgentRun> {
         let label = agent.label();
-        let worktree = self.worktrees.prepare(target, task, label.kind).await?;
-        let run = agent.run(worktree.path(), prompt).await;
-        let run = self.cleanup_worktree(worktree, run).await;
+        let worktree = self.worktrees.prepare(target).await?;
+        let run = agent.run(worktree.workspace(), prompt).await;
+        if let Err(err) = self.worktrees.cleanup(worktree).await {
+            warn!(error = ?err, "failed to clean up worktree; startup removes leftovers");
+        }
         match &run {
             Ok(run) => info!(
                 target = %target.html_url(),
@@ -999,26 +997,6 @@ where
             ),
         }
         run
-    }
-
-    async fn cleanup_worktree<T>(
-        &self,
-        worktree: PreparedWorktree,
-        task_result: Result<T>,
-    ) -> Result<T> {
-        let cleanup_result = self.worktrees.cleanup(worktree).await;
-        match (task_result, cleanup_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(err)) => Err(err),
-            (Err(err), Ok(())) => Err(err),
-            (Err(err), Err(cleanup_err)) => {
-                error!(
-                    error = ?cleanup_err,
-                    "failed to clean up worktree after task failure"
-                );
-                Err(err)
-            }
-        }
     }
 
     fn can_start_task(&self) -> Result<bool> {
@@ -1433,6 +1411,7 @@ fn deduplicate_auto_review_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentKind;
     use crate::agent::AgentLabel;
     use crate::domain::{AgentTaskOrigin, CommitSha, Issue, TreeSha};
     use anyhow::{Result, anyhow};
@@ -1654,17 +1633,12 @@ mod tests {
 
     #[async_trait]
     impl Worktrees for FakeWorktrees {
-        async fn prepare(
-            &self,
-            target: &WorkTarget,
-            _task: &AgentTask,
-            _agent: AgentKind,
-        ) -> Result<PreparedWorktree> {
+        async fn prepare(&self, target: &WorkTarget) -> Result<PreparedWorktree> {
             self.calls.lock().unwrap().push(target.repo_key());
             if let Some(message) = self.error.lock().unwrap().take() {
                 return Err(anyhow!(message));
             }
-            Ok(PreparedWorktree::new(self.worktree.clone()))
+            Ok(PreparedWorktree::new(Workspace::new(self.worktree.clone())))
         }
 
         async fn cleanup(&self, _worktree: PreparedWorktree) -> Result<()> {
@@ -1710,11 +1684,11 @@ mod tests {
             &self.label
         }
 
-        async fn run(&self, worktree: &Path, prompt: &str) -> Result<AgentRun> {
+        async fn run(&self, workspace: &Workspace, prompt: &str) -> Result<AgentRun> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((worktree.to_path_buf(), prompt.to_string()));
+                .push((workspace.root().to_path_buf(), prompt.to_string()));
             let response = self
                 .response
                 .ok_or_else(|| anyhow!("{} failed", self.label.kind))?;
@@ -1750,8 +1724,11 @@ mod tests {
             &self.label
         }
 
-        async fn run(&self, worktree: &Path, _prompt: &str) -> Result<AgentRun> {
-            self.calls.lock().unwrap().push(worktree.to_path_buf());
+        async fn run(&self, workspace: &Workspace, _prompt: &str) -> Result<AgentRun> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(workspace.root().to_path_buf());
             self.entered.wait().await;
             self.release.notified().await;
             Ok(AgentRun {
