@@ -182,6 +182,7 @@ struct AgentFile {
 struct PromptsFile {
     mention: Option<String>,
     pull_request_opened: Option<String>,
+    review: Option<String>,
 }
 
 impl ConfigFile {
@@ -312,9 +313,12 @@ fn required_prompts(value: Option<PromptsFile>) -> Result<PromptTemplates> {
     let pull_request_opened = non_empty(prompts.pull_request_opened)
         .ok_or_else(|| anyhow!("prompts.pull_request_opened must not be empty"))?;
 
+    let review = non_empty(prompts.review).unwrap_or_default();
+
     Ok(PromptTemplates {
         mention,
         pull_request_opened,
+        review,
     })
 }
 
@@ -439,6 +443,9 @@ effort = "max"
 [prompts]
 mention = "mention {{{{cleaned_text}}}}"
 pull_request_opened = "review {{{{pr_url}}}}"
+review = """
+Only P0 issues.
+"""
 "#
         )
         .unwrap();
@@ -499,6 +506,7 @@ pull_request_opened = "review {{{{pr_url}}}}"
             prompts.pull_request_opened.as_deref(),
             Some("review {{pr_url}}")
         );
+        assert_eq!(prompts.review.as_deref(), Some("Only P0 issues.\n"));
         assert_eq!(config.github_api_ip.as_deref(), Some("127.0.0.1"));
     }
 
@@ -568,6 +576,7 @@ pull_request_opened = "review {{{{pr_url}}}}"
             required_prompts(Some(PromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: None,
+                review: None,
             }))
             .is_err()
         );
@@ -575,6 +584,7 @@ pull_request_opened = "review {{{{pr_url}}}}"
             required_prompts(Some(PromptsFile {
                 mention: Some(" ".to_string()),
                 pull_request_opened: Some("review".to_string()),
+                review: None,
             }))
             .is_err()
         );
@@ -582,12 +592,24 @@ pull_request_opened = "review {{{{pr_url}}}}"
             required_prompts(Some(PromptsFile {
                 mention: Some("mention".to_string()),
                 pull_request_opened: Some("review".to_string()),
+                review: None,
             }))
             .unwrap(),
             PromptTemplates {
                 mention: "mention".to_string(),
                 pull_request_opened: "review".to_string(),
+                review: String::new(),
             }
+        );
+        assert_eq!(
+            required_prompts(Some(PromptsFile {
+                mention: Some("mention".to_string()),
+                pull_request_opened: Some("review".to_string()),
+                review: Some("  Only P0 issues.\n".to_string()),
+            }))
+            .unwrap()
+            .review,
+            "Only P0 issues."
         );
     }
 

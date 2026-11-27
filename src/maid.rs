@@ -1878,6 +1878,7 @@ mod tests {
         PromptTemplates {
             mention: "mention {{mention_url}}: {{cleaned_text}}".to_string(),
             pull_request_opened: "review {{pr_url}} by {{author}}".to_string(),
+            review: String::new(),
         }
     }
 
