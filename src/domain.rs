@@ -467,6 +467,7 @@ impl AgentTask {
                     ("target_url", self.pr_url.as_str()),
                     ("raw_body", raw_body.as_str()),
                     ("cleaned_text", cleaned_text.as_str()),
+                    ("review", templates.review.as_str()),
                 ],
             ),
             AgentTaskOrigin::PullRequestOpened { author } => render_template(
@@ -474,6 +475,7 @@ impl AgentTask {
                 &[
                     ("pr_url", self.pr_url.as_str()),
                     ("author", author.as_str()),
+                    ("review", templates.review.as_str()),
                 ],
             ),
         }
@@ -516,6 +518,8 @@ impl AgentTaskOrigin {
 pub struct PromptTemplates {
     pub mention: String,
     pub pull_request_opened: String,
+    /// The review rules both templates can include as `{{review}}`.
+    pub review: String,
 }
 
 fn render_template(template: &str, values: &[(&str, &str)]) -> Result<String> {
@@ -695,6 +699,7 @@ mod tests {
         let templates = PromptTemplates {
             mention: "TARGET={{ target_url }} REQUEST={{cleaned_text}}".to_string(),
             pull_request_opened: String::new(),
+            review: String::new(),
         };
 
         assert_eq!(
@@ -714,9 +719,42 @@ mod tests {
         let templates = PromptTemplates {
             mention: String::new(),
             pull_request_opened: "{{missing}}".to_string(),
+            review: String::new(),
         };
 
         assert!(task.prompt(&templates).is_err());
+    }
+
+    #[test]
+    fn both_templates_include_the_review_rules() {
+        let templates = PromptTemplates {
+            mention: "{{cleaned_text}}: {{review}}".to_string(),
+            pull_request_opened: "{{pr_url}}: {{review}}".to_string(),
+            review: "Only P0 issues.".to_string(),
+        };
+        let mention = AgentTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: AgentTaskOrigin::Mention {
+                mention_url: "https://github.com/o/r/pull/1#issuecomment-2".to_string(),
+                raw_body: "@maid-bot review".to_string(),
+                cleaned_text: "review".to_string(),
+            },
+        };
+        let opened = AgentTask {
+            pr_url: "https://github.com/o/r/pull/1".to_string(),
+            origin: AgentTaskOrigin::PullRequestOpened {
+                author: "dionysuzx".to_string(),
+            },
+        };
+
+        assert_eq!(
+            mention.prompt(&templates).unwrap(),
+            "review: Only P0 issues."
+        );
+        assert_eq!(
+            opened.prompt(&templates).unwrap(),
+            "https://github.com/o/r/pull/1: Only P0 issues."
+        );
     }
 
     #[test]
@@ -847,6 +885,7 @@ Review request:
 please review
 "
             .to_string(),
+            review: String::new(),
         }
     }
 }

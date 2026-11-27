@@ -46,10 +46,16 @@ metrics_bind_address = "127.0.0.1:9464"
 # Required. These templates are the full prompts Maid sends to every agent.
 # Each comment Maid posts ends with the rendered prompt in a collapsed section.
 # Supported mention placeholders:
-# {{mention_url}}, {{target_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}}
+# {{mention_url}}, {{target_url}}, {{pr_url}}, {{raw_body}}, {{cleaned_text}},
+# {{review}}
 # Supported pull_request_opened placeholders:
-# {{pr_url}}, {{author}}
+# {{pr_url}}, {{author}}, {{review}}
+# Optional `review` is the review rules both templates can include as
+# {{review}}, so they are written once.
 [prompts]
+review = """
+Report only issues that block merging, each with its file, line, and reason.
+"""
 mention = """
 You are responding to a GitHub mention.
 
@@ -67,6 +73,8 @@ Raw mention body:
 
 Cleaned request text:
 {{cleaned_text}}
+
+If asked to review: {{review}}
 """
 pull_request_opened = """
 You are responding automatically to a GitHub pull request opened by a trusted account.
@@ -81,7 +89,7 @@ Opened by:
 {{author}}
 
 Review request:
-please review
+{{review}}
 """
 
 # Required. The coding agents Maid runs, one entry per kind ("codex" or
