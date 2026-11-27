@@ -101,15 +101,12 @@ struct ClaudeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::test_support::write_script;
     use std::{fs, path::Path};
 
     fn fake_claude(dir: &Path, script: &str) -> String {
         let bin = dir.join("fake-claude");
-        fs::write(&bin, script).unwrap();
-        let mut permissions = fs::metadata(&bin).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&bin, permissions).unwrap();
+        write_script(&bin, script);
         bin.display().to_string()
     }
 

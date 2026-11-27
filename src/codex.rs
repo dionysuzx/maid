@@ -286,8 +286,7 @@ enum CodexJsonItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::test_support::write_script;
     use tokio::time::timeout;
 
     #[test]
@@ -337,7 +336,7 @@ mod tests {
     async fn run_finishes_when_child_leaves_stdout_open_after_exit() {
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("fake-codex");
-        fs::write(
+        write_script(
             &bin,
             r#"#!/bin/sh
 output_path=""
@@ -356,11 +355,7 @@ printf '%s\n' 'file final' > "$output_path"
 (sleep 5) &
 exit 0
 "#,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&bin).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&bin, permissions).unwrap();
+        );
 
         let codex = CodexCli::new(bin.display().to_string(), "test-model", "low");
 
@@ -380,7 +375,7 @@ exit 0
     async fn run_finishes_after_task_completion_when_wrapper_keeps_running() {
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("fake-codex");
-        fs::write(
+        write_script(
             &bin,
             r#"#!/bin/sh
 output_path=""
@@ -396,11 +391,7 @@ cat >/dev/null
 python3 -c 'import sys; output_path = sys.argv[1]; print("{\"type\":\"thread.started\",\"thread_id\":\"session-1\"}"); print("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"json final\"}}"); print("{\"type\":\"turn.completed\"}"); sys.stdout.flush(); open(output_path, "w").write("file final\n")' "$output_path"
 sleep 5
 "#,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&bin).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&bin, permissions).unwrap();
+        );
 
         let codex = CodexCli::new(bin.display().to_string(), "test-model", "low")
             .with_exit_after_completion_timeout(Duration::from_millis(100));
@@ -421,7 +412,7 @@ sleep 5
     async fn run_waits_for_normal_exit_after_task_completion() {
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("fake-codex");
-        fs::write(
+        write_script(
             &bin,
             r#"#!/bin/sh
 output_path=""
@@ -436,11 +427,7 @@ done
 cat >/dev/null
 python3 -c 'import sys, time; output_path = sys.argv[1]; print("{\"type\":\"thread.started\",\"thread_id\":\"session-1\"}"); print("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"json final\"}}"); print("{\"type\":\"turn.completed\"}"); sys.stdout.flush(); time.sleep(0.2); open(output_path, "w").write("file final after graceful exit\n")' "$output_path"
 "#,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&bin).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&bin, permissions).unwrap();
+        );
 
         let codex = CodexCli::new(bin.display().to_string(), "test-model", "low")
             .with_exit_after_completion_timeout(Duration::from_secs(2));
